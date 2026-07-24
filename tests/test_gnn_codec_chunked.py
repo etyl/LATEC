@@ -184,19 +184,46 @@ def test_chunked_matches_whole_bound(current_ckpt):
     assert _maxerr(yc, x) <= chunk.error_bound
 
 
+def test_gate_applies_on_whole_tensor_path(current_ckpt):
+    """gate=True with chunk_size=0 (whole-tensor): the gate is device-only, so a
+    gated whole-tensor encode is realised as a single chunk covering the shape
+    (grid 1 per axis). The stream then carries chunk metadata and honours the
+    bound; the ungated whole-tensor encode stays on the plain numpy path."""
+    from deepsz.gnn_codec import _read_stream
+
+    rng = np.random.RandomState(3)
+    x = rng.rand(20, 24).astype(np.float32)
+
+    gated = GNNCompressorCodec(
+        current_ckpt, error_bound=1e-4, levels=LEVELS, chunk_size=0,
+        fp16=False, compile=False, gate=True,
+    )
+    plain = GNNCompressorCodec(
+        current_ckpt, error_bound=1e-4, levels=LEVELS, chunk_size=0,
+        fp16=False, compile=False, gate=False,
+    )
+
+    sg = gated.compress(x)
+    meta_g = _read_stream(sg)[0]
+    # gate routes the whole-tensor case through a single chunk covering the shape
+    assert meta_g["chunks"] == [20, 24]  # ceil(shape, anchor_stride=1<<LEVELS)
+    assert "chunks" not in _read_stream(plain.compress(x))[0]  # numpy whole path
+    assert _maxerr(gated.uncompress(sg), x) <= gated.error_bound
+
+
 def test_auto_chunk_selection(current_ckpt):
     """chunk_size=None: whole-tensor for small inputs, chunked past the
     threshold; forced int must be a multiple of anchor_stride."""
     codec = _codec(current_ckpt, chunk_size=None)
-    assert codec._chunk_edges((16, 16)) is None  # small -> whole
+    assert codec._chunk_edges((16, 16), STRIDE) is None  # small -> whole
     big = (1 << 12, 1 << 12)  # 16.7M points -> chunked
-    edges = codec._chunk_edges(big)
+    edges = codec._chunk_edges(big, STRIDE)
     assert edges is not None
     assert all(e % STRIDE == 0 and e > 0 for e in edges)
     assert np.prod([min(e, n) for e, n in zip(edges, big)]) <= 1 << 21
     assert np.prod([min(e + STRIDE, n) for e, n in zip(edges, big)]) > 1 << 21
 
-    elongated = codec._chunk_edges((1 << 20, 16))
+    elongated = codec._chunk_edges((1 << 20, 16), STRIDE)
     assert elongated[1] >= 16
     assert elongated[0] > edges[0]  # short axis leaves room for a longer chunk
 
@@ -374,6 +401,37 @@ def test_compile_flag_roundtrips_and_persists(current_ckpt, monkeypatch):
     meta, _ = _read_stream(bytes(stream))
     assert meta.get("compiled") is True
     assert _maxerr(codec.uncompress(stream), x) <= 0.02
+
+
+def test_compile_auto_defers_to_crossover(current_ckpt, monkeypatch):
+    """compile='auto' (the default) never compiles while _COMPILE_AUTO_CROSSOVER is
+    None (no measured crossover); setting the crossover turns it on past that many
+    chunks -- independently of the explicit-compile floor _COMPILE_MIN_CHUNKS."""
+    import deepsz.gnn_codec as gc
+    from deepsz.gnn_codec import _read_stream
+
+    rng = np.random.RandomState(12)
+    x = rng.rand(8, 8).astype(np.float32)  # 4 chunks at chunk_size=STRIDE
+    codec = GNNCompressorCodec(
+        current_ckpt, error_bound=0.02, levels=LEVELS, chunk_size=STRIDE,
+        fp16=False, compile="auto",
+    )
+    assert codec.auto_compile is True and codec.compile is False
+
+    # crossover None -> auto stays off even with the forced floor lowered
+    monkeypatch.setattr(gc, "_COMPILE_MIN_CHUNKS", 1)
+    meta, _ = _read_stream(bytes(codec.compress(x)))
+    assert meta.get("compiled") is False
+
+    # a low crossover flips auto on (4 chunks >= 2), gating on its own constant
+    monkeypatch.setattr(gc, "_COMPILE_AUTO_CROSSOVER", 2)
+    meta, _ = _read_stream(bytes(codec.compress(x)))
+    assert meta.get("compiled") is True
+
+
+def test_bad_compile_string_rejected(current_ckpt):
+    with pytest.raises(ValueError, match="bool or 'auto'"):
+        GNNCompressorCodec(current_ckpt, compile="yes")
 
 
 # --- halo geometry: out-of-chunk neighbours go live only once coded ---------

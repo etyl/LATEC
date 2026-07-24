@@ -114,6 +114,11 @@ def main(argv=None):
         "chunk). Same float path replayed at decode",
     )
     args = ap.parse_args(argv)
+    # add_common forces --levels to a fixed int default (for the interp path);
+    # let the GNN codec pick levels from the tensor shape unless the user asked
+    # for a specific depth.
+    _argv = sys.argv[1:] if argv is None else list(argv)
+    levels_explicit = any(a == "--levels" or a.startswith("--levels=") for a in _argv)
 
     arr = load_tensor(args.input)
     orig_bytes = arr.nbytes
@@ -137,7 +142,7 @@ def main(argv=None):
         codec = GNNCompressorCodec(
             args.gnn_checkpoint,
             error_bound=eb,
-            levels=args.levels,
+            levels=args.levels if levels_explicit else "auto",
             radius=args.radius,
             zstd_level=args.zstd_level,
             eb_ratio=args.eb_ratio,
