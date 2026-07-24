@@ -403,6 +403,37 @@ def test_compile_flag_roundtrips_and_persists(current_ckpt, monkeypatch):
     assert _maxerr(codec.uncompress(stream), x) <= 0.02
 
 
+def test_compile_auto_defers_to_crossover(current_ckpt, monkeypatch):
+    """compile='auto' (the default) never compiles while _COMPILE_AUTO_CROSSOVER is
+    None (no measured crossover); setting the crossover turns it on past that many
+    chunks -- independently of the explicit-compile floor _COMPILE_MIN_CHUNKS."""
+    import deepsz.gnn_codec as gc
+    from deepsz.gnn_codec import _read_stream
+
+    rng = np.random.RandomState(12)
+    x = rng.rand(8, 8).astype(np.float32)  # 4 chunks at chunk_size=STRIDE
+    codec = GNNCompressorCodec(
+        current_ckpt, error_bound=0.02, levels=LEVELS, chunk_size=STRIDE,
+        fp16=False, compile="auto",
+    )
+    assert codec.auto_compile is True and codec.compile is False
+
+    # crossover None -> auto stays off even with the forced floor lowered
+    monkeypatch.setattr(gc, "_COMPILE_MIN_CHUNKS", 1)
+    meta, _ = _read_stream(bytes(codec.compress(x)))
+    assert meta.get("compiled") is False
+
+    # a low crossover flips auto on (4 chunks >= 2), gating on its own constant
+    monkeypatch.setattr(gc, "_COMPILE_AUTO_CROSSOVER", 2)
+    meta, _ = _read_stream(bytes(codec.compress(x)))
+    assert meta.get("compiled") is True
+
+
+def test_bad_compile_string_rejected(current_ckpt):
+    with pytest.raises(ValueError, match="bool or 'auto'"):
+        GNNCompressorCodec(current_ckpt, compile="yes")
+
+
 # --- halo geometry: out-of-chunk neighbours go live only once coded ---------
 
 

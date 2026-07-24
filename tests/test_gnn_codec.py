@@ -52,7 +52,10 @@ def test_defaults_match_eval_tensor(tiny_checkpoint):
     assert codec.chunk_size is None
     assert not hasattr(codec, "chunk_batch")
     assert codec.fp16 is True
-    assert codec.compile is True
+    # compile default is now "auto": a benchmark-backed decision (no measured
+    # crossover -> off), so the resolved flag is False and auto_compile is set.
+    assert codec.auto_compile is True
+    assert codec.compile is False
 
 
 @pytest.mark.parametrize("levels", [1, 2, 4, 6])

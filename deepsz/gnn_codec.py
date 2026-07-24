@@ -31,10 +31,28 @@ _ANCHOR_BLOCK = 1
 # auto mode: whole-tensor below this many points, chunked above (whole-tensor
 # memory is ~30*L*K*d bytes/point in transients — ~2^21 points is a few GB)
 _AUTO_CHUNK_THRESHOLD = 1 << 21
-# torch.compile only pays past this many chunks (dynamo warmup is seconds; the
-# fused embed saves ~ms per wave). ponytail: rough amortization cutoff, tune if
-# compile cost or per-wave savings change materially.
+# Minimum chunk count before an *explicit* compile=True is honored: below this,
+# dynamo warmup can't be amortized, so a forced compile is silently skipped.
 _COMPILE_MIN_CHUNKS = 64
+# Chunk count past which compile="auto" turns compile ON. None = "no crossover
+# measured -> auto keeps compile OFF". Set from scripts/bench_compile.py.
+#
+# Measured (Volta cap 7.0, d64/agg2/levels2/edge8/fp16, cache_size_limit=8 = the
+# torch default the codec runs at), compress wall-time vs eager (off):
+#     chunks     off   default-compile   reduce-overhead(CUDA graphs)
+#         16   7.1 s     81.9 (0.09x)        83.0 (0.09x)
+#         64  18.4 s     91.8 (0.20x)       107.7 (0.17x)
+#        256  63.5 s    142.4 (0.45x)       190.7 (0.33x)
+# compile NEVER wins and the curves diverge: its marginal per-chunk cost
+# (0.26 default / 0.43 reduce-overhead s/chunk) exceeds eager's (0.24), so there
+# is no finite crossover. Cause: the message-pass ``embed`` recompiles per distinct
+# ``n_live`` neighbour-geometry -- capped at 8 by dynamo, so after 8 geometries it
+# falls back to eager and the warmup is pure loss; reduce-overhead is worse still
+# because varying per-wave M forces a CUDA-graph recapture every wave. This is a
+# Python-control-flow guard issue, not GPU-specific, so it is expected to hold on
+# H100/A100 too. Re-run bench_compile there and set an int here if a crossover
+# appears (e.g. after the n_live recompiles are removed).
+_COMPILE_AUTO_CROSSOVER: int | None = None
 # Schedule depth per input rank for ``levels="auto"``. The common ranks are set
 # explicitly (2-D 9, 3-D 7, 4-D 5 -> anchor_stride 512 / 128 / 32; 4-D keeps the
 # edge-32 operating point). Ranks outside the table fall back to the
@@ -846,7 +864,7 @@ class GNNCompressorCodec:
         strict_checkpoint: bool = True,
         chunk_size: int | tuple[int, ...] | None = None,
         fp16: bool = True,
-        compile: bool = True,
+        compile: bool | str = "auto",
         gate: bool = True,
     ):
         self.checkpoint_path = Path(checkpoint_path)
@@ -899,10 +917,20 @@ class GNNCompressorCodec:
         # readout stays fp32). ~2x on the GNN forward, may cost a little ratio at
         # small eb. Stored in meta so decode uses the same float path.
         self.fp16 = bool(fp16)
-        # compile: torch.compile the message-pass embed (fuses the elementwise
-        # ops that aren't in the GEMMs). Stored in meta so decode uses the same
-        # compiled float path. First encode pays a one-off compilation cost.
-        self.compile = bool(compile)
+        # compile: torch.compile the message-pass embed. "auto" (default) decides
+        # per chunk count from a benchmark-backed crossover (_COMPILE_AUTO_CROSSOVER,
+        # currently None -> off: compile never beat eager here, see the constant).
+        # True forces it (still gated by _COMPILE_MIN_CHUNKS); False disables it.
+        # The resolved decision is stored in meta so decode replays the same float
+        # path. First encode pays a one-off compilation cost.
+        if isinstance(compile, str):
+            if compile != "auto":
+                raise ValueError("compile must be a bool or 'auto'")
+            self.auto_compile = True
+            self.compile = False
+        else:
+            self.auto_compile = False
+            self.compile = bool(compile)
         # gate: scale-gated interp fallback. Applies to both the chunked and the
         # whole-tensor path -- the gate is device-only, so a gated whole-tensor
         # encode is realised as a single chunk covering the shape (see compress).
@@ -984,14 +1012,22 @@ class GNNCompressorCodec:
             # but the gate applies. gate=False keeps the plain numpy whole path.
             edges = tuple(-(-n // anchor_stride) * anchor_stride for n in shape)
         # torch.compile costs seconds of dynamo warmup per process; only worth
-        # it when there are enough chunk waves to amortize. Frozen into the
-        # stream meta so decode replays the same float path.
-        use_compile = (
-            self.compile
-            and edges is not None
-            and int(np.prod([-(-n // e) for n, e in zip(shape, edges)]))
-            >= _COMPILE_MIN_CHUNKS
+        # it when there are enough chunk waves to amortize. "auto" defers to the
+        # benchmark-backed crossover; explicit True is honored past a floor.
+        # Frozen into the stream meta so decode replays the same float path.
+        nchunks = (
+            int(np.prod([-(-n // e) for n, e in zip(shape, edges)]))
+            if edges is not None
+            else 0
         )
+        if self.auto_compile:
+            want_compile = (
+                _COMPILE_AUTO_CROSSOVER is not None
+                and nchunks >= _COMPILE_AUTO_CROSSOVER
+            )
+        else:
+            want_compile = self.compile and nchunks >= _COMPILE_MIN_CHUNKS
+        use_compile = want_compile and edges is not None
         candidates: list[tuple[int, bytes]] = []
         for ratio in ratio_candidates:
             gates = None
