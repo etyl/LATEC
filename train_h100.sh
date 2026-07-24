@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=gnn-sz
-#SBATCH --qos=qos_gpu_h100-dev
-#SBATCH --time=1:00:00
+#SBATCH --qos=qos_gpu_h100-t3
+#SBATCH --time=8:00:00
 #SBATCH --constraint=h100
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -58,9 +58,9 @@ python scripts/train_gnn.py \
     --synthetic-discontinuities 3 \
     --synthetic-batch 4 \
     --synthetic-stride 8 \
-    --agg-level 2 \
+    --agg-level 1 \
     --d 64 \
-    --lr 0.0003 \
+    --lr 0.0005 \
     --noise-range 0.000001 0.01 \
     --eval-shape 256 256 \
     --eval-eb 0.001 \
@@ -72,7 +72,7 @@ python scripts/train_gnn.py \
     --eval-tensor-every 500 \
     --device cuda \
     --wandb-mode offline \
-    --run-name gnn-agg1 \
+    --run-name gnn-agg1  \
     --compile \
     "$@"
 
