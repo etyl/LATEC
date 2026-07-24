@@ -23,7 +23,7 @@ from .rans import SCALE_HI_MULT, SCALE_LO_DIV, build_laplace_tables, scale_to_le
 
 
 _MAGIC = b"DEEPSZGN"
-_VERSION = 8
+_VERSION = 9
 _PREFIX = "<8sII"
 _PREFIX_SIZE = struct.calcsize(_PREFIX)
 _ANCHOR_BLOCK = 1
@@ -94,10 +94,10 @@ def _auto_levels(shape: tuple[int, ...]) -> int:
 # invariant to the now rank-dependent schedule depth. Without this, a fixed
 # per-step ratio compounds as ratio**(levels-1): 0.8 gives 0.8**4=0.41x at 4-D
 # (levels 5) but 0.8**8=0.17x at 2-D (levels 9), i.e. wildly different budgets.
-# Default 0.41 == 0.8**4 reproduces the per-step 0.8 the 4-D levels=5 point was
-# tuned at. The size sweep explores coarser->flatter spreads.
-_GNN_EB_COARSE_FACTOR = 0.41
-_GNN_EB_COARSE_SWEEP = (1.0, 0.65, 0.41, 0.25)
+# The default keeps the coarsest stage at 90% of the requested bound. The size
+# sweep explores that operating point together with flatter and tighter spreads.
+_GNN_EB_COARSE_FACTOR = 0.9
+_GNN_EB_COARSE_SWEEP = (1.0, 0.9, 0.65, 0.41)
 
 
 def _per_step_eb_ratio(coarse_factor: float, levels: int) -> float:
@@ -369,13 +369,14 @@ def _chunk_waves(grid: tuple[int, ...]) -> list[list[int]]:
     return [groups[k] for k in sorted(groups, key=rank)]
 
 
-# Scale-gated interp fallback: where the model's predicted scale b sits below
-# eb*2^T, its confidence is either genuine (high eb: the point is ~free) or the
-# learned-predictor precision floor talking (low eb) — only measuring can tell.
-# The encoder sweeps (T, shift) per chunk-stage against the true residuals and
-# codes gated points with the chunk-local cubic-interp prediction at scale
-# b/2^shift; the winning (T, shift) per chunk-stage travels in the header, so
-# the gate self-disables (T=0) wherever it does not pay.
+# Scale-gated classical-predictor fallback: where the model's predicted scale b
+# sits below eb*2^T, its confidence is either genuine (high eb: the point is
+# ~free) or the learned-predictor precision floor talking (low eb) — only
+# measuring can tell. The encoder sweeps (predictor, T, shift) per chunk-stage
+# against the true residuals. The candidates are the original cubic/axis-average
+# interpolation and SZ3's strong 3-D CLOUD choice, linear interpolation along
+# the first active axis. The winner travels in the header, so the gate
+# self-disables (T=0) wherever neither classical predictor pays.
 _GATE_T = np.array([2, 3, 4, 5, 6, 7, 8], np.float64)
 _GATE_SHIFTS = (0, 2, 4, 6)
 
@@ -391,8 +392,8 @@ _GATE_SHIFTS = (0, 2, 4, 6)
 # anchored on enc/dec agreement, not on matching the old numpy stream.
 
 
-def _interp_axis_at_t(torch, W, coords, axis, s, shape):
-    """Cubic interpolation on device.
+def _interp_axis_at_t(torch, W, coords, axis, s, shape, cubic):
+    """Linear or cubic interpolation on device.
 
     ``W`` is ``(C, *S)`` float64 and ``coords`` is a tuple of ``(M,)`` long
     tensors.
@@ -408,26 +409,30 @@ def _interp_axis_at_t(torch, W, coords, axis, s, shape):
     Lm1, vm1 = gather(-s)
     Lp1, vp1 = gather(+s)
     pred = 0.5 * (Lm1 + Lp1)
-    Lm3, vm3 = gather(-3 * s)
-    Lp3, vp3 = gather(+3 * s)
-    cub = (-Lm3 + 9 * Lm1 + 9 * Lp1 - Lp3) / 16.0
-    pred = torch.where((vm3 & vp3).unsqueeze(0), cub, pred)
+    if cubic:
+        Lm3, vm3 = gather(-3 * s)
+        Lp3, vp3 = gather(+3 * s)
+        cub = (-Lm3 + 9 * Lm1 + 9 * Lp1 - Lp3) / 16.0
+        pred = torch.where((vm3 & vp3).unsqueeze(0), cub, pred)
     both = (vm1 & vp1).unsqueeze(0)
     only_left = (vm1 & ~vp1).unsqueeze(0)
     return torch.where(both, pred, torch.where(only_left, Lm1, Lp1))
 
 
-def _interp_stage_pred_t(torch, recon_t, sls, coords_t, stride, axes, center):
-    """Chunk-local cubic interpolation from the causal device reconstruction."""
+def _interp_stage_pred_t(
+    torch, recon_t, sls, coords_t, stride, axes, center, *, cubic
+):
+    """Chunk-local interpolation from the causal device reconstruction."""
     W = recon_t[(slice(None), *sls)].double()
     shape = tuple(W.shape[1:])
     if center == 0 or len(axes) == 1:
         ip = sum(
-            _interp_axis_at_t(torch, W, coords_t, a, stride, shape) for a in axes
+            _interp_axis_at_t(torch, W, coords_t, a, stride, shape, cubic)
+            for a in axes
         ) / len(axes)
     else:
         ax = axes[0] if center == 1 else axes[-1]
-        ip = _interp_axis_at_t(torch, W, coords_t, ax, stride, shape)
+        ip = _interp_axis_at_t(torch, W, coords_t, ax, stride, shape, cubic)
     return ip.to(torch.float32)  # (C, n)
 
 
@@ -443,11 +448,13 @@ def _laplace_bits_t(torch, absr, b, eb):
     return (-torch.log2(p)).clamp_max(32.0)
 
 
-def _gate_select_t(torch, r_g, r_i, b, eb):
-    """Device twin of ``_gate_select``: best (T, shift) for one chunk-stage as
-    device scalar int tensors, (0, 0) = off. Branch-free (a single argmin over
-    the (shift, T) cost grid) so it issues no host sync; its choice only ranks
-    settings and travels in the header, so it need not match numpy bit for bit."""
+def _gate_select_t(torch, r_g, r_is, b, eb):
+    """Choose the best (classical predictor, T, shift) for one chunk-stage.
+
+    Returns device scalar ``(kind, T, shift)`` tensors, with kind 0 meaning off
+    and positive kinds indexing ``r_is`` from one. The selection is branch-free
+    so it issues no host sync.
+    """
     dev = b.device
     GTf = torch.tensor(_GATE_T, dtype=torch.float64, device=dev)
     GTi = GTf.to(torch.int64)
@@ -466,15 +473,22 @@ def _gate_select_t(torch, r_g, r_i, b, eb):
 
     base = cum(r_g, b)
     tot = base[-1]
-    rows = [tot - base[:-1] + cum(r_i, b * 2.0**-sh)[:-1] for sh in _GATE_SHIFTS]
-    costs = torch.stack(rows)  # (n_shift, nb-1)
+    rows = [
+        tot - base[:-1] + cum(r_i, b * 2.0**-sh)[:-1]
+        for r_i in r_is
+        for sh in _GATE_SHIFTS
+    ]
+    costs = torch.stack(rows)  # (n_predictor * n_shift, nb-1)
     mv, fi = costs.reshape(-1).min(0)
     fired = mv < tot
     ncol = nb - 1
+    nsh = len(_GATE_SHIFTS)
+    row = fi // ncol
     z = torch.zeros((), dtype=torch.int64, device=dev)
+    gate_kind = torch.where(fired, row // nsh + 1, z)
     gate_t = torch.where(fired, GTi[fi % ncol], z)
-    gate_sh = torch.where(fired, SHi[fi // ncol], z)
-    return gate_t, gate_sh
+    gate_sh = torch.where(fired, SHi[row % nsh], z)
+    return gate_kind, gate_t, gate_sh
 
 
 def _gate_apply_t(torch, pred_bi, scale_bi, ip, eb, gate_t, gate_sh):
@@ -642,13 +656,35 @@ def _compress_chunked(
                     sc = scale[bi]
                     if gate:
                         coords_t, st_i, ax_i = interp_dev[s]
-                        ip = _interp_stage_pred_t(
-                            torch, recon_t, sls, coords_t, st_i, ax_i, center
+                        ip_cubic = _interp_stage_pred_t(
+                            torch,
+                            recon_t,
+                            sls,
+                            coords_t,
+                            st_i,
+                            ax_i,
+                            center,
+                            cubic=True,
                         )
-                        gt, gs = _gate_select_t(
-                            torch, (cvals - p).abs(), (cvals - ip).abs(), sc, ebs[s]
+                        ip_linear = _interp_stage_pred_t(
+                            torch,
+                            recon_t,
+                            sls,
+                            coords_t,
+                            st_i,
+                            ax_i,
+                            1,
+                            cubic=False,
                         )
-                        gates_t.append(gt * 16 + gs)
+                        gk, gt, gs = _gate_select_t(
+                            torch,
+                            (cvals - p).abs(),
+                            ((cvals - ip_cubic).abs(), (cvals - ip_linear).abs()),
+                            sc,
+                            ebs[s],
+                        )
+                        gates_t.append(gk * 256 + gt * 16 + gs)
+                        ip = torch.where(gk == 2, ip_linear, ip_cubic)
                         p, sc = _gate_apply_t(torch, pred[bi], sc, ip, ebs[s], gt, gs)
                     codes, recon_stage, outliers = _quantize_t(
                         torch, cvals, p, ebs[s], radius, round_output
@@ -708,7 +744,7 @@ def _chunk_device_plan(torch, dev, cshape, full_shape, levels, stride, block):
     corresponding ``recon_off_dev`` uses full-tensor strides, so adding a
     chunk's global-flat origin addresses the device-resident reconstruction
     without scanning a full chunk-sized boolean mask at every stage.  Coordinate
-    tuples are retained only for cubic interpolation.  The plan is cached per
+    tuples are retained only for interpolation.  The plan is cached per
     chunk shape within one tensor encode/decode.
     """
     plan = stage_plan(cshape, levels, stride, block)
@@ -821,11 +857,35 @@ def _decompress_chunked(
                         g = gates_t[gi]
                         gi += 1
                         coords_t, st_i, ax_i = interp_dev[s]
-                        ip = _interp_stage_pred_t(
-                            torch, recon_t, sls, coords_t, st_i, ax_i, center
+                        ip_cubic = _interp_stage_pred_t(
+                            torch,
+                            recon_t,
+                            sls,
+                            coords_t,
+                            st_i,
+                            ax_i,
+                            center,
+                            cubic=True,
                         )
+                        ip_linear = _interp_stage_pred_t(
+                            torch,
+                            recon_t,
+                            sls,
+                            coords_t,
+                            st_i,
+                            ax_i,
+                            1,
+                            cubic=False,
+                        )
+                        ip = torch.where((g >> 8) == 2, ip_linear, ip_cubic)
                         p, sc = _gate_apply_t(
-                            torch, pred[bi], sc, ip, ebs[s], g >> 4, g & 15
+                            torch,
+                            pred[bi],
+                            sc,
+                            ip,
+                            ebs[s],
+                            (g >> 4) & 15,
+                            g & 15,
                         )
                     levels64 = scale_to_level(
                         sc.cpu().numpy()[None, :], ebs[s]
@@ -952,13 +1012,12 @@ class GNNCompressorCodec:
         else:
             self.auto_compile = False
             self.compile = bool(compile)
-        # gate: scale-gated interp fallback. Applies to both the chunked and the
+        # gate: scale-gated classical fallback. Applies to both the chunked and
         # whole-tensor path -- the gate is device-only, so a gated whole-tensor
         # encode is realised as a single chunk covering the shape (see compress).
-        # The encoder sweeps (T, shift) per chunk-stage against the true residuals
-        # and writes the winners into the header, so the gate self-disables where
-        # it does not pay (e.g. high eb) and the stream stays byte-identical
-        # when every choice is off. Buys ~2 bpv at eb=1e-6 on RTI.
+        # The encoder rate-selects GNN, cubic/averaged interpolation, or
+        # linear/single-axis interpolation per chunk-stage and stores the winner
+        # in the header. It self-disables wherever neither fallback pays.
         self.gate = bool(gate)
         self.checkpoint_hash = self._checkpoint_hash()
 

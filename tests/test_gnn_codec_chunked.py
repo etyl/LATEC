@@ -104,10 +104,33 @@ def test_gate_roundtrip_and_header(current_ckpt):
     if gates is None:
         assert s_on == s_off
     else:
-        assert any(g >> 4 for g in gates)
+        assert all(g >> 8 in (0, 1, 2) for g in gates)
+        assert any((g >> 4) & 15 for g in gates)
     abs_eb = eb * float(f.max() - f.min())  # eb is relative to the data range
     for s in (s_on, s_off):
         assert _maxerr(off.uncompress(s), f) <= abs_eb
+
+
+def test_gate_rate_selector_can_choose_second_predictor():
+    """The chunk-stage rate proxy selects among multiple classical candidates."""
+    from deepsz.gnn_codec import _gate_select_t
+
+    eb = 1e-3
+    scale = torch.full((32,), eb)
+    gnn_residual = torch.full((1, 32), 10 * eb)
+    candidate_1 = torch.full((1, 32), 5 * eb)
+    candidate_2 = torch.zeros((1, 32))
+
+    kind, threshold, _shift = _gate_select_t(
+        torch,
+        gnn_residual,
+        (candidate_1, candidate_2),
+        scale,
+        eb,
+    )
+
+    assert int(kind) == 2
+    assert int(threshold) > 0
 
 
 # --- roundtrip within the error bound --------------------------------------

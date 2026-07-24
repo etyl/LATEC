@@ -127,11 +127,14 @@ def test_per_step_eb_ratio_is_depth_normalised():
     assert _per_step_eb_ratio(0.41, 1) == 1.0
 
 
-def test_default_coarse_factor_preserves_4d_operating_point():
-    """Default 0.41 reproduces the legacy per-step 0.8 at the 4-D levels=5 point."""
+def test_default_coarse_factor_is_point_nine():
+    """The default keeps the coarsest stage at 90% of the requested bound."""
     from deepsz.gnn_codec import _GNN_EB_COARSE_FACTOR, _per_step_eb_ratio
 
-    assert _per_step_eb_ratio(_GNN_EB_COARSE_FACTOR, 5) == pytest.approx(0.8, abs=2e-3)
+    assert _GNN_EB_COARSE_FACTOR == pytest.approx(0.9)
+    assert _per_step_eb_ratio(_GNN_EB_COARSE_FACTOR, 5) == pytest.approx(
+        0.9 ** 0.25
+    )
 
 
 def test_numpy_nd_tensor_roundtrip(tiny_checkpoint):
