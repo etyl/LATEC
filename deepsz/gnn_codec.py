@@ -51,7 +51,9 @@ _COMPILE_MIN_CHUNKS = 64
 # because varying per-wave M forces a CUDA-graph recapture every wave. This is a
 # Python-control-flow guard issue, not GPU-specific, so it is expected to hold on
 # H100/A100 too. Re-run bench_compile there and set an int here if a crossover
-# appears (e.g. after the n_live recompiles are removed).
+# appears (e.g. after the n_live recompiles are removed). dynamic=False was tried
+# and is WORSE: it specializes per stage geometry and never converges (>420 s at 64
+# chunks) instead of amortizing -- dynamic=True's symbolic-M graph is the lesser evil.
 _COMPILE_AUTO_CROSSOVER: int | None = None
 # Schedule depth per input rank for ``levels="auto"``. The common ranks are set
 # explicitly (2-D 9, 3-D 7, 4-D 5 -> anchor_stride 512 / 128 / 32; 4-D keeps the

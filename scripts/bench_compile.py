@@ -20,6 +20,11 @@ Env knobs (all optional):
   MODES="off,default,reduce-overhead"  compile variants to compare per chunk count
                                     (reduce-overhead = CUDA graphs, the launch-bound win)
   CACHE_LIMIT=256                   torch._dynamo cache_size_limit for compile runs
+  DYNAMIC=1                         torch.compile dynamic= (1=True symbolic-M graph,
+                                    0=False specialize per shape). Measured: 0 is
+                                    WORSE -- it compiles every distinct stage geometry
+                                    (>420s timeout at 64 chunks) instead of amortizing.
+  CHILD_TIMEOUT=300                 per-point subprocess timeout; inf on overrun
   REPS=1                            timed reps per point (min taken)
 
 The CHUNK edge is held fixed (a realistic per-chunk cost); the tensor is grown to
@@ -46,6 +51,7 @@ FP16 = os.environ.get("FP16", "1") == "1"
 RANK = int(os.environ.get("RANK", "4"))
 CACHE_LIMIT = int(os.environ.get("CACHE_LIMIT", "8"))  # torch dynamo default
 CHILD_TIMEOUT = float(os.environ.get("CHILD_TIMEOUT", "300"))
+DYNAMIC = os.environ.get("DYNAMIC", "1") == "1"  # torch.compile dynamic= for all runs
 REPS = int(os.environ.get("REPS", "1"))
 NCHUNKS = [int(x) for x in os.environ.get("NCHUNKS", "1,8,16,32,64,128").split(",")]
 
@@ -109,6 +115,19 @@ def _run_point() -> None:
     dyn.config.cache_size_limit = CACHE_LIMIT
     dyn.config.accumulated_cache_size_limit = max(CACHE_LIMIT * 4, 512)
 
+    # Force the dynamic= setting of every torch.compile the codec issues, without
+    # touching library code: dynamic=False specializes per shape (a bounded set of
+    # ~stage geometries that repeat across same-edge chunks -> replay, no per-chunk
+    # recompile), dynamic=True keeps one symbolic graph across M. DYNAMIC env picks.
+    if not DYNAMIC:
+        _orig_compile = torch.compile
+
+        def _forced(fn=None, **kw):
+            kw["dynamic"] = False
+            return _orig_compile(fn, **kw) if fn is not None else _orig_compile(**kw)
+
+        torch.compile = _forced
+
     import deepsz.gnn_codec as gcodec
     from deepsz.gnn_codec import GNNCompressorCodec, _read_stream
 
@@ -144,7 +163,7 @@ def _run_point() -> None:
         torch.cuda.empty_cache()
     real_nch = int(np.prod([-(-n // e) for n, e in zip(shape, meta["chunks"])]))
     print(
-        f"POINT nchunks={real_nch} mode={mode} "
+        f"POINT nchunks={real_nch} mode={mode} dynamic={int(DYNAMIC)} "
         f"compiled={int(bool(meta.get('compiled')))} secs={best:.3f} "
         f"shape={'x'.join(map(str, shape))}",
         flush=True,
