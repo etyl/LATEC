@@ -59,7 +59,7 @@ _COMPILE_AUTO_CROSSOVER: int | None = None
 # explicitly (2-D 9, 3-D 7, 4-D 5 -> anchor_stride 512 / 128 / 32; 4-D keeps the
 # edge-32 operating point). Ranks outside the table fall back to the
 # constant-points-per-chunk rule below.
-_RANK_LEVELS = {2: 9, 3: 7, 4: 5, 5: 4}
+_RANK_LEVELS = {2: 8, 3: 6, 4: 5, 5: 4}
 
 
 def _auto_levels(shape: tuple[int, ...]) -> int:
