@@ -903,9 +903,11 @@ class GNNCompressorCodec:
         # ops that aren't in the GEMMs). Stored in meta so decode uses the same
         # compiled float path. First encode pays a one-off compilation cost.
         self.compile = bool(compile)
-        # gate: scale-gated interp fallback (chunked path only). The encoder
-        # sweeps (T, shift) per chunk-stage against the true residuals and
-        # writes the winners into the header, so the gate self-disables where
+        # gate: scale-gated interp fallback. Applies to both the chunked and the
+        # whole-tensor path -- the gate is device-only, so a gated whole-tensor
+        # encode is realised as a single chunk covering the shape (see compress).
+        # The encoder sweeps (T, shift) per chunk-stage against the true residuals
+        # and writes the winners into the header, so the gate self-disables where
         # it does not pay (e.g. high eb) and the stream stays byte-identical
         # when every choice is off. Buys ~2 bpv at eb=1e-6 on RTI.
         self.gate = bool(gate)
@@ -973,6 +975,14 @@ class GNNCompressorCodec:
             {_per_step_eb_ratio(c, levels) for c in coarse_candidates}
         )
         edges = self._chunk_edges(shape, anchor_stride)
+        if edges is None and self.gate:
+            # The scale-gated interp fallback lives entirely in the device chunked
+            # inner loop; the numpy whole-tensor path has no gate. So when the gate
+            # is enabled, realise a "gated whole-tensor" encode as a single chunk
+            # covering the whole shape (grid 1 per axis, edges rounded up to the
+            # anchor stride) -- one GPU pass, same memory footprint as whole-tensor,
+            # but the gate applies. gate=False keeps the plain numpy whole path.
+            edges = tuple(-(-n // anchor_stride) * anchor_stride for n in shape)
         # torch.compile costs seconds of dynamo warmup per process; only worth
         # it when there are enough chunk waves to amortize. Frozen into the
         # stream meta so decode replays the same float path.

@@ -184,6 +184,33 @@ def test_chunked_matches_whole_bound(current_ckpt):
     assert _maxerr(yc, x) <= chunk.error_bound
 
 
+def test_gate_applies_on_whole_tensor_path(current_ckpt):
+    """gate=True with chunk_size=0 (whole-tensor): the gate is device-only, so a
+    gated whole-tensor encode is realised as a single chunk covering the shape
+    (grid 1 per axis). The stream then carries chunk metadata and honours the
+    bound; the ungated whole-tensor encode stays on the plain numpy path."""
+    from deepsz.gnn_codec import _read_stream
+
+    rng = np.random.RandomState(3)
+    x = rng.rand(20, 24).astype(np.float32)
+
+    gated = GNNCompressorCodec(
+        current_ckpt, error_bound=1e-4, levels=LEVELS, chunk_size=0,
+        fp16=False, compile=False, gate=True,
+    )
+    plain = GNNCompressorCodec(
+        current_ckpt, error_bound=1e-4, levels=LEVELS, chunk_size=0,
+        fp16=False, compile=False, gate=False,
+    )
+
+    sg = gated.compress(x)
+    meta_g = _read_stream(sg)[0]
+    # gate routes the whole-tensor case through a single chunk covering the shape
+    assert meta_g["chunks"] == [20, 24]  # ceil(shape, anchor_stride=1<<LEVELS)
+    assert "chunks" not in _read_stream(plain.compress(x))[0]  # numpy whole path
+    assert _maxerr(gated.uncompress(sg), x) <= gated.error_bound
+
+
 def test_auto_chunk_selection(current_ckpt):
     """chunk_size=None: whole-tensor for small inputs, chunked past the
     threshold; forced int must be a multiple of anchor_stride."""
