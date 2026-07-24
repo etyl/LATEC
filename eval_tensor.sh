@@ -15,7 +15,7 @@ module purge
 module load pytorch-gpu
 
 export PYTHONUNBUFFERED=1   # flush progress to the SLURM .out live
-export DEEPSZ_M_TILE=$((32**4))   # M-tiling off for the selected chunk
+unset DEEPSZ_M_TILE
 
 # D128 checkpoint
 # CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260710-115201-7bbb4e/gnn_predictor.pt}
@@ -40,5 +40,4 @@ python scripts/eval_tensor.py "$DATA" \
     --tune "$TUNE" \
     --tune-size-slack "$TUNE_SIZE_SLACK" \
     --normalize \
-    --compile \
     "$@"

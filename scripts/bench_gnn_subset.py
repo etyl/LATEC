@@ -315,15 +315,17 @@ def main(argv=None):
         lo, hi = float(sub.min()), float(sub.max())
         sub = (sub.astype(np.float32) - lo) / max(hi - lo, 1e-12)
         print(f"normalized [{lo:.4g},{hi:.4g}] -> [0,1]")
-    eb = (
-        args.eb * max(float(sub.max()) - float(sub.min()), 1.0) if args.rel else args.eb
-    )
+    span = max(float(sub.max()) - float(sub.min()), 1.0)
+    eb = args.eb * span if args.rel else args.eb
 
     from deepsz.gnn_codec import GNNCompressorCodec
 
+    # GNNCompressorCodec normalizes internally and treats error_bound as
+    # relative to (max - min); convert this script's absolute eb (used below
+    # for the PASS/FAIL report) back to that.
     codec = GNNCompressorCodec(
         args.gnn_checkpoint,
-        error_bound=eb,
+        error_bound=eb / span,
         levels=args.levels,
         radius=args.radius,
         zstd_level=args.zstd_level,

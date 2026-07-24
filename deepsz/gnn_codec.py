@@ -23,7 +23,7 @@ from .rans import SCALE_HI_MULT, SCALE_LO_DIV, build_laplace_tables, scale_to_le
 
 
 _MAGIC = b"DEEPSZGN"
-_VERSION = 7
+_VERSION = 8
 _PREFIX = "<8sII"
 _PREFIX_SIZE = struct.calcsize(_PREFIX)
 _ANCHOR_BLOCK = 1
@@ -495,7 +495,12 @@ def _quantize_t(torch, x, pred, eb, radius, round_output):
     (codes int64, recon float32 with outliers substituted, outliers float32 in
     scan order). ``recon`` is exactly the numpy encoder's committed
     reconstruction and ``codes`` are bit-identical to the numpy quantizer
-    (verified), so the host decoder reproduces this recon exactly."""
+    (verified), so the host decoder reproduces this recon exactly.
+
+    ``round_output`` matches ``quantizer.quantize``: ``True`` verifies against
+    the rounded-to-integer reconstruction, a ``(span, offset)`` pair verifies
+    against ``round(recon * span + offset)`` converted back to ``x``'s
+    (normalized) units, ``False``/falsy skips the check."""
     x = x.reshape(-1).to(torch.float32)
     pred = pred.reshape(-1).to(torch.float32)
     w = 2.0 * eb
@@ -504,7 +509,15 @@ def _quantize_t(torch, x, pred, eb, radius, round_output):
     z = torch.zeros_like(q)
     codes = torch.where(in_range, q + radius, z)
     recon = (pred.double() + w * (codes - radius).double()).to(torch.float32)
-    recon_chk = torch.round(recon) if round_output else recon
+    if round_output is True:
+        recon_chk = torch.round(recon)
+    elif round_output:
+        span, offset = round_output
+        recon_chk = (
+            (torch.round(recon.double() * span + offset) - offset) / span
+        ).to(torch.float32)
+    else:
+        recon_chk = recon
     ok = in_range & ((x - recon_chk).abs() <= float(np.float32(eb)))
     codes = torch.where(ok, codes, z)
     is_out = codes == 0
@@ -850,12 +863,18 @@ class GNNCompressorCodec:
     numpy array or torch tensor of any rank and returns bytes. ``uncompress``
     accepts those bytes and returns a torch tensor with the original shape and
     dtype.
+
+    The tensor is always min-max normalized to [0, 1] internally (the GNN
+    operates in that range regardless of the input's raw scale), and
+    ``error_bound`` is relative to the data range: it is applied directly to
+    the normalized tensor, so ``eb=0.01`` means 1% of ``max(x) - min(x)``
+    regardless of the tensor's raw units.
     """
 
     def __init__(
         self,
         checkpoint_path: str | Path,
-        error_bound: float = 1e-2,
+        error_bound: float = 1e-2,  # relative to the tensor's (max - min); see class docstring
         *,
         levels: int | str = "auto",
         radius: int = 1 << 15,
@@ -982,6 +1001,15 @@ class GNNCompressorCodec:
         vmax = float(values.max())
         if vmax <= vmin:
             vmax = vmin + 1.0
+        # Normalize to [0, 1]: the GNN always operates in that range, and it
+        # makes error_bound naturally relative -- applied directly below, with
+        # no separate rescale, it means a fraction of (vmax - vmin).
+        values = (values - vmin) / (vmax - vmin)
+        # Integer sources: the final decompressed value is rounded to the
+        # nearest raw integer (_restore_dtype), so the quantizer must verify
+        # the bound against that rounded value, not the normalized one -- see
+        # quantize()'s round_output=(span, offset) contract.
+        round_output = (vmax - vmin, vmin) if dtype.kind in "bi" else False
         eb = self.error_bound if error_bound is None else float(error_bound)
         if eb <= 0:
             raise ValueError("error_bound must be > 0")
@@ -1035,11 +1063,11 @@ class GNNCompressorCodec:
             gates = None
             if edges is None:
                 payload = self._compress_payload(
-                    values, dtype, eb, vmin, vmax, ratio, levels, anchor_stride
+                    values, round_output, eb, ratio, levels, anchor_stride
                 )
             else:
                 payload, gates = self._compress_chunked_payload(
-                    values, dtype, eb, vmin, vmax, ratio, edges, use_compile,
+                    values, round_output, eb, ratio, edges, use_compile,
                     levels, anchor_stride,
                 )
                 if gates is not None and not any(gates):
@@ -1089,7 +1117,7 @@ class GNNCompressorCodec:
             edges = tuple(int(e) for e in meta["chunks"])
             levels = int(meta["levels"])
             anchor_stride = 1 << levels
-            predictor = self._chunked_predictor(vmin, vmax, levels, meta)
+            predictor = self._chunked_predictor(levels, meta)
             ebs = _chunk_stage_ebs(
                 shape,
                 levels,
@@ -1112,12 +1140,13 @@ class GNNCompressorCodec:
                 )
             finally:
                 _gp._M_TILE = saved_tile
+            values = values * (vmax - vmin) + vmin  # undo compress()'s [0, 1] normalize
             out = _restore_dtype(values.reshape(original_shape), dtype)
             return torch.as_tensor(out)
 
         levels = int(meta["levels"])
         anchor_stride = 1 << levels
-        predictor = self._predictor(vmin, vmax, levels, meta)
+        predictor = self._predictor(levels, meta)
         masks = stage_masks(
             shape,
             levels,
@@ -1135,6 +1164,7 @@ class GNNCompressorCodec:
         values = _decompress_region(
             payload, shape, masks, ebs, int(meta["radius"]), predictor, True
         )
+        values = values * (vmax - vmin) + vmin  # undo compress()'s [0, 1] normalize
         out = _restore_dtype(values.reshape(original_shape), dtype)
         return torch.as_tensor(out)
 
@@ -1143,15 +1173,13 @@ class GNNCompressorCodec:
     def _compress_payload(
         self,
         values: np.ndarray,
-        dtype: np.dtype,
+        round_output: bool | tuple[float, float],
         eb: float,
-        vmin: float,
-        vmax: float,
         eb_ratio: float,
         levels: int,
         anchor_stride: int,
     ) -> bytes:
-        predictor = self._predictor(vmin, vmax, levels)
+        predictor = self._predictor(levels)
         masks = stage_masks(values.shape, levels, anchor_stride, _ANCHOR_BLOCK)
         ebs = stage_ebs(
             values.shape,
@@ -1168,7 +1196,7 @@ class GNNCompressorCodec:
             ebs,
             predictor,
             self.radius,
-            dtype.kind in "bi",
+            round_output,
             stats,
         )
         return payload
@@ -1176,17 +1204,15 @@ class GNNCompressorCodec:
     def _compress_chunked_payload(
         self,
         values: np.ndarray,
-        dtype: np.dtype,
+        round_output: bool | tuple[float, float],
         eb: float,
-        vmin: float,
-        vmax: float,
         eb_ratio: float,
         edges: tuple[int, ...],
         use_compile: bool,
         levels: int,
         anchor_stride: int,
     ) -> tuple[bytes, list[int] | None]:
-        predictor = self._chunked_predictor(vmin, vmax, levels)
+        predictor = self._chunked_predictor(levels)
         predictor.compile = bool(use_compile)
         ebs = _chunk_stage_ebs(
             values.shape,
@@ -1200,7 +1226,7 @@ class GNNCompressorCodec:
             values[None, ...],
             ebs,
             self.radius,
-            dtype.kind in "bi",
+            round_output,
             predictor,
             edges,
             gate=self.gate,
@@ -1209,16 +1235,16 @@ class GNNCompressorCodec:
 
     def _chunked_predictor(
         self,
-        vmin: float,
-        vmax: float,
         levels: int,
         meta: dict[str, Any] | None = None,
     ) -> ChunkedGNNPredictor:
+        # vmin/vmax are always 0.0/1.0: compress() normalizes the tensor to
+        # [0, 1] up front, so the predictor never sees raw-scale values.
         anchor_stride = 1 << levels
         predictor = ChunkedGNNPredictor(
             self.checkpoint_path,
-            vmin,
-            vmax,
+            0.0,
+            1.0,
             device=self.device,
             levels=levels,
             anchor_stride=anchor_stride,
@@ -1231,16 +1257,14 @@ class GNNCompressorCodec:
 
     def _predictor(
         self,
-        vmin: float,
-        vmax: float,
         levels: int,
         meta: dict[str, Any] | None = None,
     ) -> GNNPredictor:
         anchor_stride = 1 << levels
         return GNNPredictor(
             self.checkpoint_path,
-            vmin,
-            vmax,
+            0.0,
+            1.0,
             max_radius=anchor_stride,
             device=self.device,
             levels=levels,

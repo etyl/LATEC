@@ -287,10 +287,14 @@ def main(argv=None):
     print("\nCodec roundtrip error-bound check (whole-tensor path):")
     from deepsz.gnn_codec import GNNCompressorCodec
 
+    # GNNCompressorCodec normalizes internally and treats error_bound as
+    # relative to (max - min); convert args.eb (absolute, used in the PASS/FAIL
+    # check below) back to that.
+    span = max(float(x.max()) - float(x.min()), 1.0)
     for lvl in sorted(set(tested) | {ref_level}):
         codec = GNNCompressorCodec(
             ckpt_for_level(lvl),
-            error_bound=args.eb,
+            error_bound=args.eb / span,
             levels=args.levels,
             radius=args.radius,
             chunk_size=0,

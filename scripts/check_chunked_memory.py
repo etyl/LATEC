@@ -103,8 +103,12 @@ def main():
         f"eb={args.eb}, d={args.d}, rans backend: {backend}"
     )
 
+    # GNNCompressorCodec normalizes internally and treats error_bound as
+    # relative to (max - min); convert args.eb (absolute, used in the
+    # OK/VIOLATED check below) back to that.
+    span = max(float(x.max()) - float(x.min()), 1.0)
     codec = GNNCompressorCodec(
-        ckpt, error_bound=args.eb, levels=args.levels, chunk_size=args.chunk_size
+        ckpt, error_bound=args.eb / span, levels=args.levels, chunk_size=args.chunk_size
     )
 
     t0 = time.time()

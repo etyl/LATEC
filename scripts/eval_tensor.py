@@ -139,9 +139,13 @@ def main(argv=None):
         os.environ.setdefault("DEEPSZ_PROGRESS", "1")  # per-chunk progress to stderr
         from deepsz.gnn_codec import GNNCompressorCodec
 
+        # GNNCompressorCodec normalizes the tensor internally and treats
+        # error_bound as relative to (max - min); convert this script's
+        # absolute eb (used below for report()/baselines) back to that.
+        gnn_span = max(float(arr.max()) - float(arr.min()), 1.0)
         codec = GNNCompressorCodec(
             args.gnn_checkpoint,
-            error_bound=eb,
+            error_bound=eb / gnn_span,
             levels=args.levels if levels_explicit else "auto",
             radius=args.radius,
             zstd_level=args.zstd_level,

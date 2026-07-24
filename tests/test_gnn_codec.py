@@ -139,7 +139,8 @@ def test_numpy_nd_tensor_roundtrip(tiny_checkpoint):
 
     rng = np.random.RandomState(0)
     x = rng.rand(5, 6, 4).astype(np.float32)
-    codec = _codec(tiny_checkpoint, eb=0.01)
+    eb = 0.01  # relative to (x.max() - x.min())
+    codec = _codec(tiny_checkpoint, eb=eb)
 
     stream = codec.compress(x)
     y = codec.uncompress(stream)
@@ -162,18 +163,21 @@ def test_numpy_nd_tensor_roundtrip(tiny_checkpoint):
     assert isinstance(y, torch.Tensor)
     assert tuple(y.shape) == x.shape
     assert y.dtype == torch.float32
-    assert torch.max(torch.abs(y - torch.from_numpy(x))) <= 0.01
+    abs_eb = eb * float(x.max() - x.min())
+    assert torch.max(torch.abs(y - torch.from_numpy(x))) <= abs_eb
 
 
 def test_torch_tensor_input_roundtrip(tiny_checkpoint):
     x = torch.linspace(-1.0, 1.0, 35, dtype=torch.float32).reshape(7, 5)
-    codec = _codec(tiny_checkpoint, eb=0.005)
+    eb = 0.005  # relative to (x.max() - x.min()) == 2.0
+    codec = _codec(tiny_checkpoint, eb=eb)
 
     y = codec.uncompress(codec.compress(x))
 
     assert tuple(y.shape) == tuple(x.shape)
     assert y.dtype == x.dtype
-    assert torch.max(torch.abs(y - x)) <= 0.005
+    abs_eb = eb * float(x.max() - x.min())
+    assert torch.max(torch.abs(y - x)) <= abs_eb
 
 
 def test_scalar_shape_roundtrip(tiny_checkpoint):
@@ -184,4 +188,6 @@ def test_scalar_shape_roundtrip(tiny_checkpoint):
 
     assert tuple(y.shape) == ()
     assert y.dtype == torch.float32
+    # a single value has no range: compress() falls back to span=1, so
+    # relative and absolute eb coincide here.
     assert torch.abs(y - torch.tensor(3.25)) <= 0.001

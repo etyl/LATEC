@@ -23,7 +23,7 @@ def quantize(
     pred: np.ndarray,
     eb: float,
     radius: int = DEFAULT_RADIUS,
-    round_output: bool = False,
+    round_output: bool | tuple[float, float] = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Quantize values ``x`` against predictions ``pred``.
 
@@ -34,7 +34,11 @@ def quantize(
     ``round_output=True`` verifies the bound against the rounded-to-integer
     reconstruction — required for integer sources, where the final cast can
     otherwise push the error past eb (e.g. eb=1.5, float error 1.5 rounds to
-    integer error 2).
+    integer error 2). Pass ``(span, offset)`` instead of ``True`` when ``x``
+    is itself normalized (e.g. to [0, 1]) but the final output is rounded to
+    an integer in the *raw* ``x * span + offset`` units -- the reconstruction
+    is verified as ``(round(recon * span + offset) - offset) / span``, i.e.
+    against the actual value the caller will round downstream.
     """
     if eb <= 0:
         raise ValueError(f"error bound must be > 0, got {eb}")
@@ -51,8 +55,13 @@ def quantize(
 
     # Verify with the decoder's own arithmetic; demote violators to outliers.
     recon = _recon_from_codes(pred, codes, eb, radius)
-    if round_output:
+    if round_output is True:
         recon = np.rint(recon)
+    elif round_output:
+        span, offset = round_output
+        recon = (
+            (np.rint(recon.astype(np.float64) * span + offset) - offset) / span
+        ).astype(np.float32)
     ok = in_range & (np.abs(x - recon) <= np.float32(eb))
     codes[~ok] = 0
     outlier_vals = x[codes == 0].copy()

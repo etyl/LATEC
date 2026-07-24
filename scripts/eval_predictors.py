@@ -117,9 +117,13 @@ def eval_gnn_chunked(img: np.ndarray, eb: float, args) -> dict:
     a fair chunked-vs-unchunked comparison)."""
     from deepsz.gnn_codec import GNNCompressorCodec
 
+    # GNNCompressorCodec normalizes internally and treats error_bound as
+    # relative to (max - min); convert eb (absolute, used in _quality() below,
+    # matching the interp/sz3 arms) back to that.
+    span = max(float(img.max()) - float(img.min()), 1.0)
     codec = GNNCompressorCodec(
         args.gnn_checkpoint,
-        error_bound=eb,
+        error_bound=eb / span,
         levels=args.levels,
         radius=args.radius,
         zstd_level=args.zstd_level,

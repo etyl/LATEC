@@ -27,7 +27,7 @@ export PYTHONUNBUFFERED=1          # flush progress to the SLURM .out live
 export DEEPSZ_M_TILE=$((32**4))    # M-tiling off for this explicitly sized chunk
 
 # GNN checkpoint (same one eval_tensor.sh uses; override with CKPT=...).
-CKPT=${CKPT:-./checkpoints/v6-d64-2agg.pt}
+CKPT=${CKPT:-./checkpoints/v6.1-d64-1agg.pt}
 
 # Large source tensor; a centred EDGE^ndim hypercube is cropped out of it.
 DATA=${DATA:-/lustre/fswork/projects/rech/lzs/uhq13gg/benchmark-scientific-data-compression/rti_75_density.npy}
@@ -44,9 +44,6 @@ python scripts/bench_gnn_subset.py "$DATA" \
     --eb "$EB" \
     --levels "$LEVELS" \
     --tune "$TUNE" \
-    --normalize \
     --label "$LABEL" \
-    --compile \
     --fp16 \
-    ${EXTRA:-} \
     "$@"

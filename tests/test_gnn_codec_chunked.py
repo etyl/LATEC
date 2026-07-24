@@ -105,8 +105,9 @@ def test_gate_roundtrip_and_header(current_ckpt):
         assert s_on == s_off
     else:
         assert any(g >> 4 for g in gates)
+    abs_eb = eb * float(f.max() - f.min())  # eb is relative to the data range
     for s in (s_on, s_off):
-        assert _maxerr(off.uncompress(s), f) <= eb
+        assert _maxerr(off.uncompress(s), f) <= abs_eb
 
 
 # --- roundtrip within the error bound --------------------------------------
@@ -129,18 +130,23 @@ def test_chunked_roundtrip_float(current_ckpt, shape):
         wave = np.cos(np.linspace(0, 2 * np.pi, s, dtype=np.float32))
         x = x + wave.reshape([-1 if i == k else 1 for i in range(len(shape))])
     x += rng.rand(*shape).astype(np.float32) * 0.05
-    codec = _codec(current_ckpt, eb=0.02, chunk_size=STRIDE)
+    eb = 0.02  # relative to (x.max() - x.min())
+    codec = _codec(current_ckpt, eb=eb, chunk_size=STRIDE)
 
     y = codec.uncompress(codec.compress(x))
 
     assert tuple(y.shape) == shape
-    assert _maxerr(y, x) <= 0.02
+    abs_eb = eb * float(x.max() - x.min())
+    assert _maxerr(y, x) <= abs_eb
 
 
 def test_chunked_roundtrip_integer(current_ckpt):
     rng = np.random.RandomState(7)
     x = (rng.rand(8, 8) * 50).astype(np.int32)
-    codec = _codec(current_ckpt, eb=1.0, chunk_size=STRIDE)
+    # eb is relative to (max - min) ~= 49; ~1.0 raw units, tight enough to
+    # exercise the integer-rounding check (quantize's round_output=(span, offset)).
+    eb = 1.0 / float(x.max() - x.min())
+    codec = _codec(current_ckpt, eb=eb, chunk_size=STRIDE)
 
     y = codec.uncompress(codec.compress(x))
 
