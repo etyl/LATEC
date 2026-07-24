@@ -188,15 +188,15 @@ def test_auto_chunk_selection(current_ckpt):
     """chunk_size=None: whole-tensor for small inputs, chunked past the
     threshold; forced int must be a multiple of anchor_stride."""
     codec = _codec(current_ckpt, chunk_size=None)
-    assert codec._chunk_edges((16, 16)) is None  # small -> whole
+    assert codec._chunk_edges((16, 16), STRIDE) is None  # small -> whole
     big = (1 << 12, 1 << 12)  # 16.7M points -> chunked
-    edges = codec._chunk_edges(big)
+    edges = codec._chunk_edges(big, STRIDE)
     assert edges is not None
     assert all(e % STRIDE == 0 and e > 0 for e in edges)
     assert np.prod([min(e, n) for e, n in zip(edges, big)]) <= 1 << 21
     assert np.prod([min(e + STRIDE, n) for e, n in zip(edges, big)]) > 1 << 21
 
-    elongated = codec._chunk_edges((1 << 20, 16))
+    elongated = codec._chunk_edges((1 << 20, 16), STRIDE)
     assert elongated[1] >= 16
     assert elongated[0] > edges[0]  # short axis leaves room for a longer chunk
 

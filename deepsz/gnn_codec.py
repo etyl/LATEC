@@ -35,6 +35,63 @@ _AUTO_CHUNK_THRESHOLD = 1 << 21
 # fused embed saves ~ms per wave). ponytail: rough amortization cutoff, tune if
 # compile cost or per-wave savings change materially.
 _COMPILE_MIN_CHUNKS = 64
+# Schedule depth per input rank for ``levels="auto"``. The common ranks are set
+# explicitly (2-D 9, 3-D 7, 4-D 5 -> anchor_stride 512 / 128 / 32; 4-D keeps the
+# edge-32 operating point). Ranks outside the table fall back to the
+# constant-points-per-chunk rule below.
+_RANK_LEVELS = {2: 9, 3: 7, 4: 5}
+
+
+def _auto_levels(shape: tuple[int, ...]) -> int:
+    """Levels for ``levels="auto"``, chosen from the rank of the input.
+
+    The schedule depth follows the input rank, not its size: a chunk is about one
+    to a few anchor cells (``anchor_stride**ndim = 2**(levels*ndim)`` points), so
+    keying the stride off the rank keeps an ~constant number of points per chunk.
+    ``_RANK_LEVELS`` fixes the tuned common ranks; other ranks fall back to
+    ``floor(log2(points_per_chunk) / ndim)`` from the auto-chunk point budget
+    (``_AUTO_CHUNK_THRESHOLD``), so a cell stays within budget -- higher-rank
+    tensors get a smaller stride, lower-rank a larger one.
+
+    A size guard then keeps ``anchor_stride <= max_axis / 2`` so a small or
+    low-rank input still carries at least two anchors on its largest axis rather
+    than collapsing to a lone corner anchor."""
+    ndim = len(shape)
+    if ndim in _RANK_LEVELS:
+        rank_levels = _RANK_LEVELS[ndim]
+    else:
+        budget_log2 = _AUTO_CHUNK_THRESHOLD.bit_length() - 1  # log2 points/chunk
+        rank_levels = budget_log2 // ndim
+    max_axis = int(max(shape))
+    size_cap = max(1, (max_axis.bit_length() - 1) - 1)  # anchor_stride <= max/2
+    return max(1, min(rank_levels, size_cap))
+
+
+# eb_ratio for the GNN codec is a *coarsest-level* factor r_end, not a raw
+# per-step decay: the finest level always keeps the full eb and the coarsest
+# level lands on eb * r_end. It is depth-normalised into stage_ebs's per-step
+# ratio at compress time (see _per_step_eb_ratio), so the coarse/fine spread is
+# invariant to the now rank-dependent schedule depth. Without this, a fixed
+# per-step ratio compounds as ratio**(levels-1): 0.8 gives 0.8**4=0.41x at 4-D
+# (levels 5) but 0.8**8=0.17x at 2-D (levels 9), i.e. wildly different budgets.
+# Default 0.41 == 0.8**4 reproduces the per-step 0.8 the 4-D levels=5 point was
+# tuned at. The size sweep explores coarser->flatter spreads.
+_GNN_EB_COARSE_FACTOR = 0.41
+_GNN_EB_COARSE_SWEEP = (1.0, 0.65, 0.41, 0.25)
+
+
+def _per_step_eb_ratio(coarse_factor: float, levels: int) -> float:
+    """Depth-normalise a coarsest-level factor into ``stage_ebs``'s per-step ratio.
+
+    ``stage_ebs`` tightens the level at ``depth`` by ``ratio ** depth`` with
+    ``depth`` in ``[0, levels-1]``. Returning ``coarse_factor ** (1/(levels-1))``
+    makes the coarsest level land on exactly ``eb * coarse_factor`` for any
+    schedule depth, so the same knob means the same thing across ranks. At
+    ``levels == 1`` there is a single (finest) level, so the factor is meaningless
+    and a flat 1.0 is returned."""
+    if levels <= 1:
+        return 1.0
+    return float(coarse_factor) ** (1.0 / (levels - 1))
 
 
 def _log(msg):
@@ -780,11 +837,11 @@ class GNNCompressorCodec:
         checkpoint_path: str | Path,
         error_bound: float = 1e-2,
         *,
-        levels: int = 5,
+        levels: int | str = "auto",
         radius: int = 1 << 15,
         device: str | None = None,  # None -> cuda if available, else cpu
         zstd_level: int = 9,
-        eb_ratio: float | None = None,  # None = auto: fast -> 0.8, size -> sweep
+        eb_ratio: float | None = None,  # coarsest-level factor; None=auto (fast/sweep)
         tune: str = "fast",
         strict_checkpoint: bool = True,
         chunk_size: int | tuple[int, ...] | None = None,
@@ -801,12 +858,25 @@ class GNNCompressorCodec:
             raise ValueError("tune must be 'fast' or 'size'")
 
         self.error_bound = float(error_bound)
-        self.levels = int(levels)
-        if self.levels < 1:
-            raise ValueError("levels must be >= 1")
-        # A level is one dyadic refinement, so inference always starts on the
-        # unique coarse grid that reaches unit stride after ``levels`` steps.
-        self.anchor_stride = 1 << self.levels
+        # levels: an explicit int fixes the dyadic schedule depth; "auto" (the
+        # default) picks it per input shape at compress time (see _auto_levels),
+        # since anchor_stride = 2**levels is capped by the smallest axis. In auto
+        # mode self.levels / self.anchor_stride stay None until compress resolves
+        # them; decode always reads the resolved levels back from the stream.
+        if isinstance(levels, str):
+            if levels != "auto":
+                raise ValueError("levels must be a positive int or 'auto'")
+            self.auto_levels = True
+            self.levels = None
+            self.anchor_stride = None
+        else:
+            self.auto_levels = False
+            self.levels = int(levels)
+            if self.levels < 1:
+                raise ValueError("levels must be >= 1")
+            # A level is one dyadic refinement, so inference always starts on the
+            # unique coarse grid that reaches unit stride after ``levels`` steps.
+            self.anchor_stride = 1 << self.levels
         self.radius = int(radius)
         if device is None:
             import torch
@@ -814,6 +884,9 @@ class GNNCompressorCodec:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
         self.zstd_level = int(zstd_level)
+        # coarsest-level error-bound factor (finest level always keeps full eb);
+        # None -> auto (fast: _GNN_EB_COARSE_FACTOR, size: sweep). Depth-normalised
+        # per resolved levels at compress time so it is rank-invariant.
         self.eb_ratio = eb_ratio
         self.tune = tune
         self.strict_checkpoint = bool(strict_checkpoint)
@@ -838,7 +911,9 @@ class GNNCompressorCodec:
         self.gate = bool(gate)
         self.checkpoint_hash = self._checkpoint_hash()
 
-    def _chunk_edges(self, shape: tuple[int, ...]) -> tuple[int, ...] | None:
+    def _chunk_edges(
+        self, shape: tuple[int, ...], anchor_stride: int
+    ) -> tuple[int, ...] | None:
         """Chunk edges for this shape, or None for the whole-tensor path."""
         cs = self.chunk_size
         if cs == 0:
@@ -846,14 +921,14 @@ class GNNCompressorCodec:
         if cs is None:
             if int(np.prod(shape)) <= _AUTO_CHUNK_THRESHOLD:
                 return None
-            return _auto_chunk_edges(shape, self.anchor_stride)
+            return _auto_chunk_edges(shape, anchor_stride)
         edges = (
             (int(cs),) * len(shape) if np.isscalar(cs) else tuple(int(e) for e in cs)
         )
         if len(edges) != len(shape):
             raise ValueError("chunk_size must be scalar or one entry per axis")
         for e in edges:
-            if e < self.anchor_stride or e % self.anchor_stride:
+            if e < anchor_stride or e % anchor_stride:
                 raise ValueError(
                     "chunk_size must be a positive multiple of anchor_stride"
                 )
@@ -879,12 +954,25 @@ class GNNCompressorCodec:
         if eb <= 0:
             raise ValueError("error_bound must be > 0")
 
-        ratio_candidates = (
+        # eb_ratio is a coarsest-level factor (see _GNN_EB_COARSE_FACTOR); depth-
+        # normalise it against the resolved schedule depth so the coarse/fine
+        # spread is the same across ranks. The set dedups the levels==1 case
+        # where every factor collapses to a flat 1.0 (one encode, not four).
+        coarse_candidates = (
             [float(self.eb_ratio)]
             if self.eb_ratio is not None
-            else ([1.0, 0.9, 0.8, 0.7] if self.tune == "size" else [0.8])
+            else (
+                list(_GNN_EB_COARSE_SWEEP)
+                if self.tune == "size"
+                else [_GNN_EB_COARSE_FACTOR]
+            )
         )
-        edges = self._chunk_edges(shape)
+        levels = _auto_levels(shape) if self.auto_levels else self.levels
+        anchor_stride = 1 << levels
+        ratio_candidates = sorted(
+            {_per_step_eb_ratio(c, levels) for c in coarse_candidates}
+        )
+        edges = self._chunk_edges(shape, anchor_stride)
         # torch.compile costs seconds of dynamo warmup per process; only worth
         # it when there are enough chunk waves to amortize. Frozen into the
         # stream meta so decode replays the same float path.
@@ -898,10 +986,13 @@ class GNNCompressorCodec:
         for ratio in ratio_candidates:
             gates = None
             if edges is None:
-                payload = self._compress_payload(values, dtype, eb, vmin, vmax, ratio)
+                payload = self._compress_payload(
+                    values, dtype, eb, vmin, vmax, ratio, levels, anchor_stride
+                )
             else:
                 payload, gates = self._compress_chunked_payload(
-                    values, dtype, eb, vmin, vmax, ratio, edges, use_compile
+                    values, dtype, eb, vmin, vmax, ratio, edges, use_compile,
+                    levels, anchor_stride,
                 )
                 if gates is not None and not any(gates):
                     gates = None  # gate never fired -> plain ungated stream
@@ -909,7 +1000,7 @@ class GNNCompressorCodec:
                 "shape": list(original_shape),
                 "dtype": dtype.str,
                 "error_bound": eb,
-                "levels": self.levels,
+                "levels": levels,
                 "radius": self.radius,
                 "vmin": vmin,
                 "vmax": vmax,
@@ -948,9 +1039,9 @@ class GNNCompressorCodec:
 
         if "chunks" in meta:
             edges = tuple(int(e) for e in meta["chunks"])
-            predictor = self._chunked_predictor(vmin, vmax, meta)
             levels = int(meta["levels"])
             anchor_stride = 1 << levels
+            predictor = self._chunked_predictor(vmin, vmax, levels, meta)
             ebs = _chunk_stage_ebs(
                 shape,
                 levels,
@@ -976,9 +1067,9 @@ class GNNCompressorCodec:
             out = _restore_dtype(values.reshape(original_shape), dtype)
             return torch.as_tensor(out)
 
-        predictor = self._predictor(vmin, vmax, meta)
         levels = int(meta["levels"])
         anchor_stride = 1 << levels
+        predictor = self._predictor(vmin, vmax, levels, meta)
         masks = stage_masks(
             shape,
             levels,
@@ -1009,15 +1100,15 @@ class GNNCompressorCodec:
         vmin: float,
         vmax: float,
         eb_ratio: float,
+        levels: int,
+        anchor_stride: int,
     ) -> bytes:
-        predictor = self._predictor(vmin, vmax)
-        masks = stage_masks(
-            values.shape, self.levels, self.anchor_stride, _ANCHOR_BLOCK
-        )
+        predictor = self._predictor(vmin, vmax, levels)
+        masks = stage_masks(values.shape, levels, anchor_stride, _ANCHOR_BLOCK)
         ebs = stage_ebs(
             values.shape,
-            self.levels,
-            self.anchor_stride,
+            levels,
+            anchor_stride,
             _ANCHOR_BLOCK,
             eb,
             eb_ratio,
@@ -1044,13 +1135,15 @@ class GNNCompressorCodec:
         eb_ratio: float,
         edges: tuple[int, ...],
         use_compile: bool,
+        levels: int,
+        anchor_stride: int,
     ) -> tuple[bytes, list[int] | None]:
-        predictor = self._chunked_predictor(vmin, vmax)
+        predictor = self._chunked_predictor(vmin, vmax, levels)
         predictor.compile = bool(use_compile)
         ebs = _chunk_stage_ebs(
             values.shape,
-            self.levels,
-            self.anchor_stride,
+            levels,
+            anchor_stride,
             _ANCHOR_BLOCK,
             eb,
             eb_ratio,
@@ -1070,9 +1163,9 @@ class GNNCompressorCodec:
         self,
         vmin: float,
         vmax: float,
+        levels: int,
         meta: dict[str, Any] | None = None,
     ) -> ChunkedGNNPredictor:
-        levels = self.levels if meta is None else int(meta["levels"])
         anchor_stride = 1 << levels
         predictor = ChunkedGNNPredictor(
             self.checkpoint_path,
@@ -1092,9 +1185,9 @@ class GNNCompressorCodec:
         self,
         vmin: float,
         vmax: float,
+        levels: int,
         meta: dict[str, Any] | None = None,
     ) -> GNNPredictor:
-        levels = self.levels if meta is None else int(meta["levels"])
         anchor_stride = 1 << levels
         return GNNPredictor(
             self.checkpoint_path,
