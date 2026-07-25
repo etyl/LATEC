@@ -15,7 +15,7 @@ pytest.importorskip("constriction")  # rANS backend; skip if unavailable
 
 from deepsz import GNNCompressorCodec
 import deepsz.gnn_predictor as gp
-from deepsz.gnn_codec import _chunk_device_plan, _chunk_waves
+from deepsz.gnn_codec import _chunk_device_plan
 from deepsz.gnn_predictor import (
     CKPT_VERSION,
     ChunkedGNNPredictor,
@@ -278,27 +278,12 @@ def test_auto_chunk_selection(current_ckpt):
         bad.compress(np.zeros((8, 8), np.float32))
 
 
-# --- color ordering: same-color chunks are mutually independent --------------
-
-
-def test_chunk_waves_are_mutually_independent():
-    """Every wave's chunks are >=2 apart on each axis they differ, so their
-    one-chunk-thick halos never overlap and sequential order is immaterial."""
-    grid = (6, 4)
-    for wave in _chunk_waves(grid):
-        coords = [np.unravel_index(ci, grid) for ci in wave]
-        for i in range(len(coords)):
-            for j in range(i + 1, len(coords)):
-                diff = np.abs(np.array(coords[i]) - np.array(coords[j]))
-                assert diff.max() >= 2  # never adjacent (Chebyshev distance >= 2)
-
-
 def test_chunk_device_plan_uses_flat_integer_indices():
     """Stage indices select the same points as the schedule masks, both within
     a contiguous chunk block and within the flattened full reconstruction."""
     cshape = (4, 3)
     full_shape = (8, 7)
-    counts, positions, recon_offsets, _, _ = _chunk_device_plan(
+    _full, counts, positions, recon_offsets, _, _, _ = _chunk_device_plan(
         torch, "cpu", cshape, full_shape, LEVELS, STRIDE, 1
     )
     plan = stage_plan(cshape, LEVELS, STRIDE, 1)

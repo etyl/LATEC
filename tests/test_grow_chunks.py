@@ -1,12 +1,14 @@
-"""Grow chunk schedule (``GNNCompressorCodec(grow=True)``): each chunk owns the
-shared boundary hyperplane on its internal high faces (extended +1 block) and the
-right/bottom neighbour inherits it as an already-decoded low face (column-split).
+"""Extended-block chunk schedule (the only chunked schedule): each chunk owns
+the shared boundary hyperplane on its internal high faces (grown +1 block) and
+the right/bottom neighbour inherits it as an already-decoded low face
+(column-split). Cross-chunk context flows through the decoded recon array, so
+halo neighbours need no per-chunk coarse embedding (value-only halo).
 
 Correctness is the load-bearing property: the extended block + column-split must
 still code every off-grid cell exactly once (bound holds) and the decoder must
 reproduce the encoder's reconstruction bit for bit (raster order, shared
-column-split). Uses the random tiny checkpoint on CPU, in the fast suite. The gate
-composes with grow, so both are exercised."""
+column-split). Uses the random tiny checkpoint on CPU, in the fast suite. The
+gate composes with the schedule, so both are exercised."""
 
 import numpy as np
 import pytest
@@ -41,7 +43,6 @@ def _codec(path, gate, eb=1e-3, chunk_size=8):
         levels=2,  # anchor_stride 4; chunk_size 8 -> multi-chunk grid
         chunk_size=chunk_size,
         gate=gate,
-        grow=True,
         fp16=False,
         compile=False,
         device="cpu",
@@ -68,14 +69,6 @@ def test_grow_roundtrip_holds_bound(tiny_checkpoint, shape, gate):
     assert _maxerr(field, rec) <= eb * span + 1e-6
 
 
-def test_grow_stream_marks_schedule(tiny_checkpoint):
-    field = np.linspace(0, 1, 24 * 24, dtype=np.float32).reshape(24, 24)
-    meta, _ = _read_meta(_codec(tiny_checkpoint, gate=False).compress(field))
-    assert meta.get("grow") is True
-    plain, _ = _read_meta(_plain(tiny_checkpoint).compress(field))
-    assert "grow" not in plain
-
-
 def test_grow_decoder_matches_encoder_recon(tiny_checkpoint):
     rng = np.random.default_rng(1)
     field = rng.standard_normal((16, 16, 16)).astype(np.float32)
@@ -85,22 +78,11 @@ def test_grow_decoder_matches_encoder_recon(tiny_checkpoint):
     assert np.array_equal(rec1, rec2)
 
 
-def test_grow_and_edge_sched_mutually_exclusive(tiny_checkpoint):
-    with pytest.raises(ValueError):
-        GNNCompressorCodec(
-            tiny_checkpoint, error_bound=1e-3, levels=2, chunk_size=8,
-            grow=True, edge_sched=True, device="cpu",
-        )
-
-
-def _plain(path):
-    return GNNCompressorCodec(
-        path, error_bound=1e-3, levels=2, chunk_size=8, gate=False,
-        fp16=False, compile=False, device="cpu",
-    )
-
-
-def _read_meta(stream):
-    from deepsz.gnn_codec import _read_stream
-
-    return _read_stream(bytes(stream))
+def test_chunked_schedule_needs_no_coarse_table(tiny_checkpoint):
+    """The chunked predictor carries no per-chunk coarse embedding table -- its
+    cross-chunk context comes entirely from the decoded recon array."""
+    field = np.linspace(0, 1, 24 * 24, dtype=np.float32).reshape(24, 24)
+    codec = _codec(tiny_checkpoint, gate=False)
+    predictor = codec._chunked_predictor(codec.levels)
+    predictor.begin(field.shape, (8, 8))
+    assert not hasattr(predictor, "coarse")

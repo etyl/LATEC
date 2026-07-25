@@ -348,27 +348,6 @@ def _decode_anchor_stage(payload, off, recon, axes, eb0, radius):
     return off
 
 
-def _chunk_waves(grid: tuple[int, ...]) -> list[list[int]]:
-    """Group chunk ids into color waves. A wave = chunks with the same per-axis
-    parity ("color") and the same tensor-boundary signature. Same-color chunks
-    are >=2 apart on every axis they differ, so their halos (thickness one chunk)
-    never overlap. Ordered by color so a wave's cross-color neighbours in earlier
-    colors are already coded. Correctness (the error bound) holds for any order;
-    only which context is available, hence the ratio, shifts."""
-    groups: dict = {}
-    for ci in range(int(np.prod(grid))):
-        cidx = np.unravel_index(ci, grid)
-        color = tuple(int(i) % 2 for i in cidx)
-        bsig = tuple((int(i) == 0, int(i) == g - 1) for i, g in zip(cidx, grid))
-        groups.setdefault((color, bsig), []).append(ci)
-
-    def rank(key):
-        color, bsig = key
-        return (sum(b << k for k, b in enumerate(color)), bsig)
-
-    return [groups[k] for k in sorted(groups, key=rank)]
-
-
 # Scale-gated classical-predictor fallback: where the model's predicted scale b
 # sits below eb*2^T, its confidence is either genuine (high eb: the point is
 # ~free) or the learned-predictor precision floor talking (low eb) — only
@@ -570,13 +549,15 @@ def _compress_chunked(
     predictor: ChunkedGNNPredictor,
     edges: tuple[int, ...],
     gate: bool = False,
-    grow: bool = False,
 ) -> tuple[bytes, list[int] | None]:
     """Encode a global anchor pass followed by one chunk at a time.
 
-    Color-wave ordering (see ``_chunk_waves``) determines which neighbouring
-    chunks are available as causal context, but model memory is devoted to one
-    maximally sized chunk instead of batching several chunks together.
+    Extended-block raster schedule: each chunk owns its internal high-face
+    planes and inherits its low faces from the already-decoded up/left
+    neighbour (column-split out of its coded set), so interiors see both-sided
+    context across every chunk seam. Chunks run in strict raster order (owner
+    i-1 before inheritor i on every axis); the error bound holds for any order
+    since every cell is coded exactly once by its owner.
 
     Device-resident inner loop: after the (host) anchor pass, the reconstruction
     lives on the GPU and every per-stage step -- forward, pred/scale, cubic-interp
@@ -587,7 +568,6 @@ def _compress_chunked(
     per-stage path."""
     torch = predictor._torch
     dev = predictor.device
-    predictor.grow = grow
     c = values.shape[0]
     shape = values.shape[1:]
     stride, block = predictor.anchor_stride, predictor.anchor_block
@@ -595,7 +575,7 @@ def _compress_chunked(
     axes = _anchor_axes(shape, stride, block)
     _log(
         f"encode: shape={shape} edges={edges} device={predictor.device} "
-        f"grow={grow} coding anchors..."
+        f"coding anchors..."
     )
     anchor_bar = _progress_bar("encode anchors", 1, unit="stage")
     parts = [_code_anchor_stage(values, recon, axes, ebs[0], radius, round_output)]
@@ -606,19 +586,10 @@ def _compress_chunked(
     )
     predictor.begin(shape, edges, channels=c, geometry_progress=geom_bar.update)
     geom_bar.close()
-    coarse_bar = _progress_bar(
-        "encode anchor embeddings", predictor.n_chunks, unit="chunk"
-    )
-    predictor.anchor_coarse(recon, progress=coarse_bar.update)
-    coarse_bar.close()
     # hand recon to the GPU for the wave loop; it never returns to host on encode
     recon_t = torch.from_numpy(recon).to(dev)
     recon_flat = recon_t.reshape(c, -1)
-    # grow inherits low faces from the up/left neighbour, so it must run in raster
-    # order (owner i-1 before inheritor i on every axis); the plain schedule uses
-    # colour waves. The bound holds for either order (every cell is still coded
-    # exactly once by its owner); only the available context differs.
-    waves = [list(range(predictor.n_chunks))] if grow else _chunk_waves(predictor.grid)
+    waves = [list(range(predictor.n_chunks))]  # raster order (see docstring)
     _log(
         f"encode: anchors done, {predictor.n_chunks} chunks, "
         f"{predictor.n_chunks} model passes"
@@ -858,10 +829,8 @@ def _decompress_chunked(
     predictor: ChunkedGNNPredictor,
     edges: tuple[int, ...],
     gates: list[int] | None = None,
-    grow: bool = False,
 ) -> np.ndarray:
     c = 1
-    predictor.grow = grow
     stride, block = predictor.anchor_stride, predictor.anchor_block
     recon = np.zeros((c, *shape), np.float32)
     axes = _anchor_axes(shape, stride, block)
@@ -875,18 +844,13 @@ def _decompress_chunked(
     )
     predictor.begin(shape, edges, channels=c, geometry_progress=geom_bar.update)
     geom_bar.close()
-    coarse_bar = _progress_bar(
-        "decode anchor embeddings", predictor.n_chunks, unit="chunk"
-    )
-    predictor.anchor_coarse(recon, progress=coarse_bar.update)
-    coarse_bar.close()
     torch = predictor._torch
     dev = predictor.device
     recon_t = torch.from_numpy(recon).to(dev)  # device-resident, same as encode
     gates_t = (
         None if gates is None else torch.tensor(gates, dtype=torch.int64, device=dev)
     )
-    waves = [list(range(predictor.n_chunks))] if grow else _chunk_waves(predictor.grid)
+    waves = [list(range(predictor.n_chunks))]  # raster order, mirrors encode
     _log(f"decode: anchors done, {predictor.n_chunks} chunks/model passes")
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
     index_cache: dict = {}  # cshape -> device stage schedule (see _chunk_device_plan)
@@ -1055,8 +1019,6 @@ class GNNCompressorCodec:
         fp16: bool = True,
         compile: bool | str = "auto",
         gate: bool = True,
-        edge_sched: bool = False,
-        grow: bool = False,
     ):
         self.checkpoint_path = Path(checkpoint_path)
         if not self.checkpoint_path.exists():
@@ -1129,22 +1091,6 @@ class GNNCompressorCodec:
         # first/last-axis linear interpolation per chunk-stage and stores the
         # winner in the header. It self-disables wherever no fallback pays.
         self.gate = bool(gate)
-        # edge_sched: code chunk faces before interiors (two-phase, see
-        # deepsz.edge_sched) so interior finest points have decoded both-sided
-        # context across chunk seams. Removes the chunk-face prediction seam that
-        # otherwise costs 17-72% on sharp fields. Host/numpy path (no device gate),
-        # so it forces gate off. Stored in meta; decode replays the same schedule.
-        self.edge_sched = bool(edge_sched)
-        # grow: extended-block chunk schedule. Each chunk's block is grown by one
-        # cell on every internal high face, so it owns (decodes) the shared
-        # boundary hyperplane; the right/bottom neighbour inherits that plane as an
-        # already-decoded low face (column-split out of its coded set). Interiors
-        # therefore see both-sided faces while keeping the full-chunk GNN context
-        # (coarse table + halo) -- unlike edge_sched's subset phases. Uses the
-        # device chunked path, so it composes with the gate. Stored in meta.
-        self.grow = bool(grow)
-        if self.grow and self.edge_sched:
-            raise ValueError("grow and edge_sched are mutually exclusive schedules")
         self.checkpoint_hash = self._checkpoint_hash()
 
     def _chunk_edges(
@@ -1218,7 +1164,7 @@ class GNNCompressorCodec:
             {_per_step_eb_ratio(c, levels) for c in coarse_candidates}
         )
         edges = self._chunk_edges(shape, anchor_stride)
-        if edges is None and self.gate and not self.edge_sched:
+        if edges is None and self.gate:
             # The scale-gated interp fallback lives entirely in the device chunked
             # inner loop; the numpy whole-tensor path has no gate. So when the gate
             # is enabled, realise a "gated whole-tensor" encode as a single chunk
@@ -1244,17 +1190,9 @@ class GNNCompressorCodec:
             want_compile = self.compile and nchunks >= _COMPILE_MIN_CHUNKS
         use_compile = want_compile and edges is not None
         candidates: list[tuple[int, bytes]] = []
-        use_edge_sched = self.edge_sched and edges is not None
         for ratio in ratio_candidates:
             gates = None
-            if use_edge_sched:
-                payload, es_gates = self._compress_edges_payload(
-                    values, round_output, eb, ratio, edges, levels, anchor_stride
-                )
-                # edge_sched always carries its per-stage-chunk gate list (decode
-                # reads one byte per iteration), even when every byte is 0.
-                gates = es_gates or None
-            elif edges is None:
+            if edges is None:
                 payload = self._compress_payload(
                     values, round_output, eb, ratio, levels, anchor_stride
                 )
@@ -1280,11 +1218,7 @@ class GNNCompressorCodec:
                 meta["chunks"] = list(edges)
                 meta["m_tile"] = int(_gp._M_TILE)  # replay the exact float path
                 meta["fp16"] = bool(self.fp16)
-                meta["compiled"] = bool(use_compile and not use_edge_sched)
-                if use_edge_sched:
-                    meta["edge_sched"] = True
-                if self.grow:
-                    meta["grow"] = True
+                meta["compiled"] = bool(use_compile)
             if gates is not None:
                 # ponytail: JSON list of one small int per chunk-stage; pack to
                 # base64 bytes if header size ever matters at huge chunk counts
@@ -1326,25 +1260,15 @@ class GNNCompressorCodec:
             saved_tile = _gp._M_TILE
             _gp._M_TILE = int(meta["m_tile"])  # match encode path
             try:
-                if meta.get("edge_sched"):
-                    from .edge_sched import decompress_chunked_edges_dev
-
-                    es_gates = meta.get("gates") or []
-                    values = decompress_chunked_edges_dev(
-                        payload, shape, ebs, int(meta["radius"]), predictor, edges,
-                        es_gates, gate=bool(es_gates),
-                    )
-                else:
-                    values = _decompress_chunked(
-                        payload,
-                        shape,
-                        ebs,
-                        int(meta["radius"]),
-                        predictor,
-                        edges,
-                        gates=meta.get("gates"),
-                        grow=bool(meta.get("grow")),
-                    )
+                values = _decompress_chunked(
+                    payload,
+                    shape,
+                    ebs,
+                    int(meta["radius"]),
+                    predictor,
+                    edges,
+                    gates=meta.get("gates"),
+                )
             finally:
                 _gp._M_TILE = saved_tile
             values = values * (vmax - vmin) + vmin  # undo compress()'s [0, 1] normalize
@@ -1437,30 +1361,8 @@ class GNNCompressorCodec:
             predictor,
             edges,
             gate=self.gate,
-            grow=self.grow,
         )
         return payload, gates
-
-    def _compress_edges_payload(
-        self,
-        values: np.ndarray,
-        round_output: bool | tuple[float, float],
-        eb: float,
-        eb_ratio: float,
-        edges: tuple[int, ...],
-        levels: int,
-        anchor_stride: int,
-    ) -> tuple[bytes, list[int]]:
-        from .edge_sched import compress_chunked_edges_dev
-
-        predictor = self._chunked_predictor(levels)
-        ebs = _chunk_stage_ebs(
-            values.shape, levels, anchor_stride, _ANCHOR_BLOCK, eb, eb_ratio
-        )
-        return compress_chunked_edges_dev(
-            values[None, ...], ebs, self.radius, round_output, predictor, edges,
-            gate=self.gate,
-        )
 
     def _chunked_predictor(
         self,
