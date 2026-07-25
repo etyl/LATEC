@@ -23,7 +23,7 @@ from .rans import SCALE_HI_MULT, SCALE_LO_DIV, build_laplace_tables, scale_to_le
 
 
 _MAGIC = b"DEEPSZGN"
-_VERSION = 9
+_VERSION = 10
 _PREFIX = "<8sII"
 _PREFIX_SIZE = struct.calcsize(_PREFIX)
 _ANCHOR_BLOCK = 1
@@ -374,10 +374,10 @@ def _chunk_waves(grid: tuple[int, ...]) -> list[list[int]]:
 # ~free) or the learned-predictor precision floor talking (low eb) — only
 # measuring can tell. The encoder sweeps (predictor, T, shift) per chunk-stage
 # against the true residuals. The candidates are the original cubic/axis-average
-# interpolation and SZ3's strong 3-D CLOUD choice, linear interpolation along
-# the first active axis. The winner travels in the header, so the gate
+# interpolation and anisotropic linear interpolation along either the first or
+# last active axis. The winner travels in the header, so the gate
 # self-disables (T=0) wherever neither classical predictor pays.
-_GATE_T = np.array([2, 3, 4, 5, 6, 7, 8], np.float64)
+_GATE_T = np.arange(2, 14, dtype=np.float64)
 _GATE_SHIFTS = (0, 2, 4, 6)
 
 
@@ -436,19 +436,31 @@ def _interp_stage_pred_t(
     return ip.to(torch.float32)  # (C, n)
 
 
-def _laplace_bits_t(torch, absr, b, eb):
-    """Ideal discretized-Laplace model cost used to rank gate settings."""
-    b = b.double().clamp(eb / SCALE_LO_DIV, eb * SCALE_HI_MULT)
+def _laplace_bits_t(torch, absr, b, eb, radius):
+    """rANS-aligned rate estimate used to rank gate settings.
+
+    Scales are snapped to the same 64-level grid as ``scale_to_level``. Regular
+    symbols are capped at the rANS table precision (24 bits), while outliers pay
+    that marker cost plus the raw float32 stored by ``pack_stage``.
+    """
+    lo = eb / SCALE_LO_DIV
+    hi = eb * SCALE_HI_MULT
+    b = b.double().clamp(lo, hi)
+    level = torch.round(
+        (torch.log(b) - np.log(lo)) / (np.log(hi) - np.log(lo)) * 63.0
+    )
+    b = torch.exp(np.log(lo) + level * ((np.log(hi) - np.log(lo)) / 63.0))
     k = torch.round(absr.double().abs() / (2 * eb))
     p = torch.where(
         k == 0,
         -torch.expm1(-eb / b),
         0.5 * torch.exp(-((2 * k - 1) * eb / b)) * -torch.expm1(-2 * eb / b),
     )
-    return (-torch.log2(p)).clamp_max(32.0)
+    regular = (-torch.log2(p)).clamp_max(24.0)
+    return torch.where(k >= radius, torch.full_like(regular, 56.0), regular)
 
 
-def _gate_select_t(torch, r_g, r_is, b, eb):
+def _gate_select_t(torch, r_g, r_is, b, eb, radius=1 << 15):
     """Choose the best (classical predictor, T, shift) for one chunk-stage.
 
     Returns device scalar ``(kind, T, shift)`` tensors, with kind 0 meaning off
@@ -467,7 +479,7 @@ def _gate_select_t(torch, r_g, r_is, b, eb):
     onehot = (bucket.unsqueeze(-1) == torch.arange(nb, device=dev)).double()  # (n, nb)
 
     def cum(r, bb):
-        w = _laplace_bits_t(torch, r, bb, eb).sum(0)  # (n,)
+        w = _laplace_bits_t(torch, r, bb, eb, radius).sum(0)  # (n,)
         binc = (w.unsqueeze(-1) * onehot).sum(0)  # (nb,)
         return torch.cumsum(binc, 0)
 
@@ -676,15 +688,34 @@ def _compress_chunked(
                             1,
                             cubic=False,
                         )
+                        ip_linear_last = _interp_stage_pred_t(
+                            torch,
+                            recon_t,
+                            sls,
+                            coords_t,
+                            st_i,
+                            ax_i,
+                            2,
+                            cubic=False,
+                        )
                         gk, gt, gs = _gate_select_t(
                             torch,
                             (cvals - p).abs(),
-                            ((cvals - ip_cubic).abs(), (cvals - ip_linear).abs()),
+                            (
+                                (cvals - ip_cubic).abs(),
+                                (cvals - ip_linear).abs(),
+                                (cvals - ip_linear_last).abs(),
+                            ),
                             sc,
                             ebs[s],
+                            radius,
                         )
                         gates_t.append(gk * 256 + gt * 16 + gs)
-                        ip = torch.where(gk == 2, ip_linear, ip_cubic)
+                        ip = torch.where(
+                            gk == 2,
+                            ip_linear,
+                            torch.where(gk == 3, ip_linear_last, ip_cubic),
+                        )
                         p, sc = _gate_apply_t(torch, pred[bi], sc, ip, ebs[s], gt, gs)
                     codes, recon_stage, outliers = _quantize_t(
                         torch, cvals, p, ebs[s], radius, round_output
@@ -877,7 +908,22 @@ def _decompress_chunked(
                             1,
                             cubic=False,
                         )
-                        ip = torch.where((g >> 8) == 2, ip_linear, ip_cubic)
+                        ip_linear_last = _interp_stage_pred_t(
+                            torch,
+                            recon_t,
+                            sls,
+                            coords_t,
+                            st_i,
+                            ax_i,
+                            2,
+                            cubic=False,
+                        )
+                        gk = g >> 8
+                        ip = torch.where(
+                            gk == 2,
+                            ip_linear,
+                            torch.where(gk == 3, ip_linear_last, ip_cubic),
+                        )
                         p, sc = _gate_apply_t(
                             torch,
                             pred[bi],
@@ -1016,8 +1062,8 @@ class GNNCompressorCodec:
         # whole-tensor path -- the gate is device-only, so a gated whole-tensor
         # encode is realised as a single chunk covering the shape (see compress).
         # The encoder rate-selects GNN, cubic/averaged interpolation, or
-        # linear/single-axis interpolation per chunk-stage and stores the winner
-        # in the header. It self-disables wherever neither fallback pays.
+        # first/last-axis linear interpolation per chunk-stage and stores the
+        # winner in the header. It self-disables wherever no fallback pays.
         self.gate = bool(gate)
         self.checkpoint_hash = self._checkpoint_hash()
 

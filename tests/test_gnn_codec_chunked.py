@@ -104,33 +104,50 @@ def test_gate_roundtrip_and_header(current_ckpt):
     if gates is None:
         assert s_on == s_off
     else:
-        assert all(g >> 8 in (0, 1, 2) for g in gates)
+        assert all(g >> 8 in (0, 1, 2, 3) for g in gates)
         assert any((g >> 4) & 15 for g in gates)
     abs_eb = eb * float(f.max() - f.min())  # eb is relative to the data range
     for s in (s_on, s_off):
-        assert _maxerr(off.uncompress(s), f) <= abs_eb
+        # The codec enforces the bound in normalized coordinates; restoring the
+        # original float32 range can add one final-output ULP.
+        restore_ulp = float(np.spacing(np.max(np.abs(f))))
+        assert _maxerr(off.uncompress(s), f) <= abs_eb + restore_ulp
 
 
-def test_gate_rate_selector_can_choose_second_predictor():
+@pytest.mark.parametrize("winner", [1, 2, 3])
+def test_gate_rate_selector_can_choose_each_predictor(winner):
     """The chunk-stage rate proxy selects among multiple classical candidates."""
     from deepsz.gnn_codec import _gate_select_t
 
     eb = 1e-3
     scale = torch.full((32,), eb)
     gnn_residual = torch.full((1, 32), 10 * eb)
-    candidate_1 = torch.full((1, 32), 5 * eb)
-    candidate_2 = torch.zeros((1, 32))
+    candidates = [torch.full((1, 32), 5 * eb) for _ in range(3)]
+    candidates[winner - 1] = torch.zeros((1, 32))
 
     kind, threshold, _shift = _gate_select_t(
         torch,
         gnn_residual,
-        (candidate_1, candidate_2),
+        tuple(candidates),
         scale,
         eb,
     )
 
-    assert int(kind) == 2
+    assert int(kind) == winner
     assert int(threshold) > 0
+
+
+def test_gate_rate_proxy_charges_raw_float_for_outlier():
+    from deepsz.gnn_codec import _laplace_bits_t
+
+    eb = 1e-3
+    radius = 8
+    scale = torch.tensor([eb])
+    regular = _laplace_bits_t(torch, torch.tensor([2 * eb * (radius - 1)]), scale, eb, radius)
+    outlier = _laplace_bits_t(torch, torch.tensor([2 * eb * radius]), scale, eb, radius)
+
+    assert float(regular[0]) <= 24.0
+    assert float(outlier[0]) == 56.0
 
 
 # --- roundtrip within the error bound --------------------------------------
