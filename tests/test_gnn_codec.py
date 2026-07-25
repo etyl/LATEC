@@ -34,6 +34,7 @@ def _codec(path, eb=1e-3):
         chunk_size=0,
         fp16=False,
         compile=False,
+        classical_fallback=False,
     )
 
 

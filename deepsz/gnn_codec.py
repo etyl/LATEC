@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import itertools
 import os
 import struct
 import sys
@@ -23,7 +24,7 @@ from .rans import SCALE_HI_MULT, SCALE_LO_DIV, build_laplace_tables, scale_to_le
 
 
 _MAGIC = b"DEEPSZGN"
-_VERSION = 10
+_VERSION = 13
 _PREFIX = "<8sII"
 _PREFIX_SIZE = struct.calcsize(_PREFIX)
 _ANCHOR_BLOCK = 1
@@ -31,6 +32,10 @@ _ANCHOR_BLOCK = 1
 # auto mode: whole-tensor below this many points, chunked above (whole-tensor
 # memory is ~30*L*K*d bytes/point in transients — ~2^21 points is a few GB)
 _AUTO_CHUNK_THRESHOLD = 1 << 21
+# Pointwise scale masks can change the reconstruction seen by every finer
+# stage. Restrict them to sufficiently dense stages; sparse/coarse stages still
+# rate-select GNN versus a coherent whole-stage classical predictor.
+_IMPLICIT_GATE_MIN_POINTS = 256
 # Minimum chunk count before an *explicit* compile=True is honored: below this,
 # dynamo warmup can't be amortized, so a forced compile is silently skipped.
 _COMPILE_MIN_CHUNKS = 64
@@ -353,16 +358,66 @@ def _decode_anchor_stage(payload, off, recon, axes, eb0, radius):
     return off
 
 
-# Scale-gated classical-predictor fallback: where the model's predicted scale b
-# sits below eb*2^T, its confidence is either genuine (high eb: the point is
-# ~free) or the learned-predictor precision floor talking (low eb) — only
-# measuring can tell. The encoder sweeps (predictor, T, shift) per chunk-stage
-# against the true residuals. The candidates are the original cubic/axis-average
-# interpolation and anisotropic linear interpolation along either the first or
-# last active axis. The winner travels in the header, so the gate
-# self-disables (T=0) wherever neither classical predictor pays.
-_GATE_T = np.arange(2, 14, dtype=np.float64)
-_GATE_SHIFTS = (0, 2, 4, 6)
+# Implicit point gate. Each chunk-stage rate-selects the GNN alone or one of
+# three interpolation predictors for points whose GNN scale is at least a
+# threshold. The decoder predicts the same scale field, so the point mask is
+# free. The control byte stores predictor kind in two bits (0=GNN only,
+# 1=cubic/axis-average, 2=first-axis linear, 3=last-axis linear) and threshold
+# in six bits. Hybrid controls have one following byte containing the classical
+# rANS scale level in six bits and the threshold direction in bit six. Thus an
+# ignored/coarse stage costs one byte and an enabled point gate costs two,
+# independent of its number of points.
+
+
+def _gate_pack_t(kind, threshold_level):
+    """Pack predictor kind and 6-bit implicit threshold into one device byte."""
+    return kind | (threshold_level << 2)
+
+
+def _gate_unpack_t(packed):
+    """Inverse of :func:`_gate_pack_t`, returning kind and threshold."""
+    return packed & 3, (packed >> 2) & 63
+
+
+def _split_gate_payload(meta: dict[str, Any], payload: bytes) -> tuple[list[int] | None, bytes]:
+    """Remove packed gate bytes from the decompressed payload."""
+    count = int(meta.get("gate_count", 0))
+    if count < 0 or count > len(payload):
+        raise ValueError("invalid packed gate count")
+    if not count:
+        return None, payload
+    return list(payload[:count]), payload[count:]
+
+
+def _chunk_slices(shape: tuple[int, ...], edges: tuple[int, ...]):
+    """Yield raster-ordered independent chunk slices."""
+    grid = tuple(-(-n // edge) for n, edge in zip(shape, edges))
+    for index in itertools.product(*(range(n) for n in grid)):
+        yield tuple(
+            slice(i * edge, min((i + 1) * edge, n))
+            for i, edge, n in zip(index, edges, shape)
+        )
+
+
+def _pack_rate_selected_chunk(mode: int, stream: bytes) -> bytes:
+    """Frame one independently decodable per-chunk codec choice."""
+    return struct.pack("<BQ", int(mode), len(stream)) + stream
+
+
+def _unpack_rate_selected_chunk(
+    payload: bytes, off: int
+) -> tuple[int, bytes, int]:
+    """Inverse of :func:`_pack_rate_selected_chunk` with bounds checks."""
+    if off + 9 > len(payload):
+        raise ValueError("truncated rate-selected chunk header")
+    mode, size = struct.unpack_from("<BQ", payload, off)
+    if mode not in (0, 1):
+        raise ValueError("invalid rate-selected chunk mode")
+    off += 9
+    end = off + size
+    if end > len(payload):
+        raise ValueError("truncated rate-selected chunk stream")
+    return mode, payload[off:end], end
 
 
 # --- device inner-loop primitives -----------------------------------------
@@ -444,60 +499,117 @@ def _laplace_bits_t(torch, absr, b, eb, radius):
     return torch.where(k >= radius, torch.full_like(regular, 56.0), regular)
 
 
-def _gate_select_t(torch, r_g, r_is, b, eb, radius=1 << 15):
-    """Choose the best (classical predictor, T, shift) for one chunk-stage.
+def _scale_level_t(torch, scale, eb):
+    """Torch twin of :func:`scale_to_level` for implicit gate decisions."""
+    lo = float(eb) / SCALE_LO_DIV
+    hi = float(eb) * SCALE_HI_MULT
+    return torch.round(
+        (torch.log(scale.double().clamp(lo, hi)) - np.log(lo))
+        / (np.log(hi) - np.log(lo))
+        * 63.0
+    ).to(torch.int64)
 
-    Returns device scalar ``(kind, T, shift)`` tensors, with kind 0 meaning off
-    and positive kinds indexing ``r_is`` from one. The selection is branch-free
-    so it issues no host sync.
+
+def _gate_select_t(torch, r_g, r_is, b, eb, radius=1 << 15):
+    """Choose an implicit scale gate by modeled rANS rate.
+
+    Returns device scalars ``(kind, threshold_level, classical_scale_level,
+    low_side)``. Kind zero keeps the GNN everywhere. For a positive kind,
+    points on the selected side of the scale threshold use the indexed
+    classical predictor and its constant entropy scale. The selector charges
+    the extra parameter byte, so sparse coarse stages can leave the gate off.
     """
     dev = b.device
-    GTf = torch.tensor(_GATE_T, dtype=torch.float64, device=dev)
-    GTi = GTf.to(torch.int64)
-    SHi = torch.tensor(_GATE_SHIFTS, dtype=torch.int64, device=dev)
-    nb = _GATE_T.size + 1
-    bucket = torch.bucketize(b.double(), eb * torch.exp2(GTf))
-    # one-hot bucket membership: per-bucket sums via a plain (deterministic)
-    # reduction, not bincount/scatter_add -- those use atomic float adds on CUDA
-    # and would make the gate choice, and thus the stream, non-deterministic.
-    onehot = (bucket.unsqueeze(-1) == torch.arange(nb, device=dev)).double()  # (n, nb)
-
-    def cum(r, bb):
-        w = _laplace_bits_t(torch, r, bb, eb, radius).sum(0)  # (n,)
-        binc = (w.unsqueeze(-1) * onehot).sum(0)  # (nb,)
-        return torch.cumsum(binc, 0)
-
-    base = cum(r_g, b)
-    tot = base[-1]
-    rows = [
-        tot - base[:-1] + cum(r_i, b * 2.0**-sh)[:-1]
-        for r_i in r_is
-        for sh in _GATE_SHIFTS
-    ]
-    costs = torch.stack(rows)  # (n_predictor * n_shift, nb-1)
-    mv, fi = costs.reshape(-1).min(0)
-    fired = mv < tot
-    ncol = nb - 1
-    nsh = len(_GATE_SHIFTS)
-    row = fi // ncol
-    z = torch.zeros((), dtype=torch.int64, device=dev)
-    gate_kind = torch.where(fired, row // nsh + 1, z)
-    gate_t = torch.where(fired, GTi[fi % ncol], z)
-    gate_sh = torch.where(fired, SHi[row % nsh], z)
-    return gate_kind, gate_t, gate_sh
-
-
-def _gate_apply_t(torch, pred_bi, scale_bi, ip, eb, gate_t, gate_sh):
-    """Device twin of ``_gate_apply``, called unconditionally on both sides: a
-    ``gate_t`` of 0 is a no-op (mirrors numpy's ``if gate_t`` skip), so encoder
-    and decoder stay symmetric without a host-sync branch. (pred, coded scale)."""
-    active = gate_t > 0
-    m = active & (scale_bi < eb * torch.exp2(gate_t.double()))
-    p = torch.where(m.unsqueeze(0), ip, pred_bi.unsqueeze(0))
-    sc = torch.where(
-        m, scale_bi * torch.exp2(-gate_sh.double()).to(scale_bi.dtype), scale_bi
+    lo = float(eb) / SCALE_LO_DIV
+    hi = float(eb) * SCALE_HI_MULT
+    log_step = (np.log(hi) - np.log(lo)) / 63.0
+    gnn_bits = _laplace_bits_t(torch, r_g, b, eb, radius)
+    gnn_cost = gnn_bits.sum()
+    b_levels = _scale_level_t(torch, b, eb)
+    best_cost = gnn_cost
+    best_kind = torch.zeros((), dtype=torch.int64, device=dev)
+    best_threshold = torch.zeros((), dtype=torch.int64, device=dev)
+    best_level = torch.zeros((), dtype=torch.int64, device=dev)
+    best_low_side = torch.zeros((), dtype=torch.int64, device=dev)
+    for kind, r_i in enumerate(r_is, 1):
+        mle = r_i.double().abs().mean().clamp(lo, hi)
+        center = torch.round((torch.log(mle) - np.log(lo)) / log_step).to(torch.int64)
+        levels = (
+            center + torch.arange(-3, 4, dtype=torch.int64, device=dev)
+        ).clamp(0, 63)
+        for level in levels:
+            scale = torch.exp(
+                torch.tensor(np.log(lo), dtype=torch.float64, device=dev)
+                + level.double() * log_step
+            )
+            delta = (
+                _laplace_bits_t(torch, r_i, scale, eb, radius) - gnn_bits
+            ).sum(dim=0)
+            by_level = torch.zeros(64, dtype=torch.float64, device=dev)
+            by_level.scatter_add_(0, b_levels.reshape(-1), delta.reshape(-1))
+            # Entries t are the cost changes from selecting level >= t and
+            # level <= t respectively. The latter retains the useful behavior
+            # of the former precision-floor gate.
+            tail_delta = torch.flip(
+                torch.cumsum(torch.flip(by_level, dims=(0,)), dim=0),
+                dims=(0,),
+            )
+            low_delta = torch.cumsum(by_level, dim=0)
+            if b.numel() >= _IMPLICIT_GATE_MIN_POINTS:
+                side_costs = torch.stack((tail_delta, low_delta))
+                cost_delta, flat_choice = side_costs.reshape(-1).min(0)
+                low_side = flat_choice // 64
+                threshold = flat_choice % 64
+            else:
+                # threshold=0 on the high side selects the whole stage.
+                cost_delta = tail_delta[0]
+                low_side = torch.zeros((), dtype=torch.int64, device=dev)
+                threshold = torch.zeros((), dtype=torch.int64, device=dev)
+            cost = gnn_cost + cost_delta
+            better = cost < best_cost
+            best_cost = torch.where(better, cost, best_cost)
+            best_kind = torch.where(
+                better,
+                torch.tensor(kind, dtype=torch.int64, device=dev),
+                best_kind,
+            )
+            best_threshold = torch.where(better, threshold, best_threshold)
+            best_level = torch.where(better, level, best_level)
+            best_low_side = torch.where(better, low_side, best_low_side)
+    # A hybrid record consumes one more raw byte than a GNN-only control.
+    use_classical = best_cost + 8.0 < gnn_cost
+    zero = torch.zeros((), dtype=torch.int64, device=dev)
+    return (
+        torch.where(use_classical, best_kind, zero),
+        torch.where(use_classical, best_threshold, zero),
+        torch.where(use_classical, best_level, zero),
+        torch.where(use_classical, best_low_side, zero),
     )
-    return p.to(torch.float32), sc.to(torch.float32)
+
+
+def _gate_apply_t(
+    torch,
+    pred_bi,
+    ip,
+    scale,
+    eb,
+    gate_kind,
+    threshold_level,
+    low_side,
+):
+    """Apply a decoder-reproducible point mask derived from the GNN scale."""
+    scale_level = _scale_level_t(torch, scale, eb)
+    in_scale_region = torch.where(
+        low_side > 0,
+        scale_level <= threshold_level,
+        scale_level >= threshold_level,
+    )
+    use_classical = (gate_kind > 0) & in_scale_region
+    return torch.where(
+        use_classical.reshape(1, -1),
+        ip,
+        pred_bi.unsqueeze(0),
+    ).to(torch.float32)
 
 
 def _quantize_t(torch, x, pred, eb, radius, round_output):
@@ -602,7 +714,9 @@ def _compress_chunked(
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
     index_cache: dict = {}  # cshape -> device stage schedule (see _chunk_device_plan)
     full_strides = np.cumprod((1,) + shape[:0:-1])[::-1].astype(np.int64)
-    gates_t: list = [] if gate else None  # per stage-chunk gate byte, device scalars
+    # Per stage-chunk (control, classical scale) device scalars. The second
+    # byte is omitted from the serialized list when the control keeps the GNN.
+    gates_t: list = [] if gate else None
     bar = _progress_bar("encode", predictor.n_chunks)
     for group in waves:
         for ci in group:
@@ -658,6 +772,7 @@ def _compress_chunked(
                     cvals = vblocks[bi].index_select(1, pos)  # (C, n)
                     p = pred[bi][None, :]
                     sc = scale[bi]
+                    gate_record = None
                     if gate:
                         coords_t, st_i, ax_i = interp_dev[s]
                         ip_cubic = _interp_stage_pred_t(
@@ -690,7 +805,7 @@ def _compress_chunked(
                             2,
                             cubic=False,
                         )
-                        gk, gt, gs = _gate_select_t(
+                        gk, gt, gl, gd = _gate_select_t(
                             torch,
                             (cvals - p).abs(),
                             (
@@ -702,13 +817,18 @@ def _compress_chunked(
                             ebs[s],
                             radius,
                         )
-                        gates_t.append(gk * 256 + gt * 16 + gs)
+                        packed_gate = _gate_pack_t(gk, gt)
+                        gate_param = gl | (gd << 6)
+                        gate_record = torch.stack((packed_gate, gate_param))
+                        gates_t.append(gate_record)
                         ip = torch.where(
                             gk == 2,
                             ip_linear,
                             torch.where(gk == 3, ip_linear_last, ip_cubic),
                         )
-                        p, sc = _gate_apply_t(torch, pred[bi], sc, ip, ebs[s], gt, gs)
+                        p = _gate_apply_t(
+                            torch, pred[bi], ip, sc, ebs[s], gk, gt, gd
+                        )
                     codes, recon_stage, outliers = _quantize_t(
                         torch, cvals, p, ebs[s], radius, round_output
                     )
@@ -721,6 +841,11 @@ def _compress_chunked(
                             sc.to("cpu", non_blocking=True),
                             tables,
                             ebs[s],
+                            (
+                                gate_record.to("cpu", non_blocking=True)
+                                if gate_record is not None
+                                else None
+                            ),
                         )
                     )
             predictor.finish_wave(recon_t)
@@ -739,12 +864,33 @@ def _compress_chunked(
                         )
                     )
                     continue
-                codes_c, out_c, sc_c, tables, eb_s = item
+                codes_c, out_c, sc_c, tables, eb_s, gate_c = item
+                codes_np = codes_c.numpy().astype(np.uint32)
+                out_np = out_c.numpy().astype(np.float32)
+                gate_kind, gate_threshold, gate_level, gate_low_side = (
+                    (0, 0, 0, 0)
+                    if gate_c is None
+                    else (
+                        *(
+                            int(v)
+                            for v in _gate_unpack_t(gate_c[0])
+                        ),
+                        int(gate_c[1]) & 63,
+                        (int(gate_c[1]) >> 6) & 1,
+                    )
+                )
                 levels = scale_to_level(sc_c.numpy()[None, :], eb_s).reshape(-1)
+                if gate_kind:
+                    mask = (
+                        levels <= gate_threshold
+                        if gate_low_side
+                        else levels >= gate_threshold
+                    )
+                    levels[mask] = gate_level
                 parts.append(
                     pack_stage(
-                        codes_c.numpy().astype(np.uint32),
-                        out_c.numpy().astype(np.float32),
+                        codes_np,
+                        out_np,
                         rans_levels=levels,
                         rans_tables=tables,
                     )
@@ -756,7 +902,15 @@ def _compress_chunked(
     bar.close()
     gates = None
     if gate:
-        gates = [int(x) for x in torch.stack(gates_t).cpu().tolist()] if gates_t else []
+        pairs = torch.stack(gates_t).cpu().tolist() if gates_t else []
+        if any(int(pair[0]) & 3 for pair in pairs):
+            gates = []
+            for control, scale_level in pairs:
+                gates.append(int(control))
+                if int(control) & 3:
+                    gates.append(int(scale_level))
+        if gates is not None and any(g < 0 or g > 255 for g in gates):
+            raise AssertionError("packed gate decision does not fit in one byte")
     return b"".join(parts), gates
 
 
@@ -852,9 +1006,6 @@ def _decompress_chunked(
     torch = predictor._torch
     dev = predictor.device
     recon_t = torch.from_numpy(recon).to(dev)  # device-resident, same as encode
-    gates_t = (
-        None if gates is None else torch.tensor(gates, dtype=torch.int64, device=dev)
-    )
     waves = [list(range(predictor.n_chunks))]  # raster order, mirrors encode
     _log(f"decode: anchors done, {predictor.n_chunks} chunks/model passes")
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
@@ -915,8 +1066,16 @@ def _decompress_chunked(
                     sls = predictor.chunk_slices(ids[bi])
                     p = pred[bi][None, :]
                     sc = scale[bi]
-                    if gates_t is not None:
-                        g = gates_t[gi]
+                    gate_kind = 0
+                    gate_threshold = 0
+                    gate_level = 0
+                    gate_low_side = 0
+                    if gates is not None:
+                        if gi >= len(gates):
+                            raise ValueError("truncated implicit gate list")
+                        packed_gate = torch.tensor(
+                            gates[gi], dtype=torch.int64, device=dev
+                        )
                         gi += 1
                         coords_t, st_i, ax_i = interp_dev[s]
                         ip_cubic = _interp_stage_pred_t(
@@ -949,26 +1108,52 @@ def _decompress_chunked(
                             2,
                             cubic=False,
                         )
-                        gk = g >> 8
+                        gk, gt = _gate_unpack_t(packed_gate)
+                        if int(gk):
+                            if gi >= len(gates):
+                                raise ValueError("truncated implicit gate parameters")
+                            gate_param = int(gates[gi])
+                            gi += 1
+                            if gate_param >= 128:
+                                raise ValueError("invalid implicit gate parameter")
+                            gl = torch.tensor(
+                                gate_param & 63, dtype=torch.int64, device=dev
+                            )
+                            gd = torch.tensor(
+                                (gate_param >> 6) & 1,
+                                dtype=torch.int64,
+                                device=dev,
+                            )
+                        else:
+                            gl = torch.zeros((), dtype=torch.int64, device=dev)
+                            gd = torch.zeros((), dtype=torch.int64, device=dev)
                         ip = torch.where(
                             gk == 2,
                             ip_linear,
                             torch.where(gk == 3, ip_linear_last, ip_cubic),
                         )
-                        p, sc = _gate_apply_t(
-                            torch,
-                            pred[bi],
-                            sc,
-                            ip,
-                            ebs[s],
-                            (g >> 4) & 15,
-                            g & 15,
+                        p = _gate_apply_t(
+                            torch, pred[bi], ip, sc, ebs[s], gk, gt, gd
                         )
+                        gate_kind = int(gk)
+                        gate_threshold = int(gt)
+                        gate_level = int(gl)
+                        gate_low_side = int(gd)
                     levels64 = scale_to_level(
                         sc.cpu().numpy()[None, :], ebs[s]
                     ).reshape(-1)
+                    if gate_kind:
+                        mask = (
+                            levels64 <= gate_threshold
+                            if gate_low_side
+                            else levels64 >= gate_threshold
+                        )
+                        levels64[mask] = gate_level
                     codes, outliers, off = unpack_stage(
-                        payload, off, rans_levels=levels64, rans_tables=tables
+                        payload,
+                        off,
+                        rans_levels=levels64,
+                        rans_tables=tables,
                     )
                     recon_stage = _dequantize_t(
                         torch,
@@ -1024,6 +1209,7 @@ class GNNCompressorCodec:
         fp16: bool = True,
         compile: bool | str = "auto",
         gate: bool = True,
+        classical_fallback: bool = True,
     ):
         self.checkpoint_path = Path(checkpoint_path)
         if not self.checkpoint_path.exists():
@@ -1089,13 +1275,14 @@ class GNNCompressorCodec:
         else:
             self.auto_compile = False
             self.compile = bool(compile)
-        # gate: scale-gated classical fallback. Applies to both the chunked and
-        # whole-tensor path -- the gate is device-only, so a gated whole-tensor
-        # encode is realised as a single chunk covering the shape (see compress).
-        # The encoder rate-selects GNN, cubic/averaged interpolation, or
-        # first/last-axis linear interpolation per chunk-stage and stores the
-        # winner in the header. It self-disables wherever no fallback pays.
+        # gate: hybrid classical fallback. Applies to both the chunked and
+        # whole-tensor path. Each chunk-stage rate-selects GNN, cubic/averaged
+        # interpolation, or first/last-axis linear interpolation.
         self.gate = bool(gate)
+        # Per-chunk safety net: independently encode each outer block with the
+        # implicit GNN hybrid and tuned standard interpolation, then retain the
+        # smaller bounded stream. gate=False remains the pure-GNN control.
+        self.classical_fallback = bool(classical_fallback)
         self.checkpoint_hash = self._checkpoint_hash()
 
     def _chunk_edges(
@@ -1120,6 +1307,120 @@ class GNNCompressorCodec:
                     "chunk_size must be a positive multiple of anchor_stride"
                 )
         return edges
+
+    def _compress_gnn_block(
+        self,
+        block: np.ndarray,
+        absolute_eb: float,
+        levels: int,
+    ) -> bytes:
+        """Compress one independent block with the implicit GNN hybrid."""
+        block32 = block.astype(np.float32, copy=False)
+        bmin = float(block32.min())
+        bmax = float(block32.max())
+        block_span = bmax - bmin if bmax > bmin else 1.0
+        compile_mode: bool | str = "auto" if self.auto_compile else self.compile
+        codec = GNNCompressorCodec(
+            self.checkpoint_path,
+            error_bound=absolute_eb / block_span,
+            levels=levels,
+            radius=self.radius,
+            device=self.device,
+            zstd_level=self.zstd_level,
+            eb_ratio=self.eb_ratio,
+            tune=self.tune,
+            strict_checkpoint=self.strict_checkpoint,
+            chunk_size=self.chunk_size,
+            fp16=self.fp16,
+            compile=compile_mode,
+            gate=self.gate,
+            classical_fallback=False,
+        )
+        return codec.compress(block)
+
+    def _compress_interp_block(
+        self,
+        block: np.ndarray,
+        absolute_eb: float,
+        levels: int,
+        anchor_stride: int,
+    ) -> bytes | None:
+        """Compress one independent block with tuned standard interpolation."""
+        from .codec import compress as classic_compress
+        from .predictor import InterpPredictor
+
+        if block.dtype.kind in "biu" and block.dtype != np.dtype(np.uint8):
+            # The standard stream currently stores only uint8 or float32. Do
+            # not introduce an unchecked float-to-integer rounding path.
+            return None
+        classic_block = (
+            block
+            if block.dtype == np.dtype(np.uint8)
+            else block.astype(np.float32, copy=False)
+        )
+        predictor = InterpPredictor(
+            order="cubic",
+            levels=levels,
+            anchor_stride=anchor_stride,
+            anchor_block=_ANCHOR_BLOCK,
+        )
+        stream, _ = classic_compress(
+            np.ascontiguousarray(classic_block),
+            absolute_eb,
+            predictor,
+            levels=levels,
+            anchor_stride=anchor_stride,
+            anchor_block=_ANCHOR_BLOCK,
+            radius=self.radius,
+            zstd_level=self.zstd_level,
+            tune="size",
+        )
+        return stream
+
+    def _compress_rate_selected_chunks(
+        self,
+        raw: np.ndarray,
+        absolute_eb: float,
+        relative_eb: float,
+        levels: int,
+        anchor_stride: int,
+        edges: tuple[int, ...],
+        original_shape: tuple[int, ...],
+        dtype: np.dtype,
+        vmin: float,
+        vmax: float,
+    ) -> bytes:
+        """Choose the bounded GNN or interpolation stream independently per block."""
+        parts = []
+        choices = []
+        for sls in _chunk_slices(raw.shape, edges):
+            block = np.ascontiguousarray(raw[sls])
+            gnn_stream = self._compress_gnn_block(block, absolute_eb, levels)
+            interp_stream = self._compress_interp_block(
+                block, absolute_eb, levels, anchor_stride
+            )
+            choices_for_block = [(1, gnn_stream)]
+            if interp_stream is not None:
+                choices_for_block.append((0, interp_stream))
+            mode, stream = min(choices_for_block, key=lambda item: len(item[1]))
+            choices.append((mode, stream))
+            parts.append(_pack_rate_selected_chunk(mode, stream))
+
+        if len(choices) == 1:
+            return choices[0][1]
+        meta = {
+            "shape": list(original_shape),
+            "dtype": dtype.str,
+            "error_bound": relative_eb,
+            "levels": levels,
+            "radius": self.radius,
+            "vmin": vmin,
+            "vmax": vmax,
+            "checkpoint_hash": self.checkpoint_hash.hex(),
+            "fallback": "rate-selected-chunks",
+            "select_chunks": list(edges),
+        }
+        return _write_stream(meta, b"".join(parts), self.zstd_level)
 
     def compress(self, x: Any, error_bound: float | None = None) -> bytes:
         """Compress a numpy array or torch tensor of any rank into bytes."""
@@ -1178,13 +1479,25 @@ class GNNCompressorCodec:
         )
         edges = self._chunk_edges(shape, anchor_stride)
         if edges is None and self.gate:
-            # The scale-gated interp fallback lives entirely in the device chunked
-            # inner loop; the numpy whole-tensor path has no gate. So when the gate
-            # is enabled, realise a "gated whole-tensor" encode as a single chunk
-            # covering the whole shape (grid 1 per axis, edges rounded up to the
-            # anchor stride) -- one GPU pass, same memory footprint as whole-tensor,
-            # but the gate applies. gate=False keeps the plain numpy whole path.
+            # The per-stage hybrid selector lives in the device chunked inner loop;
+            # the numpy whole-tensor path has no selector. So when it is enabled,
+            # realize a hybrid whole-tensor encode as one chunk covering the shape
+            # (edges rounded up to the anchor stride). gate=False keeps the plain
+            # numpy whole path as an explicit pure-GNN control.
             edges = tuple(-(-n // anchor_stride) * anchor_stride for n in shape)
+        if self.gate and self.classical_fallback:
+            return self._compress_rate_selected_chunks(
+                arr.reshape(shape),
+                eb * (vmax - vmin),
+                eb,
+                levels,
+                anchor_stride,
+                edges,
+                original_shape,
+                dtype,
+                vmin,
+                vmax,
+            )
         # torch.compile costs seconds of dynamo warmup per process; only worth
         # it when there are enough chunk waves to amortize. "auto" defers to the
         # benchmark-backed crossover; explicit True is honored past a floor.
@@ -1233,9 +1546,8 @@ class GNNCompressorCodec:
                 meta["fp16"] = bool(self.fp16)
                 meta["compiled"] = bool(use_compile)
             if gates is not None:
-                # ponytail: JSON list of one small int per chunk-stage; pack to
-                # base64 bytes if header size ever matters at huge chunk counts
-                meta["gates"] = gates
+                meta["gate_count"] = len(gates)
+                payload = bytes(gates) + payload
             stream = _write_stream(meta, payload, self.zstd_level)
             candidates.append((len(stream), stream))
         return min(candidates, key=lambda item: item[0])[1]
@@ -1244,7 +1556,16 @@ class GNNCompressorCodec:
         """Decompress bytes from ``compress`` and return a torch tensor."""
         import torch
 
-        meta, payload = _read_stream(bytes(stream))
+        stream = bytes(stream)
+        from .bitstream import MAGIC as CLASSIC_MAGIC
+
+        if stream.startswith(CLASSIC_MAGIC):
+            from .codec import decompress as classic_decompress
+
+            return torch.as_tensor(classic_decompress(stream))
+
+        meta, payload = _read_stream(stream)
+        gates, payload = _split_gate_payload(meta, payload)
         got_hash = meta["checkpoint_hash"]
         if self.strict_checkpoint and got_hash != self.checkpoint_hash.hex():
             raise ValueError("checkpoint hash differs from the stream metadata")
@@ -1256,6 +1577,29 @@ class GNNCompressorCodec:
         vmax = float(meta["vmax"])
         if vmax <= vmin:
             vmax = vmin + 1.0
+
+        if meta.get("fallback") == "rate-selected-chunks":
+            from .codec import decompress as classic_decompress
+
+            edges = tuple(int(e) for e in meta["select_chunks"])
+            if len(edges) != len(shape) or any(e <= 0 for e in edges):
+                raise ValueError("invalid rate-selected chunk edges")
+            values = np.empty(shape, dtype=dtype)
+            off = 0
+            for sls in _chunk_slices(shape, edges):
+                mode, chunk_stream, off = _unpack_rate_selected_chunk(payload, off)
+                block = (
+                    classic_decompress(chunk_stream)
+                    if mode == 0
+                    else self.uncompress(chunk_stream).numpy()
+                )
+                expected = tuple(values[sls].shape)
+                if tuple(block.shape) != expected:
+                    raise ValueError("rate-selected chunk shape mismatch")
+                values[sls] = block
+            if off != len(payload):
+                raise ValueError("trailing bytes in rate-selected chunk payload")
+            return torch.as_tensor(values.reshape(original_shape))
 
         if "chunks" in meta:
             edges = tuple(int(e) for e in meta["chunks"])
@@ -1280,7 +1624,7 @@ class GNNCompressorCodec:
                     int(meta["radius"]),
                     predictor,
                     edges,
-                    gates=meta.get("gates"),
+                    gates=gates,
                 )
             finally:
                 _gp._M_TILE = saved_tile
