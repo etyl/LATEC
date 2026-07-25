@@ -56,19 +56,22 @@ _COMPILE_MIN_CHUNKS = 64
 # chunks) instead of amortizing -- dynamic=True's symbolic-M graph is the lesser evil.
 _COMPILE_AUTO_CROSSOVER: int | None = None
 # Schedule depth per input rank for ``levels="auto"``. The common ranks are set
-# explicitly (2-D 9, 3-D 7, 4-D 5 -> anchor_stride 512 / 128 / 32; 4-D keeps the
-# edge-32 operating point). Ranks outside the table fall back to the
-# constant-points-per-chunk rule below.
-_RANK_LEVELS = {2: 8, 3: 6, 4: 5, 5: 4}
+# explicitly (2-D 8, 4-D 5 -> anchor_stride 256 / 32; 4-D keeps the edge-32
+# operating point). 3-D is also checkpoint-dependent: aggregation level 1 uses
+# level 7, while the wider level-2 neighbourhood uses level 6. Ranks outside the
+# table fall back to the constant-points-per-chunk rule below.
+_RANK_LEVELS = {2: 8, 4: 5, 5: 4}
 
 
-def _auto_levels(shape: tuple[int, ...]) -> int:
+def _auto_levels(shape: tuple[int, ...], agg_level: int = 2) -> int:
     """Levels for ``levels="auto"``, chosen from the rank of the input.
 
     The schedule depth follows the input rank, not its size: a chunk is about one
     to a few anchor cells (``anchor_stride**ndim = 2**(levels*ndim)`` points), so
     keying the stride off the rank keeps an ~constant number of points per chunk.
-    ``_RANK_LEVELS`` fixes the tuned common ranks; other ranks fall back to
+    ``_RANK_LEVELS`` fixes the tuned common ranks. For 3-D, the checkpoint's
+    neighbourhood aggregation level selects 7 levels for aggregation level 1
+    and 6 levels for aggregation level 2 or greater. Other ranks fall back to
     ``floor(log2(points_per_chunk) / ndim)`` from the auto-chunk point budget
     (``_AUTO_CHUNK_THRESHOLD``), so a cell stays within budget -- higher-rank
     tensors get a smaller stride, lower-rank a larger one.
@@ -77,7 +80,9 @@ def _auto_levels(shape: tuple[int, ...]) -> int:
     low-rank input still carries at least two anchors on its largest axis rather
     than collapsing to a lone corner anchor."""
     ndim = len(shape)
-    if ndim in _RANK_LEVELS:
+    if ndim == 3:
+        rank_levels = 7 if agg_level == 1 else 6
+    elif ndim in _RANK_LEVELS:
         rank_levels = _RANK_LEVELS[ndim]
     else:
         budget_log2 = _AUTO_CHUNK_THRESHOLD.bit_length() - 1  # log2 points/chunk
@@ -1158,7 +1163,15 @@ class GNNCompressorCodec:
                 else [_GNN_EB_COARSE_FACTOR]
             )
         )
-        levels = _auto_levels(shape) if self.auto_levels else self.levels
+        if self.auto_levels:
+            import torch
+
+            agg_level = _gp._load_inference_model(
+                self.checkpoint_path, torch, self.device
+            )[3]
+            levels = _auto_levels(shape, agg_level)
+        else:
+            levels = self.levels
         anchor_stride = 1 << levels
         ratio_candidates = sorted(
             {_per_step_eb_ratio(c, levels) for c in coarse_candidates}

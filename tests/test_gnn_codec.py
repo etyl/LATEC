@@ -79,16 +79,16 @@ def test_bad_levels_string_rejected(tiny_checkpoint):
 @pytest.mark.parametrize(
     "shape,expected",
     [
-        # rank sets the depth; the tuned common ranks are 2-D 9, 3-D 7, 4-D 5.
+        # Rank sets the depth; these cases use the default aggregation level 2.
         ((64, 64, 64, 64), 5),  # 4-D -> level 5 (edge-32 operating point)
         ((128, 128, 128, 128), 5),
-        ((256, 256, 256), 7),  # 3-D -> 7 when the size guard does not bind
-        ((2048, 2048), 9),  # 2-D -> 9 when the size guard does not bind
+        ((256, 256, 256), 6),  # 3-D, aggregation level 2
+        ((2048, 2048), 8),  # 2-D -> 8 when the size guard does not bind
         ((4, 4, 4, 100000), 5),  # rank 4 regardless of one huge axis
         ((256, 256, 256, 256, 256), 4),  # 5-D fallback -> smaller stride
         # size guard: small / low-rank inputs cannot exceed anchor_stride=max/2
-        ((512, 512), 8),  # 2-D wants 9 but the 512 axis caps it
-        ((64, 64), 5),  # 2-D wants 9 but the 64 axis caps it
+        ((512, 512), 8),
+        ((64, 64), 5),  # 2-D wants 8 but the 64 axis caps it
         ((32, 32), 4),
         ((16, 16, 16, 16), 3),  # small 4-D block: guard drops 5 -> 3
         ((4,), 1),
@@ -112,6 +112,14 @@ def test_auto_levels_is_rank_driven_not_size_driven():
     # higher rank -> shallower schedule (smaller stride keeps a chunk bounded)
     assert _auto_levels((256,) * 5) < _auto_levels((256,) * 4)
     assert _auto_levels((256,) * 4) < _auto_levels((256,) * 3)
+
+
+def test_auto_levels_3d_depends_on_aggregation_level():
+    from deepsz.gnn_codec import _auto_levels
+
+    shape = (256, 256, 256)
+    assert _auto_levels(shape, agg_level=1) == 7
+    assert _auto_levels(shape, agg_level=2) == 6
 
 
 def test_per_step_eb_ratio_is_depth_normalised():
