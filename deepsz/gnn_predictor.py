@@ -1447,6 +1447,13 @@ class ChunkedGNNPredictor:
         self.d, self.model, self.checkpoint_hash, self.agg_level = (
             _load_inference_model(checkpoint_path, torch, self.device)
         )
+        # "grow" schedule: each chunk's block is extended by one cell on every
+        # internal high face, so it *owns* (decodes) the shared boundary
+        # hyperplane with its right/bottom neighbours. The neighbour inherits
+        # that plane as an already-decoded low face (the codec column-splits it
+        # out of the neighbour's coded set). The codec sets this flag; when off,
+        # chunks are the plain half-open partition.
+        self.grow = False
 
     # -- per-tensor lifecycle -------------------------------------------------
     def begin(self, shape, chunk_edges, channels: int = 1, geometry_progress=None):
@@ -1517,10 +1524,24 @@ class ChunkedGNNPredictor:
 
     def chunk_slices(self, ci: int):
         cidx = np.unravel_index(ci, self.grid)
-        return tuple(
-            slice(i * e, min((i + 1) * e, n))
-            for i, e, n in zip(cidx, self.edges, self.shape)
-        )
+        sls = []
+        for i, e, n in zip(cidx, self.edges, self.shape):
+            hi = min((i + 1) * e, n)
+            # grow: own the shared boundary plane on internal high faces.
+            if self.grow and (i + 1) * e < n:
+                hi = (i + 1) * e + 1
+            sls.append(slice(i * e, hi))
+        return tuple(sls)
+
+    def low_axes(self, ci: int) -> tuple[int, ...]:
+        """Axes on which this chunk has an internal *low* neighbour -- its local
+        coord-0 hyperplane is that neighbour's already-decoded high face (grow
+        mode), so the codec column-splits those cells out of this chunk's coded
+        set. Empty unless ``grow``."""
+        if not self.grow:
+            return ()
+        cidx = np.unravel_index(ci, self.grid)
+        return tuple(a for a, i in enumerate(cidx) if i > 0)
 
     def _norm(self, vals: np.ndarray):
         v = (np.clip(vals, self.vmin, self.vmax) - self.vmin) / self.span
