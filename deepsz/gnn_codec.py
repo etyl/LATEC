@@ -436,6 +436,20 @@ _GATE_DIR_SHIFT = 10
 # No field prefers the legacy copy, and the two that look flat are fields where
 # the gate rarely fires at all -- so unlike the interp side there is nothing to
 # earn and the strongest mode is the default.
+#
+# It is not free. This path is launch-bound, so gather count is the cost model,
+# and END_EXTRAP forces the two *linear* candidates to fetch +-3s, which they
+# previously never touched (the cubic candidate already has those samples for its
+# own stencil, so it gets END_EXTRAP for nothing and END_QUAD is pure arithmetic).
+# One 64^3 finest sub-stage, V100, min of 7 interleaved rounds:
+#
+#   legacy 4.39 ms | QUAD 4.71 (+7%) | EXTRAP 5.48 (+25%) | both 7.33 (+67%)
+#
+# End to end that is ~+3-8% encode and no measurable decode cost, against -44%
+# bytes on s3d -- but on a field where the gate rarely fires it is paid for
+# nothing, since the candidates are computed before the gate chooses. Masking the
+# extrapolation to the ends (2.5% of points on 160^3) would add kernels rather
+# than remove them, so the lever is a cheaper gate, not cheaper ends.
 _GATE_END_MODE = END_QUAD | END_EXTRAP
 
 # Adaptive finest-level gate. The finest level (stride-1 sub-stages) carries the
