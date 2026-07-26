@@ -18,6 +18,7 @@ import deepsz.gnn_predictor as gp
 from deepsz.gnn_codec import (
     _GATE_END_MODE,
     _chunk_device_plan,
+    _end_plan,
     _interp_axis_at_t,
     roundtrip_slack,
 )
@@ -460,11 +461,37 @@ def test_device_gate_interp_matches_numpy_interp(end_mode, cubic):
             shape,
             cubic,
             end_mode,
+            _end_plan(torch, "cpu", coords, axis, 1, shape),
         )
         np.testing.assert_allclose(got.numpy(), exp, rtol=0, atol=1e-12)
 
 
-def test_gate_end_mode_is_the_strongest_pair():
+def test_end_plan_compacts_to_the_line_ends():
+    """``_end_plan`` is what keeps the end rules off the full-length tensors: it
+    must select only the unbracketed points, and nothing at all on an axis where
+    every point has both immediate neighbours."""
+    shape = (9, 7)
+    coords = tuple(c.ravel() for c in np.indices(shape))
+
+    idx, only_left, far_idx, far_valid = _end_plan(torch, "cpu", coords, 1, 2, shape)
+    # Axis 1 has length 7, so at stride 2 the unbracketed columns are 0 and 1 (no
+    # -2 neighbour) and 5 and 6 (no +2 one) -> 4 of 7 columns, every row.
+    cols = coords[1][idx.numpy()]
+    assert set(int(c) for c in cols) == {0, 1, 5, 6}
+    assert idx.numel() == 9 * 4
+    # 5 and 6 lean left (behind-sample at -6); 0 and 1 lean right (+6).
+    np.testing.assert_array_equal(only_left.numpy(), cols >= 5)
+    behind = np.where(cols >= 5, cols - 6, cols + 6)
+    np.testing.assert_array_equal(far_idx[1].numpy(), np.clip(behind, 0, 6))
+    # ...and only columns 6 and 0 have that behind-sample in bounds, so 1 and 5
+    # degrade to the plain copy even under END_EXTRAP.
+    np.testing.assert_array_equal(far_valid.numpy(), behind == np.clip(behind, 0, 6))
+    np.testing.assert_array_equal(far_idx[0].numpy(), coords[0][idx.numpy()])
+
+    # stride 1 on the length-9 axis: interior columns are bracketed, so an axis
+    # whose points are all bracketed returns None rather than an empty subset.
+    interior = (np.array([4]), np.array([4]))
+    assert _end_plan(torch, "cpu", interior, 0, 1, shape) is None
     """The GNN gate does not sweep its line ends (see ``_GATE_END_MODE``); pin the
     measured choice so a future edit to the interp predictor's more conservative
     default does not silently drag the gate along with it."""

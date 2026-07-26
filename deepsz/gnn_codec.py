@@ -437,19 +437,28 @@ _GATE_DIR_SHIFT = 10
 # the gate rarely fires at all -- so unlike the interp side there is nothing to
 # earn and the strongest mode is the default.
 #
-# It is not free. This path is launch-bound, so gather count is the cost model,
-# and END_EXTRAP forces the two *linear* candidates to fetch +-3s, which they
-# previously never touched (the cubic candidate already has those samples for its
-# own stencil, so it gets END_EXTRAP for nothing and END_QUAD is pure arithmetic).
-# One 64^3 finest sub-stage, V100, min of 7 interleaved rounds:
+# It is not free, but it is much cheaper than it looks: the end rules apply to the
+# ~3% of points that are line ends, so ``_end_plan`` compacts them once per cached
+# chunk plan and the device evaluates them on that subset instead of masking
+# full-length tensors. This needs no ``nonzero`` (which would sync the launch-bound
+# critical path) because *which* points are ends is pure geometry of the chunk
+# shape and sub-stage. All three candidates, one 64^3 stride-1 stage, V100, min of
+# 7 interleaved rounds, outputs ``torch.equal`` between the two implementations:
 #
-#   legacy 4.39 ms | QUAD 4.71 (+7%) | EXTRAP 5.48 (+25%) | both 7.33 (+67%)
+#   end mode   full-length masks   _end_plan subset
+#   legacy               3.61 ms      2.96 ms  -18%
+#   QUAD                 4.45         3.83     -14%
+#   EXTRAP               4.89         3.60     -26%
+#   both (deployed)      5.75         4.46     -22%
 #
-# End to end that is ~+3-8% encode and no measurable decode cost, against -44%
-# bytes on s3d -- but on a field where the gate rarely fires it is paid for
-# nothing, since the candidates are computed before the gate chooses. Masking the
-# extrapolation to the ends (2.5% of points on 160^3) would add kernels rather
-# than remove them, so the lever is a cheaper gate, not cheaper ends.
+# EXTRAP gains most because the two *linear* candidates need +-3s only at the ends
+# (the cubic candidate already holds those samples for its own stencil, and
+# END_QUAD is pure arithmetic on them). Legacy gains too: the full-length +-s
+# validity masks and the final selecting ``where``s are gone entirely.
+# End to end the win is inside run-to-run noise on s3d (encode is dominated by the
+# model forward, and the same config varies 33-66s on a shared box) -- what this
+# buys is that the strongest end mode is no longer something a field with a rarely
+# firing gate pays much for.
 _GATE_END_MODE = END_QUAD | END_EXTRAP
 
 # Adaptive finest-level gate. The finest level (stride-1 sub-stages) carries the
@@ -492,7 +501,40 @@ def _unpack_gates(blob: str) -> list[int]:
 # anchored on enc/dec agreement, not on matching the old numpy stream.
 
 
-def _interp_axis_at_t(torch, W, coords, axis, s, shape, cubic, end_mode):
+def _end_plan(torch, dev, coords_np, axis, s, shape):
+    """Static geometry of one axis's line ends, or ``None`` if it has none.
+
+    A point whose ``+-s`` neighbours are both in bounds is interpolated by the
+    ordinary stencil; the rest -- the line ends, ~2.5% of a 160^3 chunk's points --
+    take a one-sided rule that reads only the two samples *behind* them. Which
+    points those are, which side they lean to, and where their behind-samples live
+    depend on the chunk shape and sub-stage alone, so they are resolved on the host
+    once per cached chunk plan and the device just applies them to a compacted
+    subset. Returns ``(idx, only_left, far_idx, far_valid)``: positions within the
+    stage, side, the gather index of the ``-+3s`` sample, and its validity.
+    """
+    c, L = coords_np[axis], shape[axis]
+    vm1, vp1 = c - s >= 0, c + s < L
+    idx = np.flatnonzero(~(vm1 & vp1))
+    if idx.size == 0:
+        return None
+    only_left = (vm1 & ~vp1)[idx]
+    cfar = c[idx] + np.where(only_left, -3 * s, 3 * s)
+    far = list(cc[idx] for cc in coords_np)
+    far[axis] = np.clip(cfar, 0, L - 1)
+
+    def to_dev(a):
+        return torch.from_numpy(np.ascontiguousarray(a)).to(dev)
+
+    return (
+        to_dev(idx.astype(np.int64)),
+        to_dev(only_left),
+        tuple(to_dev(f.astype(np.int64)) for f in far),
+        to_dev((cfar >= 0) & (cfar < L)),
+    )
+
+
+def _interp_axis_at_t(torch, W, coords, axis, s, shape, cubic, end_mode, ends):
     """Linear or cubic interpolation on device.
 
     ``W`` is ``(C, *S)`` float64 and ``coords`` is a tuple of ``(M,)`` long
@@ -501,26 +543,25 @@ def _interp_axis_at_t(torch, W, coords, axis, s, shape, cubic, end_mode):
     reconstruction, so a line end is hit at every chunk face rather than only at
     the domain face, and the legacy nearest-neighbour copy is correspondingly
     more expensive than it is for the whole-tensor interp predictor.
+
+    Line ends are handled on the ``_end_plan`` subset rather than by masking
+    full-length tensors, which is what keeps ``END_EXTRAP`` from costing the
+    *linear* candidates a pair of full ``+-3s`` gathers they use nowhere else.
     """
 
-    def gather(off):
-        ca = coords[axis] + off
-        valid = (ca >= 0) & (ca < shape[axis])
+    def at(off):  # neighbour values, edge-clamped (validity is handled per branch)
         idx = list(coords)
-        idx[axis] = ca.clamp(0, shape[axis] - 1)
-        return W[(slice(None), *idx)], valid
+        idx[axis] = (coords[axis] + off).clamp(0, shape[axis] - 1)
+        return W[(slice(None), *idx)]
 
-    Lm1, vm1 = gather(-s)
-    Lp1, vp1 = gather(+s)
-    lin = 0.5 * (Lm1 + Lp1)
-    pred = lin
-    far = None
+    Lm1, Lp1 = at(-s), at(+s)
+    out = 0.5 * (Lm1 + Lp1)
     if cubic:
-        Lm3, vm3 = gather(-3 * s)
-        Lp3, vp3 = gather(+3 * s)
-        far = (Lm3, vm3, Lp3, vp3)
+        ca = coords[axis]
+        vm3, vp3 = ca - 3 * s >= 0, ca + 3 * s < shape[axis]
+        Lm3, Lp3 = at(-3 * s), at(+3 * s)
         cub = (-Lm3 + 9 * Lm1 + 9 * Lp1 - Lp3) / 16.0
-        one_far = lin
+        one_far = out
         if end_mode & END_QUAD:
             one_far = torch.where(
                 (vp3 & ~vm3).unsqueeze(0),
@@ -528,40 +569,39 @@ def _interp_axis_at_t(torch, W, coords, axis, s, shape, cubic, end_mode):
                 torch.where(
                     (vm3 & ~vp3).unsqueeze(0),
                     (-Lm3 + 6 * Lm1 + 3 * Lp1) / 8.0,  # interp_quad_2 (trailing)
-                    lin,  # both far neighbours missing: nothing better than linear
+                    out,  # both far neighbours missing: nothing better than linear
                 ),
             )
-        pred = torch.where((vm3 & vp3).unsqueeze(0), cub, one_far)
-    both = vm1 & vp1
-    left, right = Lm1, Lp1
+        out = torch.where((vm3 & vp3).unsqueeze(0), cub, one_far)
+    if ends is None:  # this axis is bracketed everywhere: no ends to overwrite
+        return out
+    eidx, only_left, far_idx, far_valid = ends
+    side = only_left.unsqueeze(0)
+    near = torch.where(side, Lm1.index_select(1, eidx), Lp1.index_select(1, eidx))
     if end_mode & END_EXTRAP:
-        if far is None:  # linear order never gathered the far samples
-            Lm3, vm3 = gather(-3 * s)
-            Lp3, vp3 = gather(+3 * s)
-        else:
-            Lm3, vm3, Lp3, vp3 = far
         # interp_linear1: continue the last known slope, falling back to the copy
         # when even the second sample behind is off the line.
-        left = torch.where(vm3.unsqueeze(0), 1.5 * Lm1 - 0.5 * Lm3, Lm1)
-        right = torch.where(vp3.unsqueeze(0), 1.5 * Lp1 - 0.5 * Lp3, Lp1)
-    only_left = (vm1 & ~vp1).unsqueeze(0)
-    return torch.where(both.unsqueeze(0), pred, torch.where(only_left, left, right))
+        far = W[(slice(None), *far_idx)]
+        near = torch.where(far_valid.unsqueeze(0), 1.5 * near - 0.5 * far, near)
+    return out.index_copy_(1, eidx, near)
 
 
 def _interp_stage_pred_t(
-    torch, recon_t, sls, coords_t, stride, axes, center, *, cubic, end_mode
+    torch, recon_t, sls, coords_t, stride, axes, center, *, cubic, end_mode, ends
 ):
     """Chunk-local interpolation from the causal device reconstruction."""
     W = recon_t[(slice(None), *sls)].double()
     shape = tuple(W.shape[1:])
+
+    def axis_pred(a):
+        return _interp_axis_at_t(
+            torch, W, coords_t, a, stride, shape, cubic, end_mode, ends[a]
+        )
+
     if center == 0 or len(axes) == 1:
-        ip = sum(
-            _interp_axis_at_t(torch, W, coords_t, a, stride, shape, cubic, end_mode)
-            for a in axes
-        ) / len(axes)
+        ip = sum(axis_pred(a) for a in axes) / len(axes)
     else:
-        ax = axes[0] if center == 1 else axes[-1]
-        ip = _interp_axis_at_t(torch, W, coords_t, ax, stride, shape, cubic, end_mode)
+        ip = axis_pred(axes[0] if center == 1 else axes[-1])
     return ip.to(torch.float32)  # (C, n)
 
 
@@ -569,16 +609,18 @@ def _gate_interps(torch, recon_t, sls, interp_dev, s, center, end_mode):
     """The three gate interp candidates for one stage: (cubic, first-axis linear,
     last-axis linear). Shared by encoder and decoder so both see identical
     fallbacks; the caller selects among them by the stored/derived gate kind."""
-    coords_t, st_i, ax_i = interp_dev[s]
+    coords_t, st_i, ax_i, ends_i = interp_dev[s]
     ip_cubic = _interp_stage_pred_t(
         torch, recon_t, sls, coords_t, st_i, ax_i, center, cubic=True,
-        end_mode=end_mode,
+        end_mode=end_mode, ends=ends_i,
     )
     ip_linear = _interp_stage_pred_t(
-        torch, recon_t, sls, coords_t, st_i, ax_i, 1, cubic=False, end_mode=end_mode,
+        torch, recon_t, sls, coords_t, st_i, ax_i, 1, cubic=False,
+        end_mode=end_mode, ends=ends_i,
     )
     ip_linear_last = _interp_stage_pred_t(
-        torch, recon_t, sls, coords_t, st_i, ax_i, 2, cubic=False, end_mode=end_mode,
+        torch, recon_t, sls, coords_t, st_i, ax_i, 2, cubic=False,
+        end_mode=end_mode, ends=ends_i,
     )
     return ip_cubic, ip_linear, ip_linear_last
 
@@ -1018,7 +1060,8 @@ def _chunk_device_plan(
             coords = tuple(
                 torch.from_numpy(np.ascontiguousarray(cc)).to(dev) for cc in coords_np
             )
-            interp_dev.append((coords, st, ax))
+            ends = {a: _end_plan(torch, dev, coords_np, a, st, cshape) for a in ax}
+            interp_dev.append((coords, st, ax, ends))
         else:
             interp_dev.append(None)
     center = default_interp_center(len(cshape))
