@@ -15,6 +15,7 @@ import numpy as np
 from .bitstream import (
     DTYPE_CODES,
     DTYPE_IDS,
+    END_MODE_SHIFT,
     FLAG_COMPILED,
     FLAG_CUBIC,
     FLAG_FP16,
@@ -27,7 +28,12 @@ from .bitstream import (
     write_stream,
 )
 from .levels import stage_ebs, stage_masks
-from .predictor import InterpPredictor, default_interp_center
+from .predictor import (
+    END_MODE_MAX,
+    InterpPredictor,
+    default_interp_center,
+    default_interp_end_mode,
+)
 from .quantizer import dequantize, quantize
 from .rans import build_laplace_tables, model_bits, scale_to_level
 
@@ -133,7 +139,7 @@ def compress(
     def ebs_for(ratio):
         return stage_ebs(region_shape, levels, anchor_stride, anchor_block, eb, ratio)
 
-    def make_header(center, ratio):
+    def make_header(center, ratio, end_mode):
         return Header(
             channels=c,
             src_dtype=src_dtype,
@@ -152,7 +158,7 @@ def compress(
             vmin=vmin,
             vmax=vmax,
             ckpt_hash=getattr(predictor, "checkpoint_hash", b"\0" * 16),
-            flags=flags,
+            flags=flags | (int(end_mode) << END_MODE_SHIFT),
             interp_center=center,
             eb_ratio=ratio,
         )
@@ -165,55 +171,95 @@ def compress(
     # carries the full eb, so every candidate satisfies the bound.
     tunable = getattr(predictor, "tunable", False)
     has_center = hasattr(predictor, "center")
-    # Resolve a rank-aware ``center`` (None = auto) now that the region rank is
-    # known, so fast mode and the tune sweep both start from the right base.
+    has_end_mode = hasattr(predictor, "end_mode")
+    # Resolve the rank-aware ``center`` / ``end_mode`` (None = auto) now that the
+    # region rank is known, so fast mode and the tune sweep both start from the
+    # right base.
     if has_center and getattr(predictor, "center") is None:
         predictor.center = default_interp_center(len(region_shape))
+    if has_end_mode and getattr(predictor, "end_mode") is None:
+        predictor.end_mode = default_interp_end_mode(len(region_shape))
     if eb_ratio is not None:
         ratio_cands = [eb_ratio]
     elif tunable and tune != "fast":
         ratio_cands = [1.0, 0.9, 0.8, 0.7]
     else:  # single encode: predictor's best fixed default (see fast_eb_ratio)
         ratio_cands = [getattr(predictor, "fast_eb_ratio", 1.0)]
+    sweep = tunable and tune != "fast" and eb_ratio is None
     base_center = getattr(predictor, "center", 0)
     center_cands = [base_center]
-    if tunable and has_center and tune != "fast" and eb_ratio is None:
+    if sweep and has_center:
         center_cands += [c for c in (0, 1, 2) if c != base_center]
+    base_end = getattr(predictor, "end_mode", 0)
 
     candidates = []
+
+    def run(ratio, center, end_mode):
+        """Encode one candidate, record it, and return it."""
+        if has_center:
+            predictor.center = center
+        if has_end_mode:
+            predictor.end_mode = end_mode
+        payload, rc, raw_bytes, st = encode(ebs_for(ratio))
+        header = make_header(center, ratio, end_mode)
+        t0 = time.time()
+        stream = write_stream(header, payload, zstd_level)
+        st["entropy_s"] += time.time() - t0
+        st["raw_payload_bytes"] = raw_bytes
+        st["compressed_bytes"] = len(stream)
+        st["recon_sse"] = float(sum(st["stage_recon_sse"]))
+        cand = (len(stream), st["recon_sse"], ratio, center, end_mode, stream, rc, st)
+        candidates.append(cand)
+        return cand
+
+    # Knobs are swept in sequence, the way SZ3 tunes its own interpolation
+    # settings, rather than as a full product: 4 end modes x 4 ratios x 3 centres
+    # is 48 encodes, which is unusable on a real field.
+    #
+    # Line-end handling goes FIRST, and the order matters: it has by far the
+    # largest single effect (-37% on s3d, where the others are worth a few
+    # percent) and it interacts strongly with them, so conditioning ratio/centre
+    # on it beats the reverse. Measured on the s3d 160^3 crop at rel eb 1e-3 --
+    # ends-last picks (0.8, centre 2, mode 3) for 25223 B, ends-first reaches
+    # (0.9, centre 0, mode 3) for 21096 B.
+    seen = set()
+
+    def run_once(ratio, center, end_mode):
+        if (ratio, center, end_mode) not in seen:
+            seen.add((ratio, center, end_mode))
+            run(ratio, center, end_mode)
+
+    run_once(ratio_cands[0], base_center, base_end)
+    chosen_end = base_end
+    if sweep and has_end_mode:
+        for end_mode in range(END_MODE_MAX + 1):
+            run_once(ratio_cands[0], base_center, end_mode)
+        chosen_end = min(candidates, key=lambda c: (c[0], c[1]))[4]
+
     for ratio in ratio_cands:
         for center in center_cands:
-            if has_center:
-                predictor.center = center
-            payload, rc, raw_bytes, st = encode(ebs_for(ratio))
-            header = make_header(center, ratio)
-            t0 = time.time()
-            stream = write_stream(header, payload, zstd_level)
-            st["entropy_s"] += time.time() - t0
-            st["raw_payload_bytes"] = raw_bytes
-            st["compressed_bytes"] = len(stream)
-            st["recon_sse"] = float(sum(st["stage_recon_sse"]))
-            candidates.append(
-                (len(stream), st["recon_sse"], ratio, center, stream, rc, st)
-            )
+            run_once(ratio, center, chosen_end)
 
     if tune == "rd" and eb_ratio is None and tunable and len(candidates) > 1:
         min_size = min(c[0] for c in candidates)
         size_limit = min_size * tune_size_slack
         feasible = [c for c in candidates if c[0] <= size_limit]
-        best = min(feasible, key=lambda c: (c[1], c[0], c[2], c[3]))
+        best = min(feasible, key=lambda c: (c[1], c[0], c[2], c[3], c[4]))
     else:
-        best = min(candidates, key=lambda c: (c[0], c[1], c[2], c[3]))
+        best = min(candidates, key=lambda c: (c[0], c[1], c[2], c[3], c[4]))
 
-    _, _, chosen_ratio, chosen_center, stream, recon_canvas, stats = best
+    _, _, chosen_ratio, chosen_center, chosen_end, stream, recon_canvas, stats = best
     stats["tune_candidates"] = len(candidates)
-    stats["search_predict_s"] = sum(c[6]["predict_s"] for c in candidates)
-    stats["search_quantize_s"] = sum(c[6]["quantize_s"] for c in candidates)
-    stats["search_entropy_s"] = sum(c[6]["entropy_s"] for c in candidates)
+    stats["search_predict_s"] = sum(c[7]["predict_s"] for c in candidates)
+    stats["search_quantize_s"] = sum(c[7]["quantize_s"] for c in candidates)
+    stats["search_entropy_s"] = sum(c[7]["entropy_s"] for c in candidates)
     if has_center:
         predictor.center = chosen_center
+    if has_end_mode:
+        predictor.end_mode = chosen_end
     stats["eb_ratio"] = chosen_ratio
     stats["interp_center"] = chosen_center
+    stats["interp_end_mode"] = chosen_end
     stats["tune"] = tune
     stats["tune_size_slack"] = (
         tune_size_slack if tune == "rd" and eb_ratio is None and tunable else 1.0
@@ -221,11 +267,14 @@ def compress(
     if verbose:
         print(
             f"tuned: eb_ratio={chosen_ratio} center={chosen_center} "
+            f"end_mode={chosen_end} "
             f"compressed={len(stream)} bytes raw={stats['raw_payload_bytes']} bytes "
             f"sse={stats['recon_sse']:.6g}"
         )
 
-    stats["recon"] = _finalize(recon_canvas, make_header(chosen_center, chosen_ratio))
+    stats["recon"] = _finalize(
+        recon_canvas, make_header(chosen_center, chosen_ratio, chosen_end)
+    )
     stats["original_bytes"] = img.nbytes
     stats["ratio"] = img.nbytes / len(stream)
     return stream, stats
@@ -249,6 +298,8 @@ def decompress(stream: bytes, predictor_factory=None) -> np.ndarray:
     predictor = predictor_factory(header)
     if hasattr(predictor, "center"):
         predictor.center = header.interp_center
+    if hasattr(predictor, "end_mode"):
+        predictor.end_mode = (header.flags >> END_MODE_SHIFT) & END_MODE_MAX
 
     make_masks = getattr(predictor, "stage_masks", stage_masks)
     spatial = tuple(header.spatial)

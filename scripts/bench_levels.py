@@ -282,13 +282,19 @@ class WhatIfGate:
             coords = np.nonzero(mask)
             W = recon[(slice(None), *sls)].astype(np.float64)
             center = default_interp_center(len(cshape))
+            # 0 = the original linear/edge-copy ends, which is what the GNN
+            # codec's device gate interps (`gnn_codec._interp_axis_at_t`) still
+            # do; keep this comparison apples-to-apples with the deployed gate
+            # rather than with the interp predictor's newer default.
+            end_mode = 0
             if center == 0 or len(axes) == 1:
                 ip = sum(
-                    _interp_axis_at(W, coords, a, stride, "cubic", cshape) for a in axes
+                    _interp_axis_at(W, coords, a, stride, "cubic", cshape, end_mode)
+                    for a in axes
                 ) / len(axes)
             else:
                 a = axes[0] if center == 1 else axes[-1]
-                ip = _interp_axis_at(W, coords, a, stride, "cubic", cshape)
+                ip = _interp_axis_at(W, coords, a, stride, "cubic", cshape, end_mode)
             truth = self.field[(slice(None), *sls)][:, mask][0]
             self._accum(
                 float(eb),

@@ -30,6 +30,10 @@ FLAG_NOTILE = 1 << 5  # whole image is one tile (no padding, no seam)
 FLAG_RANS = 1 << 6  # per-symbol scale-conditioned coder for stage bins
 FLAG_FP16 = 1 << 7  # GNN message pass used fp16 autocast
 FLAG_COMPILED = 1 << 8  # GNN message pass used torch.compile
+# interp line-end handling, predictor.END_QUAD / END_EXTRAP shifted into flags
+FLAG_END_QUAD = 1 << 9
+FLAG_END_EXTRAP = 1 << 10
+END_MODE_SHIFT = 9  # flags >> this, masked to 2 bits, is the predictor end_mode
 
 # magic, version, flags, channels, dtype, scheduling parameters, predictor
 # parameters, value range, checkpoint fingerprint, and per-level EB ratio.
