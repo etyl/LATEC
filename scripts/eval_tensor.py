@@ -131,7 +131,10 @@ def main(argv=None):
         print(f"normalized [{lo:.4g},{hi:.4g}] -> [0,1]")
     eb = args.eb
     if args.rel:
-        eb = args.eb * max(float(arr.max()) - float(arr.min()), 1.0)
+        # Relative eb is a fraction of the true value range; only floor the span
+        # away from zero (matching load/report). A 1.0 floor silently rescales
+        # any field whose range is < 1 (e.g. S3D mass fractions, range ~0.04).
+        eb = args.eb * max(float(arr.max()) - float(arr.min()), 1e-12)
 
     if args.predictor == "gnn":
         # GNNCompressorCodec auto-chunks large tensors; the codec.compress path
@@ -142,7 +145,11 @@ def main(argv=None):
         # GNNCompressorCodec normalizes the tensor internally and treats
         # error_bound as relative to (max - min); convert this script's
         # absolute eb (used below for report()/baselines) back to that.
-        gnn_span = max(float(arr.max()) - float(arr.min()), 1.0)
+        # NB: floor only against zero-division, NOT at 1.0 -- a 1.0 floor hands
+        # the GNN a bound tightened by 1/span (25x on S3D, span ~0.04) while the
+        # sz3/interp baselines below keep the true absolute eb, so the GNN looks
+        # far worse than it is. Keep the conversion exact so the comparison is fair.
+        gnn_span = max(float(arr.max()) - float(arr.min()), 1e-12)
         codec = GNNCompressorCodec(
             args.gnn_checkpoint,
             error_bound=eb / gnn_span,
