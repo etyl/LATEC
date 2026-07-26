@@ -168,9 +168,10 @@ def test_gate_rate_selector_can_choose_high_side():
     assert int(threshold) > 0
 
 
-def test_gate_fine_implicit_roundtrip_and_header(current_ckpt):
-    """The implicit finest gate holds the bound, adds no per-stage bytes (only a
-    flag), and its decision is replayed from the header alone."""
+def test_gate_fine_adaptive_roundtrip_and_header(current_ckpt):
+    """The adaptive finest gate holds the bound and stores at most one descriptor
+    per chunk (not one per finest sub-stage); its decision is replayed from the
+    header alone."""
     from deepsz.gnn_codec import _read_stream, _unpack_gates
 
     rng = np.random.RandomState(3)
@@ -187,13 +188,18 @@ def test_gate_fine_implicit_roundtrip_and_header(current_ckpt):
     )
     stream = codec.compress(f)
     meta = _read_stream(stream)[0]
-    assert meta.get("gate_fine") is True
+    n_chunks = (16 // STRIDE) ** 2
+    # Finest gate descriptors: at most one word per chunk (vs one per finest
+    # sub-stage in the per-sub-stage gate), and never a legacy flag.
+    assert "gate_fine" not in meta
+    packed_fine = meta.get("fine_gates")
+    if packed_fine is not None:
+        assert len(_unpack_gates(packed_fine)) <= n_chunks
     # The packed coarse gate list, if present, only holds coarse (stride>1) stages.
     packed = meta.get("gates")
     if packed is not None:
         n_stages = len(stage_plan((STRIDE, STRIDE), LEVELS, 1 << LEVELS)) - 1
         n_finest = (1 << f.ndim) - 1  # stride-1 sub-stages per chunk
-        n_chunks = (16 // STRIDE) ** 2
         assert len(_unpack_gates(packed)) <= n_chunks * (n_stages - n_finest)
 
     y = codec.uncompress(stream)

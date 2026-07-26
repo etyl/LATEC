@@ -373,17 +373,16 @@ _GATE_SHIFTS = (0, 2, 4, 6)
 # kind 0 == off; kind 1/2/3 == cubic / first-axis-linear / last-axis-linear.
 _GATE_DIR_SHIFT = 10
 
-# Implicit finest-level gate. The finest level (stride-1 sub-stages) carries the
+# Adaptive finest-level gate. The finest level (stride-1 sub-stages) carries the
 # large majority of the bits, and on smooth fields interpolation beats the model
-# there almost everywhere. Rather than spend a per-chunk-stage header byte at the
-# finest level, both encoder and decoder apply one fixed, parameter-free rule
-# recomputed from the scale each already holds: fire cubic-interp fallback on the
-# low side of eb*2^_GATE_FINE_T with a _GATE_FINE_SHIFT scale tightening. The
+# there almost everywhere. Spending one swept gate word per finest sub-stage is
+# accurate but the finest level has 2^ndim - 1 sub-stages per chunk. gate_fine
+# instead chooses a *single* descriptor per chunk (predictor, direction, T,
+# shift) from the chunk's first finest sub-stage and reuses it across the rest,
+# storing one word per chunk. The threshold is still data-chosen (adaptive) --
+# unlike a hardcoded rule -- but the per-chunk metadata drops by ~2^ndim. The
 # error bound is enforced by quantization regardless of predictor, so this only
 # ever trades rate, never correctness; disable per stream with gate_fine=False.
-_GATE_FINE_T = 6
-_GATE_FINE_SHIFT = 2
-_GATE_FINE_KIND = 1  # cubic
 
 
 def _pack_gates(gates: list[int]) -> str:
@@ -456,6 +455,23 @@ def _interp_stage_pred_t(
         ax = axes[0] if center == 1 else axes[-1]
         ip = _interp_axis_at_t(torch, W, coords_t, ax, stride, shape, cubic)
     return ip.to(torch.float32)  # (C, n)
+
+
+def _gate_interps(torch, recon_t, sls, interp_dev, s, center):
+    """The three gate interp candidates for one stage: (cubic, first-axis linear,
+    last-axis linear). Shared by encoder and decoder so both see identical
+    fallbacks; the caller selects among them by the stored/derived gate kind."""
+    coords_t, st_i, ax_i = interp_dev[s]
+    ip_cubic = _interp_stage_pred_t(
+        torch, recon_t, sls, coords_t, st_i, ax_i, center, cubic=True
+    )
+    ip_linear = _interp_stage_pred_t(
+        torch, recon_t, sls, coords_t, st_i, ax_i, 1, cubic=False
+    )
+    ip_linear_last = _interp_stage_pred_t(
+        torch, recon_t, sls, coords_t, st_i, ax_i, 2, cubic=False
+    )
+    return ip_cubic, ip_linear, ip_linear_last
 
 
 def _laplace_bits_t(torch, absr, b, eb, radius):
@@ -604,7 +620,7 @@ def _compress_chunked(
     edges: tuple[int, ...],
     gate: bool = False,
     gate_fine: bool = True,
-) -> tuple[bytes, list[int] | None]:
+) -> tuple[bytes, list[int] | None, list[int] | None]:
     """Encode a global anchor pass followed by one chunk at a time.
 
     Extended-block raster schedule: each chunk owns its internal high-face
@@ -653,13 +669,11 @@ def _compress_chunked(
     index_cache: dict = {}  # cshape -> device stage schedule (see _chunk_device_plan)
     full_strides = np.cumprod((1,) + shape[:0:-1])[::-1].astype(np.int64)
     gates_t: list = [] if gate else None  # per stage-chunk gate byte, device scalars
-    # Finest level = stride-1 sub-stages; there the gate is implicit (no header
-    # byte), governed by the fixed _GATE_FINE_* rule. Depends only on the schedule
-    # shape, so compute once for the whole encode.
+    # Finest level = stride-1 sub-stages; with gate_fine one descriptor per chunk
+    # covers them all (chosen at the chunk's first finest sub-stage). is_finest
+    # depends only on the schedule shape, so compute once for the whole encode.
+    fine_gates_t: list = [] if (gate and gate_fine) else None  # one word per chunk
     is_finest = [st == 1 for st in stage_strides(len(shape), predictor.levels, stride)]
-    fine_t = torch.tensor(_GATE_FINE_T, dtype=torch.int64, device=dev)
-    fine_sh = torch.tensor(_GATE_FINE_SHIFT, dtype=torch.int64, device=dev)
-    fine_dir = torch.zeros((), dtype=torch.int64, device=dev)
     bar = _progress_bar("encode", predictor.n_chunks)
     for group in waves:
         for ci in group:
@@ -674,6 +688,7 @@ def _compress_chunked(
             full_counts, counts, pos_dev, recon_off_dev, interp_dev, pred_idx_dev, center = (
                 index_cache[key]
             )
+            fine_desc = None  # (kind, dir, T, shift) chosen once per chunk (gate_fine)
             # The chunk value block is uploaded once, not once per stage.
             vblocks = [
                 torch.from_numpy(
@@ -716,47 +731,42 @@ def _compress_chunked(
                     p = pred[bi][None, :]
                     sc = scale[bi]
                     if gate and gate_fine and is_finest[s]:
-                        # Implicit finest gate: fixed cubic-interp fallback, no
-                        # header byte. Only the cubic candidate is needed here.
-                        coords_t, st_i, ax_i = interp_dev[s]
-                        ip = _interp_stage_pred_t(
-                            torch, recon_t, sls, coords_t, st_i, ax_i, center,
-                            cubic=True,
+                        # Adaptive finest gate: pick one descriptor per chunk at
+                        # its first finest sub-stage, then reuse it (one stored
+                        # word per chunk, see the "Adaptive finest-level gate" note).
+                        ip_cubic, ip_linear, ip_linear_last = _gate_interps(
+                            torch, recon_t, sls, interp_dev, s, center
+                        )
+                        if fine_desc is None:
+                            gk, gd, gt, gs = _gate_select_t(
+                                torch,
+                                (cvals - p).abs(),
+                                (
+                                    (cvals - ip_cubic).abs(),
+                                    (cvals - ip_linear).abs(),
+                                    (cvals - ip_linear_last).abs(),
+                                ),
+                                sc,
+                                ebs[s],
+                                radius,
+                            )
+                            fine_desc = (gk, gd, gt, gs)
+                            fine_gates_t.append(
+                                (gd << _GATE_DIR_SHIFT) + gk * 256 + gt * 16 + gs
+                            )
+                        else:
+                            gk, gd, gt, gs = fine_desc
+                        ip = torch.where(
+                            gk == 2,
+                            ip_linear,
+                            torch.where(gk == 3, ip_linear_last, ip_cubic),
                         )
                         p, sc = _gate_apply_t(
-                            torch, pred[bi], sc, ip, ebs[s], fine_t, fine_sh, fine_dir
+                            torch, pred[bi], sc, ip, ebs[s], gt, gs, gd
                         )
                     elif gate:
-                        coords_t, st_i, ax_i = interp_dev[s]
-                        ip_cubic = _interp_stage_pred_t(
-                            torch,
-                            recon_t,
-                            sls,
-                            coords_t,
-                            st_i,
-                            ax_i,
-                            center,
-                            cubic=True,
-                        )
-                        ip_linear = _interp_stage_pred_t(
-                            torch,
-                            recon_t,
-                            sls,
-                            coords_t,
-                            st_i,
-                            ax_i,
-                            1,
-                            cubic=False,
-                        )
-                        ip_linear_last = _interp_stage_pred_t(
-                            torch,
-                            recon_t,
-                            sls,
-                            coords_t,
-                            st_i,
-                            ax_i,
-                            2,
-                            cubic=False,
+                        ip_cubic, ip_linear, ip_linear_last = _gate_interps(
+                            torch, recon_t, sls, interp_dev, s, center
                         )
                         gk, gd, gt, gs = _gate_select_t(
                             torch,
@@ -829,7 +839,14 @@ def _compress_chunked(
     gates = None
     if gate:
         gates = [int(x) for x in torch.stack(gates_t).cpu().tolist()] if gates_t else []
-    return b"".join(parts), gates
+    fine_gates = None
+    if gate and gate_fine:
+        fine_gates = (
+            [int(x) for x in torch.stack(fine_gates_t).cpu().tolist()]
+            if fine_gates_t
+            else []
+        )
+    return b"".join(parts), gates, fine_gates
 
 
 def _chunk_device_plan(
@@ -906,7 +923,7 @@ def _decompress_chunked(
     predictor: ChunkedGNNPredictor,
     edges: tuple[int, ...],
     gates: list[int] | None = None,
-    gate_fine: bool = False,
+    fine_gates: list[int] | None = None,
 ) -> np.ndarray:
     c = 1
     stride, block = predictor.anchor_stride, predictor.anchor_block
@@ -928,18 +945,22 @@ def _decompress_chunked(
     gates_t = (
         None if gates is None else torch.tensor(gates, dtype=torch.int64, device=dev)
     )
+    fine_gates_t = (
+        None
+        if fine_gates is None
+        else torch.tensor(fine_gates, dtype=torch.int64, device=dev)
+    )
     waves = [list(range(predictor.n_chunks))]  # raster order, mirrors encode
     _log(f"decode: anchors done, {predictor.n_chunks} chunks/model passes")
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
     index_cache: dict = {}  # cshape -> device stage schedule (see _chunk_device_plan)
     full_strides = np.cumprod((1,) + shape[:0:-1])[::-1].astype(np.int64)
     recon_flat = recon_t.reshape(c, -1)
-    # Mirror the encoder's implicit finest gate (stride-1 stages, no header byte).
+    # Mirror the encoder's adaptive finest gate: one descriptor per chunk covering
+    # all its stride-1 sub-stages, read at the chunk's first finest sub-stage.
     is_finest = [st == 1 for st in stage_strides(len(shape), predictor.levels, stride)]
-    fine_t = torch.tensor(_GATE_FINE_T, dtype=torch.int64, device=dev)
-    fine_sh = torch.tensor(_GATE_FINE_SHIFT, dtype=torch.int64, device=dev)
-    fine_dir = torch.zeros((), dtype=torch.int64, device=dev)
     gi = 0
+    fgi = 0
     bar = _progress_bar("decode", predictor.n_chunks)
     for group in waves:
         for ci in group:
@@ -954,6 +975,7 @@ def _decompress_chunked(
             full_counts, counts, _, recon_off_dev, interp_dev, pred_idx_dev, center = (
                 index_cache[key]
             )
+            fine_desc = None  # (kind, dir, T, shift) read once per chunk (gate_fine)
             origin_bases = [
                 int(
                     sum(
@@ -993,49 +1015,33 @@ def _decompress_chunked(
                     sls = predictor.chunk_slices(ids[bi])
                     p = pred[bi][None, :]
                     sc = scale[bi]
-                    if gate_fine and is_finest[s]:
-                        # Implicit finest gate: fixed cubic-interp rule, no byte.
-                        coords_t, st_i, ax_i = interp_dev[s]
-                        ip = _interp_stage_pred_t(
-                            torch, recon_t, sls, coords_t, st_i, ax_i, center,
-                            cubic=True,
+                    if fine_gates_t is not None and is_finest[s]:
+                        # Adaptive finest gate: read one descriptor per chunk at
+                        # its first finest sub-stage, then reuse it.
+                        ip_cubic, ip_linear, ip_linear_last = _gate_interps(
+                            torch, recon_t, sls, interp_dev, s, center
                         )
-                        p, sc = _gate_apply_t(
-                            torch, pred[bi], sc, ip, ebs[s], fine_t, fine_sh, fine_dir
+                        if fine_desc is None:
+                            g = fine_gates_t[fgi]
+                            fgi += 1
+                            fine_desc = (
+                                (g >> 8) & 3,
+                                (g >> 4) & 15,
+                                g & 15,
+                                (g >> _GATE_DIR_SHIFT) & 1,
+                            )
+                        gk, gt, gs, gd = fine_desc
+                        ip = torch.where(
+                            gk == 2,
+                            ip_linear,
+                            torch.where(gk == 3, ip_linear_last, ip_cubic),
                         )
+                        p, sc = _gate_apply_t(torch, pred[bi], sc, ip, ebs[s], gt, gs, gd)
                     elif gates_t is not None:
                         g = gates_t[gi]
                         gi += 1
-                        coords_t, st_i, ax_i = interp_dev[s]
-                        ip_cubic = _interp_stage_pred_t(
-                            torch,
-                            recon_t,
-                            sls,
-                            coords_t,
-                            st_i,
-                            ax_i,
-                            center,
-                            cubic=True,
-                        )
-                        ip_linear = _interp_stage_pred_t(
-                            torch,
-                            recon_t,
-                            sls,
-                            coords_t,
-                            st_i,
-                            ax_i,
-                            1,
-                            cubic=False,
-                        )
-                        ip_linear_last = _interp_stage_pred_t(
-                            torch,
-                            recon_t,
-                            sls,
-                            coords_t,
-                            st_i,
-                            ax_i,
-                            2,
-                            cubic=False,
+                        ip_cubic, ip_linear, ip_linear_last = _gate_interps(
+                            torch, recon_t, sls, interp_dev, s, center
                         )
                         gk = (g >> 8) & 3
                         ip = torch.where(
@@ -1186,17 +1192,17 @@ class GNNCompressorCodec:
         # first/last-axis linear interpolation per chunk-stage and stores the
         # winner in the header. It self-disables wherever no fallback pays.
         self.gate = bool(gate)
-        # gate_fine (opt-in, default off): at the finest (stride-1) level replace
-        # the per-chunk-stage swept gate byte with an implicit, header-free
-        # cubic-interp fallback keyed on a fixed scale threshold (see _GATE_FINE_*).
-        # It trades the finest level's per-chunk adaptivity for zero side
-        # information. On an untrained model over a smooth field the adaptive
-        # two-sided gate is far better (the finest level carries most of the bits,
-        # so fixing its rule forfeits nearly all the gate's benefit), and packing
-        # already makes the per-stage bytes cheap -- so this defaults off. It may
-        # pay on a trained checkpoint whose finest-level behaviour is uniform;
-        # validate per checkpoint before enabling. Only active when gate is on; the
-        # error bound holds regardless (quantization enforces it).
+        # gate_fine (opt-in, default off): at the finest (stride-1) level store one
+        # adaptively-chosen gate descriptor per chunk instead of one swept word per
+        # finest sub-stage. The threshold is still data-chosen (picked from the
+        # chunk's first finest sub-stage and reused across its 2^ndim - 1 finest
+        # sub-stages), so it keeps per-chunk adaptivity while cutting the finest
+        # level's metadata ~2^ndim. It reuses one descriptor across sub-stages, so
+        # its rate is >= the fully per-sub-stage gate (gate_fine=False); since
+        # packing already makes the per-sub-stage words cheap, that default is
+        # usually as good or better. gate_fine helps most when finest metadata,
+        # not payload, dominates. Only active when gate is on; the error bound
+        # holds regardless (quantization enforces it).
         self.gate_fine = bool(gate_fine) and self.gate
         self.checkpoint_hash = self._checkpoint_hash()
 
@@ -1307,17 +1313,20 @@ class GNNCompressorCodec:
         candidates: list[tuple[int, bytes]] = []
         for ratio in ratio_candidates:
             gates = None
+            fine_gates = None
             if edges is None:
                 payload = self._compress_payload(
                     values, round_output, eb, ratio, levels, anchor_stride
                 )
             else:
-                payload, gates = self._compress_chunked_payload(
+                payload, gates, fine_gates = self._compress_chunked_payload(
                     values, round_output, eb, ratio, edges, use_compile,
                     levels, anchor_stride,
                 )
                 if gates is not None and not any(gates):
                     gates = None  # gate never fired -> plain ungated stream
+                if fine_gates is not None and not any(fine_gates):
+                    fine_gates = None  # finest gate never fired -> nothing to store
             meta = {
                 "shape": list(original_shape),
                 "dtype": dtype.str,
@@ -1334,14 +1343,14 @@ class GNNCompressorCodec:
                 meta["m_tile"] = int(_gp._M_TILE)  # replay the exact float path
                 meta["fp16"] = bool(self.fp16)
                 meta["compiled"] = bool(use_compile)
-                # The implicit finest gate carries no per-stage bytes, only this
-                # flag; decode replays the same fixed rule (see _GATE_FINE_*).
-                if self.gate_fine:
-                    meta["gate_fine"] = True
             if gates is not None:
                 # Per-chunk-stage coarse gate words, zstd+base64 packed (the JSON
                 # header is otherwise uncompressed; repeated/zero words collapse).
                 meta["gates"] = _pack_gates(gates)
+            if fine_gates is not None:
+                # One adaptive finest-gate descriptor per chunk (gate_fine),
+                # packed the same way; decode reads one per chunk.
+                meta["fine_gates"] = _pack_gates(fine_gates)
             stream = _write_stream(meta, payload, self.zstd_level)
             candidates.append((len(stream), stream))
         return min(candidates, key=lambda item: item[0])[1]
@@ -1380,6 +1389,7 @@ class GNNCompressorCodec:
             _gp._M_TILE = int(meta["m_tile"])  # match encode path
             try:
                 packed_gates = meta.get("gates")
+                packed_fine = meta.get("fine_gates")
                 values = _decompress_chunked(
                     payload,
                     shape,
@@ -1388,7 +1398,7 @@ class GNNCompressorCodec:
                     predictor,
                     edges,
                     gates=None if packed_gates is None else _unpack_gates(packed_gates),
-                    gate_fine=bool(meta.get("gate_fine", False)),
+                    fine_gates=None if packed_fine is None else _unpack_gates(packed_fine),
                 )
             finally:
                 _gp._M_TILE = saved_tile
@@ -1463,7 +1473,7 @@ class GNNCompressorCodec:
         use_compile: bool,
         levels: int,
         anchor_stride: int,
-    ) -> tuple[bytes, list[int] | None]:
+    ) -> tuple[bytes, list[int] | None, list[int] | None]:
         predictor = self._chunked_predictor(levels)
         predictor.compile = bool(use_compile)
         ebs = _chunk_stage_ebs(
@@ -1474,7 +1484,7 @@ class GNNCompressorCodec:
             eb,
             eb_ratio,
         )
-        payload, gates = _compress_chunked(
+        payload, gates, fine_gates = _compress_chunked(
             values[None, ...],
             ebs,
             self.radius,
@@ -1484,7 +1494,7 @@ class GNNCompressorCodec:
             gate=self.gate,
             gate_fine=self.gate_fine,
         )
-        return payload, gates
+        return payload, gates, fine_gates
 
     def _chunked_predictor(
         self,
