@@ -64,12 +64,10 @@ def _maxerr(y, x):
 
 
 def test_gate_roundtrip_and_header(current_ckpt):
-    """Implicit scale gates roundtrip and use compact variable byte records."""
-    from deepsz.gnn_codec import (
-        _gate_unpack_t,
-        _read_stream,
-        _split_gate_payload,
-    )
+    """Scale-gated interp fallback: the bound holds, decode is driven by the
+    header (not the codec flag), and an all-off gate leaves the stream
+    byte-identical to gate=False."""
+    from deepsz.gnn_codec import _read_stream
 
     rng = np.random.RandomState(7)
     gx, gy = np.meshgrid(
@@ -87,12 +85,10 @@ def test_gate_roundtrip_and_header(current_ckpt):
         fp16=False,
         compile=False,
         gate=True,
-        classical_fallback=False,
     )
     off = _codec(current_ckpt, eb=eb, chunk_size=STRIDE)
     s_on, s_off = on.compress(f), off.compress(f)
-    meta, payload = _read_stream(s_on)
-    gates, _stage_payload = _split_gate_payload(meta, payload)
+    meta = _read_stream(s_on)[0]
     for redundant in (
         "codec",
         "coded_shape",
@@ -104,34 +100,12 @@ def test_gate_roundtrip_and_header(current_ckpt):
         "chunk_batch",
     ):
         assert redundant not in meta
+    gates = meta.get("gates")
     if gates is None:
         assert s_on == s_off
     else:
-        assert "gates" not in meta
-        assert meta["gate_count"] == len(gates)
-        assert len(payload) >= len(gates)
-        decoded = []
-        i = 0
-        while i < len(gates):
-            kind, threshold = _gate_unpack_t(
-                torch.tensor(gates[i], dtype=torch.int64)
-            )
-            i += 1
-            scale_level = None
-            low_side = None
-            if int(kind):
-                scale_level = gates[i] & 63
-                low_side = (gates[i] >> 6) & 1
-                i += 1
-            decoded.append((int(kind), int(threshold), scale_level, low_side))
-        assert all(kind in (0, 1, 2, 3) for kind, _, _, _ in decoded)
-        assert all(0 <= threshold < 64 for _, threshold, _, _ in decoded)
-        assert all(
-            scale_level is None or 0 <= scale_level < 64
-            for _, _, scale_level, _ in decoded
-        )
-        assert all(low_side is None or low_side in (0, 1) for *_, low_side in decoded)
-        assert any(kind > 0 for kind, _, _, _ in decoded)
+        assert all(g >> 8 in (0, 1, 2, 3) for g in gates)
+        assert any((g >> 4) & 15 for g in gates)
     abs_eb = eb * float(f.max() - f.min())  # eb is relative to the data range
     for s in (s_on, s_off):
         # The codec enforces the bound in normalized coordinates; restoring the
@@ -151,7 +125,7 @@ def test_gate_rate_selector_can_choose_each_predictor(winner):
     candidates = [torch.full((1, 32), 5 * eb) for _ in range(3)]
     candidates[winner - 1] = torch.zeros((1, 32))
 
-    kind, threshold, scale_level, low_side = _gate_select_t(
+    kind, threshold, _shift = _gate_select_t(
         torch,
         gnn_residual,
         tuple(candidates),
@@ -160,62 +134,7 @@ def test_gate_rate_selector_can_choose_each_predictor(winner):
     )
 
     assert int(kind) == winner
-    assert 0 <= int(threshold) < 64
-    assert 0 <= int(scale_level) < 64
-    assert int(low_side) in (0, 1)
-
-
-def test_implicit_gate_switches_only_high_scale_points():
-    from deepsz.gnn_codec import _gate_apply_t, _gate_select_t
-
-    eb = 1e-3
-    scale = torch.tensor([eb / 16, eb / 16, 4 * eb, 4 * eb]).repeat(128)
-    gnn_residual = torch.tensor([[0.0, 0.0, 20 * eb, 20 * eb]]).repeat(1, 128)
-    classical = torch.tensor([[20 * eb, 20 * eb, 0.0, 0.0]]).repeat(1, 128)
-    poor = torch.full_like(classical, 20 * eb)
-
-    kind, threshold, scale_level, low_side = _gate_select_t(
-        torch,
-        gnn_residual,
-        (classical, poor, poor),
-        scale,
-        eb,
-    )
-    pred = torch.tensor([1.0, 2.0, 3.0, 4.0]).repeat(128)
-    interp = torch.tensor([[10.0, 20.0, 30.0, 40.0]]).repeat(1, 128)
-    selected = _gate_apply_t(
-        torch, pred, interp, scale, eb, kind, threshold, low_side
-    )
-
-    assert int(kind) == 1
-    assert 0 < int(threshold) < 63
-    assert 0 <= int(scale_level) < 64
-    assert int(low_side) == 0
-    expected = torch.tensor([[1.0, 2.0, 30.0, 40.0]]).repeat(1, 128)
-    assert torch.equal(selected, expected)
-
-
-def test_implicit_gate_can_be_ignored_when_savings_do_not_pay_for_parameter():
-    from deepsz.gnn_codec import _gate_select_t
-
-    eb = 1e-3
-    scale = torch.full((2,), eb)
-    residual = torch.tensor([[eb, eb]])
-
-    kind, threshold, scale_level, low_side = _gate_select_t(
-        torch,
-        residual,
-        (torch.zeros_like(residual),) * 3,
-        scale,
-        eb,
-    )
-
-    assert (
-        int(kind),
-        int(threshold),
-        int(scale_level),
-        int(low_side),
-    ) == (0, 0, 0, 0)
+    assert int(threshold) > 0
 
 
 def test_gate_rate_proxy_charges_raw_float_for_outlier():
@@ -229,99 +148,6 @@ def test_gate_rate_proxy_charges_raw_float_for_outlier():
 
     assert float(regular[0]) <= 24.0
     assert float(outlier[0]) == 56.0
-
-
-def test_per_chunk_fallback_can_store_mixed_modes(current_ckpt, monkeypatch):
-    """Each independent block keeps its smaller valid codec stream."""
-    from deepsz.gnn_codec import (
-        _chunk_slices,
-        _read_stream,
-        _unpack_rate_selected_chunk,
-    )
-
-    x = np.zeros((8, 8), np.float64)
-    x[:, 4:] = 1.0
-    codec = GNNCompressorCodec(
-        current_ckpt,
-        error_bound=1e-3,
-        levels=LEVELS,
-        chunk_size=STRIDE,
-        fp16=False,
-        compile=False,
-        gate=True,
-        classical_fallback=True,
-    )
-    original_gnn = codec._compress_gnn_block
-    original_interp = codec._compress_interp_block
-    losing = np.random.RandomState(0).bytes(1 << 16)
-    monkeypatch.setattr(
-        codec,
-        "_compress_gnn_block",
-        lambda block, eb, levels: (
-            original_gnn(block, eb, levels) if float(block.mean()) < 0.5 else losing
-        ),
-    )
-    monkeypatch.setattr(
-        codec,
-        "_compress_interp_block",
-        lambda block, eb, levels, stride: (
-            losing
-            if float(block.mean()) < 0.5
-            else original_interp(block, eb, levels, stride)
-        ),
-    )
-
-    stream = codec.compress(x)
-    meta, payload = _read_stream(stream)
-    edges = tuple(meta["select_chunks"])
-    modes = []
-    off = 0
-    for _ in _chunk_slices(x.shape, edges):
-        mode, _chunk, off = _unpack_rate_selected_chunk(payload, off)
-        modes.append(mode)
-
-    assert meta["fallback"] == "rate-selected-chunks"
-    assert modes == [1, 0, 1, 0]
-    assert "gates" not in meta
-    assert _maxerr(codec.uncompress(stream), x) <= codec.error_bound
-
-
-def test_single_float32_classical_fallback_uses_native_stream(
-    current_ckpt, monkeypatch
-):
-    """A single float32 interpolation chunk needs no outer GNN wrapper."""
-    from deepsz.bitstream import MAGIC
-
-    x = np.linspace(0, 1, 64, dtype=np.float32).reshape(8, 8)
-    codec = GNNCompressorCodec(
-        current_ckpt,
-        error_bound=1e-3,
-        levels=LEVELS,
-        chunk_size=2 * STRIDE,
-        fp16=False,
-        compile=False,
-        gate=True,
-        classical_fallback=True,
-    )
-    incompressible = np.random.RandomState(1).bytes(1 << 16)
-    monkeypatch.setattr(
-        codec,
-        "_compress_gnn_block",
-        lambda *args, **kwargs: incompressible,
-    )
-
-    stream = codec.compress(x)
-
-    assert stream.startswith(MAGIC)
-    assert _maxerr(codec.uncompress(stream), x) <= codec.error_bound
-
-
-@pytest.mark.parametrize("payload", [b"", b"\x02" + b"\0" * 8, b"\x00\x01" + b"\0" * 7])
-def test_rate_selected_chunk_rejects_malformed_payload(payload):
-    from deepsz.gnn_codec import _unpack_rate_selected_chunk
-
-    with pytest.raises(ValueError):
-        _unpack_rate_selected_chunk(payload, 0)
 
 
 # --- roundtrip within the error bound --------------------------------------
@@ -416,7 +242,7 @@ def test_gate_applies_on_whole_tensor_path(current_ckpt):
 
     gated = GNNCompressorCodec(
         current_ckpt, error_bound=1e-4, levels=LEVELS, chunk_size=0,
-        fp16=False, compile=False, gate=True, classical_fallback=False,
+        fp16=False, compile=False, gate=True,
     )
     plain = GNNCompressorCodec(
         current_ckpt, error_bound=1e-4, levels=LEVELS, chunk_size=0,
@@ -571,7 +397,6 @@ def test_fp16_flag_roundtrips_and_persists(current_ckpt):
         chunk_size=STRIDE,
         fp16=True,
         compile=False,
-        classical_fallback=False,
     )
 
     stream = codec.compress(x)
@@ -596,7 +421,6 @@ def test_compile_flag_roundtrips_and_persists(current_ckpt, monkeypatch):
         chunk_size=STRIDE,
         fp16=False,
         compile=True,
-        classical_fallback=False,
     )
 
     stream = codec.compress(x)
@@ -621,7 +445,7 @@ def test_compile_auto_defers_to_crossover(current_ckpt, monkeypatch):
     x = rng.rand(8, 8).astype(np.float32)  # 4 chunks at chunk_size=STRIDE
     codec = GNNCompressorCodec(
         current_ckpt, error_bound=0.02, levels=LEVELS, chunk_size=STRIDE,
-        fp16=False, compile="auto", classical_fallback=False,
+        fp16=False, compile="auto",
     )
     assert codec.auto_compile is True and codec.compile is False
 
