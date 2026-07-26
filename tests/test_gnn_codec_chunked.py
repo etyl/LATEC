@@ -67,7 +67,7 @@ def test_gate_roundtrip_and_header(current_ckpt):
     """Scale-gated interp fallback: the bound holds, decode is driven by the
     header (not the codec flag), and an all-off gate leaves the stream
     byte-identical to gate=False."""
-    from deepsz.gnn_codec import _read_stream
+    from deepsz.gnn_codec import _read_stream, _unpack_gates
 
     rng = np.random.RandomState(7)
     gx, gy = np.meshgrid(
@@ -85,6 +85,9 @@ def test_gate_roundtrip_and_header(current_ckpt):
         fp16=False,
         compile=False,
         gate=True,
+        # isolate the per-chunk-stage coarse gate: the implicit finest gate would
+        # otherwise perturb the stream even when no coarse byte fires.
+        gate_fine=False,
     )
     off = _codec(current_ckpt, eb=eb, chunk_size=STRIDE)
     s_on, s_off = on.compress(f), off.compress(f)
@@ -100,11 +103,13 @@ def test_gate_roundtrip_and_header(current_ckpt):
         "chunk_batch",
     ):
         assert redundant not in meta
-    gates = meta.get("gates")
-    if gates is None:
+    packed = meta.get("gates")
+    if packed is None:
         assert s_on == s_off
     else:
-        assert all(g >> 8 in (0, 1, 2, 3) for g in gates)
+        gates = _unpack_gates(packed)
+        assert all((g >> 8) & 3 in (0, 1, 2, 3) for g in gates)
+        assert all((g >> 10) & 1 in (0, 1) for g in gates)
         assert any((g >> 4) & 15 for g in gates)
     abs_eb = eb * float(f.max() - f.min())  # eb is relative to the data range
     for s in (s_on, s_off):
@@ -125,7 +130,7 @@ def test_gate_rate_selector_can_choose_each_predictor(winner):
     candidates = [torch.full((1, 32), 5 * eb) for _ in range(3)]
     candidates[winner - 1] = torch.zeros((1, 32))
 
-    kind, threshold, _shift = _gate_select_t(
+    kind, _dir, threshold, _shift = _gate_select_t(
         torch,
         gnn_residual,
         tuple(candidates),
@@ -135,6 +140,73 @@ def test_gate_rate_selector_can_choose_each_predictor(winner):
 
     assert int(kind) == winner
     assert int(threshold) > 0
+
+
+def test_gate_rate_selector_can_choose_high_side():
+    """The two-sided selector falls back on the HIGH-b region when the model is
+    only wrong where it is uncertain (large scale) and interp is fine there."""
+    from deepsz.gnn_codec import _gate_select_t
+
+    eb = 1e-3
+    n = 64
+    # Low-b half: model is exact. High-b half: model is way off, interp is exact.
+    scale = torch.cat([torch.full((n // 2,), eb), torch.full((n // 2,), eb * 4096)])
+    gnn_residual = torch.cat(
+        [torch.zeros(n // 2), torch.full((n // 2,), 50 * eb)]
+    ).reshape(1, n)
+    cubic = torch.cat(
+        [torch.full((n // 2,), 50 * eb), torch.zeros(n // 2)]
+    ).reshape(1, n)
+    others = torch.full((1, n), 50 * eb)
+
+    kind, direction, threshold, _shift = _gate_select_t(
+        torch, gnn_residual, (cubic, others, others), scale, eb
+    )
+
+    assert int(kind) == 1  # cubic
+    assert int(direction) == 1  # high-side: fall back where b is large
+    assert int(threshold) > 0
+
+
+def test_gate_fine_implicit_roundtrip_and_header(current_ckpt):
+    """The implicit finest gate holds the bound, adds no per-stage bytes (only a
+    flag), and its decision is replayed from the header alone."""
+    from deepsz.gnn_codec import _read_stream, _unpack_gates
+
+    rng = np.random.RandomState(3)
+    gx, gy = np.meshgrid(
+        np.linspace(0, 6, 16, dtype=np.float32),
+        np.linspace(0, 6, 16, dtype=np.float32),
+        indexing="ij",
+    )
+    f = np.sin(gx) * np.cos(gy) + rng.rand(16, 16).astype(np.float32) * 0.005
+    eb = 1e-5
+    codec = GNNCompressorCodec(
+        current_ckpt, error_bound=eb, levels=LEVELS, chunk_size=STRIDE,
+        fp16=False, compile=False, gate=True, gate_fine=True,
+    )
+    stream = codec.compress(f)
+    meta = _read_stream(stream)[0]
+    assert meta.get("gate_fine") is True
+    # The packed coarse gate list, if present, only holds coarse (stride>1) stages.
+    packed = meta.get("gates")
+    if packed is not None:
+        n_stages = len(stage_plan((STRIDE, STRIDE), LEVELS, 1 << LEVELS)) - 1
+        n_finest = (1 << f.ndim) - 1  # stride-1 sub-stages per chunk
+        n_chunks = (16 // STRIDE) ** 2
+        assert len(_unpack_gates(packed)) <= n_chunks * (n_stages - n_finest)
+
+    y = codec.uncompress(stream)
+    abs_eb = eb * float(f.max() - f.min())
+    restore_ulp = float(np.spacing(np.max(np.abs(f))))
+    assert _maxerr(y, f) <= abs_eb + restore_ulp
+
+
+def test_pack_gates_roundtrip():
+    from deepsz.gnn_codec import _pack_gates, _unpack_gates
+
+    gates = [0, 0, 256, 1 << 10 | 3 << 8 | 13 << 4 | 6, 0, 4095, 0, 0, 0]
+    assert _unpack_gates(_pack_gates(gates)) == gates
 
 
 def test_gate_rate_proxy_charges_raw_float_for_outlier():
