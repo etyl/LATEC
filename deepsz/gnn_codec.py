@@ -183,6 +183,47 @@ def _restore_dtype(values: np.ndarray, dtype: np.dtype) -> np.ndarray:
     return values.astype(dtype, copy=False)
 
 
+# float32 unit roundoff (half an eps): the largest relative error of one
+# correctly-rounded float32 operation.
+_F32_U = float(np.finfo(np.float32).eps) / 2
+
+
+def roundtrip_slack(vmin: float, vmax: float) -> float:
+    """Float32 normalize/denormalize slack, in the tensor's ORIGINAL units.
+
+    ``error_bound`` is relative to the data range and is enforced on the [0, 1]
+    normalized tensor: the codec guarantees ``|x_norm - recon_norm| <= eb``. The
+    caller, though, sees ``recon_norm * S + vmin`` (``S = vmax - vmin``) compared
+    against the untouched input, and both the normalize and the denormalize are
+    float32 -- so the round trip adds representation error the quantizer never
+    saw. Checking ``|v - out| <= eb * S`` as an exact inequality therefore asks
+    for more precision than float32 can carry; the correct comparison allows
+    this slack. (Measured on rti_normal.npy at eb=1e-3: the internal normalized
+    bound held on every one of 1048576 points, yet 2 points sat 4.2e-8 over
+    ``eb * S`` purely from the round trip -- well inside the slack below.)
+
+    Budget, with ``u = _F32_U`` and each float32 op contributing ``(1 + e)``,
+    ``|e| <= u``:
+
+    * normalize ``xn = fl(fl(v - vmin) / S)`` gives
+      ``|xn * S - (v - vmin)| <= 2u * S``;
+    * denormalize ``out = fl(fl(rn * S) + vmin)`` gives
+      ``|out - (rn * S + vmin)| <= u * S + u * max|v|``.
+
+    Summing the two, ``|v - out| <= S * eb + u * (3S + max|v|)``, so the slack is
+    ``u * (3S + max|v|)``. This replaces the ad-hoc one-output-ULP allowance the
+    codec's tests used to grant, with a bound derived from the arithmetic.
+
+    Note this is a float32 representation allowance, not slack in the codec's
+    guarantee: the quantizer still enforces ``eb`` exactly in normalized units,
+    so the excess over ``eb * S`` stays a few ULPs and never grows with eb.
+    """
+    span = float(vmax) - float(vmin)
+    if span <= 0:
+        return 0.0
+    return _F32_U * (3.0 * span + max(abs(float(vmin)), abs(float(vmax))))
+
+
 def _write_stream(meta: dict[str, Any], payload: bytes, zstd_level: int) -> bytes:
     header = json.dumps(meta, sort_keys=True, separators=(",", ":")).encode("utf-8")
     body = zstandard.ZstdCompressor(level=zstd_level).compress(payload)

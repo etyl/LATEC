@@ -15,7 +15,7 @@ pytest.importorskip("constriction")  # rANS backend; skip if unavailable
 
 from deepsz import GNNCompressorCodec
 import deepsz.gnn_predictor as gp
-from deepsz.gnn_codec import _chunk_device_plan
+from deepsz.gnn_codec import _chunk_device_plan, roundtrip_slack
 from deepsz.gnn_predictor import (
     CKPT_VERSION,
     ChunkedGNNPredictor,
@@ -112,11 +112,11 @@ def test_gate_roundtrip_and_header(current_ckpt):
         assert all((g >> 10) & 1 in (0, 1) for g in gates)
         assert any((g >> 4) & 15 for g in gates)
     abs_eb = eb * float(f.max() - f.min())  # eb is relative to the data range
+    # The codec enforces the bound in normalized coordinates; the float32
+    # denormalize back to the original range adds roundtrip_slack (derived).
+    slack = roundtrip_slack(float(f.min()), float(f.max()))
     for s in (s_on, s_off):
-        # The codec enforces the bound in normalized coordinates; restoring the
-        # original float32 range can add one final-output ULP.
-        restore_ulp = float(np.spacing(np.max(np.abs(f))))
-        assert _maxerr(off.uncompress(s), f) <= abs_eb + restore_ulp
+        assert _maxerr(off.uncompress(s), f) <= abs_eb + slack
 
 
 @pytest.mark.parametrize("winner", [1, 2, 3])
@@ -204,8 +204,53 @@ def test_gate_fine_adaptive_roundtrip_and_header(current_ckpt):
 
     y = codec.uncompress(stream)
     abs_eb = eb * float(f.max() - f.min())
-    restore_ulp = float(np.spacing(np.max(np.abs(f))))
-    assert _maxerr(y, f) <= abs_eb + restore_ulp
+    slack = roundtrip_slack(float(f.min()), float(f.max()))
+    assert _maxerr(y, f) <= abs_eb + slack
+
+
+def test_roundtrip_slack_budget():
+    """The float32 normalize/denormalize allowance grows with max|v| and span,
+    and vanishes for a degenerate range."""
+    from deepsz.gnn_codec import _F32_U
+
+    assert roundtrip_slack(0.0, 1.0) == pytest.approx(_F32_U * 4.0, rel=1e-9)
+    # shifting the same span away from zero grows max|v|, so the slack grows
+    assert roundtrip_slack(1000.0, 1001.0) > roundtrip_slack(0.0, 1.0)
+    # widening the span grows it too
+    assert roundtrip_slack(0.0, 10.0) > roundtrip_slack(0.0, 1.0)
+    assert roundtrip_slack(5.0, 5.0) == 0.0  # degenerate range
+    # it stays a few ULPs, never a meaningful fraction of a sane bound
+    assert roundtrip_slack(0.14, 1.0) < 1e-6
+
+
+def test_bound_holds_in_original_units_within_roundtrip_slack(current_ckpt):
+    """Regression: the caller-visible bound holds in ORIGINAL units up to the
+    derived float32 round-trip slack -- and the excess never exceeds it. A field
+    offset far from zero (large max|v| relative to span) is the case that put
+    2/1048576 points of rti_normal.npy over eb before the slack was derived."""
+    rng = np.random.RandomState(5)
+    gx, gy = np.meshgrid(
+        np.linspace(0, 5, 32, dtype=np.float32),
+        np.linspace(0, 5, 32, dtype=np.float32),
+        indexing="ij",
+    )
+    base = np.sin(gx) * np.cos(gy) + rng.rand(32, 32).astype(np.float32) * 0.01
+    base = (base - base.min()) / (base.max() - base.min())
+    f = (0.1429 + 0.8571 * base).astype(np.float32)
+    slack = roundtrip_slack(float(f.min()), float(f.max()))
+
+    for eb in (1e-2, 1e-3, 1e-4):
+        codec = GNNCompressorCodec(
+            current_ckpt, error_bound=eb, levels=LEVELS, chunk_size=STRIDE,
+            fp16=False, compile=False, gate=True,
+        )
+        rec = codec.uncompress(codec.compress(f)).numpy()
+        abs_eb = eb * (float(f.max()) - float(f.min()))
+        err = np.abs(f.astype(np.float64) - rec.astype(np.float64))
+        assert err.max() <= abs_eb + slack
+        # the slack is an allowance for float32 noise, not a licence to drift:
+        # any excess over the exact bound must be a small fraction of it
+        assert err.max() - abs_eb <= 1e-4 * abs_eb
 
 
 def test_pack_gates_roundtrip():
