@@ -15,7 +15,13 @@ pytest.importorskip("constriction")  # rANS backend; skip if unavailable
 
 from deepsz import GNNCompressorCodec
 import deepsz.gnn_predictor as gp
-from deepsz.gnn_codec import _chunk_device_plan, roundtrip_slack
+from deepsz.gnn_codec import (
+    _GATE_END_MODE,
+    _chunk_device_plan,
+    _interp_axis_at_t,
+    roundtrip_slack,
+)
+from deepsz.predictor import END_EXTRAP, END_MODE_MAX, END_QUAD, _interp_axis_at
 from deepsz.gnn_predictor import (
     CKPT_VERSION,
     ChunkedGNNPredictor,
@@ -406,7 +412,7 @@ def test_chunk_device_plan_uses_flat_integer_indices():
     a contiguous chunk block and within the flattened full reconstruction."""
     cshape = (4, 3)
     full_shape = (8, 7)
-    _full, counts, positions, recon_offsets, _, _, _ = _chunk_device_plan(
+    _full, counts, positions, recon_offsets, _, _, _, _ = _chunk_device_plan(
         torch, "cpu", cshape, full_shape, LEVELS, STRIDE, 1
     )
     plan = stage_plan(cshape, LEVELS, STRIDE, 1)
@@ -426,6 +432,43 @@ def test_chunk_device_plan_uses_flat_integer_indices():
             tuple(c + o for c, o in zip(coords, origin)), full_shape
         )
         np.testing.assert_array_equal(recon_off.numpy() + origin_base, expected_global)
+
+
+@pytest.mark.parametrize("end_mode", range(END_MODE_MAX + 1))
+@pytest.mark.parametrize("cubic", [True, False])
+def test_device_gate_interp_matches_numpy_interp(end_mode, cubic):
+    """``_interp_axis_at_t`` must agree with the numpy ``_interp_axis_at`` branch
+    for branch, for every end mode. The gate's interp candidates are what the GNN
+    codec falls back to, so a divergence here would silently cost rate (and would
+    not be caught by a round trip, which only checks enc/dec agreement)."""
+    rng = np.random.RandomState(5)
+    shape = (9, 7)
+    W = rng.rand(1, *shape) * 10.0
+    # Every coordinate on one axis, so the far/near-neighbour validity pattern
+    # covers both ends of the line and the interior.
+    coords = tuple(c.ravel() for c in np.indices(shape))
+    for axis in range(2):
+        exp = _interp_axis_at(
+            W, coords, axis, 1, "cubic" if cubic else "linear", shape, end_mode
+        )
+        got = _interp_axis_at_t(
+            torch,
+            torch.from_numpy(W),
+            tuple(torch.from_numpy(c) for c in coords),
+            axis,
+            1,
+            shape,
+            cubic,
+            end_mode,
+        )
+        np.testing.assert_allclose(got.numpy(), exp, rtol=0, atol=1e-12)
+
+
+def test_gate_end_mode_is_the_strongest_pair():
+    """The GNN gate does not sweep its line ends (see ``_GATE_END_MODE``); pin the
+    measured choice so a future edit to the interp predictor's more conservative
+    default does not silently drag the gate along with it."""
+    assert _GATE_END_MODE == END_QUAD | END_EXTRAP
 
 
 def test_query_only_nearest_search_matches_period_tile_lookup():

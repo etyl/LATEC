@@ -267,6 +267,7 @@ class WhatIfGate:
         self._plans = {}
 
     def grab(self, pr, s, recon, eb, pred, scale):
+        from deepsz.gnn_codec import _GATE_END_MODE
         from deepsz.predictor import _interp_axis_at, default_interp_center
 
         for bi, ci in enumerate(pr._wave_ids):
@@ -282,11 +283,9 @@ class WhatIfGate:
             coords = np.nonzero(mask)
             W = recon[(slice(None), *sls)].astype(np.float64)
             center = default_interp_center(len(cshape))
-            # 0 = the original linear/edge-copy ends, which is what the GNN
-            # codec's device gate interps (`gnn_codec._interp_axis_at_t`) still
-            # do; keep this comparison apples-to-apples with the deployed gate
-            # rather than with the interp predictor's newer default.
-            end_mode = 0
+            # Mirror the deployed GNN gate's line-end handling so the per-level
+            # comparison matches what the codec actually does.
+            end_mode = _GATE_END_MODE
             if center == 0 or len(axes) == 1:
                 ip = sum(
                     _interp_axis_at(W, coords, a, stride, "cubic", cshape, end_mode)
