@@ -24,7 +24,7 @@ from .rans import SCALE_HI_MULT, SCALE_LO_DIV, build_laplace_tables, scale_to_le
 
 
 _MAGIC = b"DEEPSZGN"
-_VERSION = 12
+_VERSION = 13
 _PREFIX = "<8sII"
 _PREFIX_SIZE = struct.calcsize(_PREFIX)
 _ANCHOR_BLOCK = 1

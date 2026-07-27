@@ -3,12 +3,14 @@
 File = a fixed little-endian header, the spatial shape, and one zstd frame.
 
 The stage payload (produced by the codec, opaque here) contains, per stage:
-  [n_codes u32][kexp u8 | blob len u56][entropy blob][n_outliers u32][outliers f32...]
+  [n_codes u32][shape u5 | kexp u4 | blob len u55][entropy blob]
+  [n_outliers u32][outliers f32...]
 
 The entropy blob is canonical Huffman unless the header sets ``FLAG_RANS``, in
 which case it uses scale-conditioned context coding over the same code array.
-``kexp`` is the rANS coder window for that stage (0 on the Huffman path); it
-shares the length word so that per-stage alphabet sizing costs no bytes.
+``kexp`` is the rANS coder window for that stage and ``shape`` its entry in the
+mixture dictionary (both 0 on the Huffman path). They share the length word so
+that per-stage alphabet sizing and shape selection cost no bytes.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ import numpy as np
 import zstandard
 
 MAGIC = b"DEEPSZ01"
-VERSION = 2
+VERSION = 3
 
 
 FLAG_MOCK = 1 << 0
@@ -168,39 +170,53 @@ def pack_stage(
 ) -> bytes:
     blob_codes = np.asarray(codes, np.uint32)
     out = np.asarray(outliers, np.float32)
-    kexp = 0  # unused on the Huffman path
+    kexp = shape = 0  # unused on the Huffman path
     if rans_levels is None:
         from .huffman import huffman_encode
 
         hblob = huffman_encode(blob_codes)
     else:
-        from .rans import choose_kexp, rans_encode
+        from .rans import choose_kexp, choose_shape, rans_encode
 
         if rans_tables is None:
             raise ValueError("rans_tables are required with rans_levels")
-        # Size the alphabet to the window this stage actually uses. The decoder
-        # needs the exponent to pick the same tables, and it rides in the top
-        # byte of the blob-length field rather than costing a byte of its own:
-        # a dedicated byte would swamp the near-empty coarse stages, where a
-        # whole schedule level can be a few dozen points spread over hundreds
-        # of stages (measured +72% on one such level).
+        # Size the alphabet to the window this stage actually uses, then pick the
+        # mixture shape that codes it shortest. The decoder needs both to select
+        # the same tables, and they ride in the spare high bits of the
+        # blob-length field rather than costing bytes of their own: dedicated
+        # bytes would swamp the near-empty coarse stages, where a whole schedule
+        # level can be a few dozen points spread over hundreds of stages
+        # (measured +72% on one such level for the window alone, and +52% for
+        # the shape id at 5 bits).
         kexp = choose_kexp(blob_codes, rans_tables.radius)
-        hblob = rans_encode(blob_codes, rans_levels, rans_tables, kexp=kexp)
+        shape = choose_shape(blob_codes, rans_levels, rans_tables, kexp)
+        hblob = rans_encode(
+            blob_codes, rans_levels, rans_tables, kexp=kexp, shape=shape
+        )
     return (
-        struct.pack("<IQ", len(blob_codes), _pack_hlen(len(hblob), kexp))
+        struct.pack("<IQ", len(blob_codes), _pack_hlen(len(hblob), kexp, shape))
         + hblob
         + struct.pack("<I", len(out))
         + out.tobytes()
     )
 
 
-_HLEN_BITS = 56  # blob length occupies the low bits; the coder window the top 8
+# The blob length occupies the low bits; the coder window and the shape id share
+# the top 9, which the length word had going spare (55 bits still frames 32 PB).
+_HLEN_BITS = 55
+_KEXP_BITS = 4
+_KEXP_SHIFT = _HLEN_BITS
+_SHAPE_SHIFT = _HLEN_BITS + _KEXP_BITS
 
 
-def _pack_hlen(hlen: int, kexp: int) -> int:
+def _pack_hlen(hlen: int, kexp: int, shape: int) -> int:
     if hlen >= 1 << _HLEN_BITS:
         raise ValueError("stage entropy blob is too large to frame")
-    return hlen | (int(kexp) << _HLEN_BITS)
+    if not 0 <= int(kexp) < 1 << _KEXP_BITS:
+        raise ValueError("rANS coder window does not fit the stage frame")
+    if not 0 <= int(shape) < 1 << 5:
+        raise ValueError("rANS shape id does not fit the stage frame")
+    return hlen | (int(kexp) << _KEXP_SHIFT) | (int(shape) << _SHAPE_SHIFT)
 
 
 def unpack_stage(
@@ -212,7 +228,8 @@ def unpack_stage(
 ) -> tuple[np.ndarray, np.ndarray, int]:
     n_codes, framed = struct.unpack_from("<IQ", buf, off)
     hlen = framed & ((1 << _HLEN_BITS) - 1)
-    kexp = framed >> _HLEN_BITS
+    kexp = (framed >> _KEXP_SHIFT) & ((1 << _KEXP_BITS) - 1)
+    shape = framed >> _SHAPE_SHIFT
     off += 12
     if rans_levels is None:
         from .huffman import huffman_decode
@@ -225,7 +242,9 @@ def unpack_stage(
             raise ValueError("rans_tables are required with rans_levels")
         if not kexp:
             raise ValueError("rANS stage record has no coder window")
-        codes = rans_decode(buf[off : off + hlen], rans_levels, rans_tables, kexp=kexp)
+        codes = rans_decode(
+            buf[off : off + hlen], rans_levels, rans_tables, kexp=kexp, shape=shape
+        )
     if len(codes) != n_codes:
         raise ValueError("stage code count mismatch")
     off += hlen

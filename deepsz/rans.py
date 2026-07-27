@@ -7,6 +7,7 @@ the ANS stack decodes them in ascending scale-level order.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -29,9 +30,11 @@ class RansTables:
     def alphabet(self) -> int:
         return 2 * self.radius
 
-    def cdfs_for(self, kexp: int) -> np.ndarray:
-        """CDFs over the reduced alphabet of window exponent ``kexp``."""
-        return _build_laplace_cdfs_cached(int(kexp), self.cdfs.shape[0], self.precision)
+    def cdfs_for(self, kexp: int, shape: int = 0) -> np.ndarray:
+        """CDFs over the reduced alphabet of window ``kexp``, shaped by ``shape``."""
+        return _build_cdfs_cached(
+            int(kexp), int(shape), self.cdfs.shape[0], self.precision
+        )
 
 
 # Shared eb-relative scale-grid span [eb/SCALE_LO_DIV, eb*SCALE_HI_MULT].
@@ -94,6 +97,131 @@ def _widen(syms: np.ndarray, radius: int, kexp: int) -> np.ndarray:
     return np.where(syms == 0, 0, codes).astype(np.uint32)
 
 
+# ---- per-stage shape selection ----
+#
+# One Laplace scale cannot be both peakier at zero and heavier in the tail than
+# a Laplace, but that is what the residuals in a single scale level measure like
+# (s3d 1e-5, level 20: empirical p(0) 0.586 vs Laplace 0.377) -- the signature of
+# pooling heterogeneous true scales into one grid level. Peak and tail are
+# rigidly coupled, so the coder is forced to be wrong at both ends.
+#
+# The fix needs no new table machinery: mix two rows of the existing per-level
+# weights, a peaked core plus a broader tail,
+#
+#     p(level) = (1 - w) * p[level] + w * p[min(level + D, n_levels - 1)]
+#
+# and let the encoder pick from a fixed dictionary, sending the entry id. A
+# dictionary rather than a fitted table because fitted shapes do not generalise
+# across fields -- the same pattern as the swept interp end_mode and the
+# per-chunk gate descriptor. Entry 0 is pure Laplace, so no stage can come out
+# worse than it would have, and the id rides free in the framing word.
+
+_MIX_DELTAS = (4, 8, 16, 24)
+_MIX_WEIGHTS = (0.02, 0.05, 0.12, 0.25, 0.45)
+
+# (level offset, tail weight); entry 0 is pure Laplace.
+SHAPES: tuple[tuple[int, float], ...] = ((0, 0.0),) + tuple(
+    (d, w) for d in _MIX_DELTAS for w in _MIX_WEIGHTS
+)
+N_SHAPES = len(SHAPES)
+SHAPE_BITS = 5
+assert N_SHAPES <= 1 << SHAPE_BITS
+
+# Fraction of a stage's points scored when picking the shape. The candidates are
+# coarsely different, so this is a choice between shapes rather than an estimate
+# of a parameter: a 5% stride picked the same entry on every measured stage at a
+# third of the cost.
+_SELECT_SAMPLE = 0.05
+_SELECT_MIN = 1024
+
+# A model set costs n_levels * 2**(kexp+1) * 4 bytes, so at the widest windows
+# each dictionary entry is 16 MB and takes ~1 s to build. Offering all 21 there
+# pushes the working set past any sane cache budget and the rebuilds dominate
+# (measured 4.5x encode on rti at 1e-5). Above _WIDE_KEXP the encoder therefore
+# only considers the light-tail entries, which is where the wide-window picks
+# concentrate anyway: it holds the working set near 120 MB and costs nothing on
+# s3d, 0.08pp on cloud and 0.27pp on rti. This is an encoder-side restriction --
+# the id space and the decoder are unchanged.
+_WIDE_KEXP = 13
+_WIDE_WEIGHT = 0.02
+
+
+@lru_cache(maxsize=None)
+def _shape_ids(kexp: int) -> tuple[int, ...]:
+    """Dictionary entries the encoder may select for window ``kexp``."""
+    if kexp < _WIDE_KEXP:
+        return tuple(range(N_SHAPES))
+    return (0,) + tuple(
+        i for i, (_d, w) in enumerate(SHAPES) if w == _WIDE_WEIGHT
+    )
+
+
+def choose_shape(
+    codes: np.ndarray,
+    levels64: np.ndarray,
+    tables: RansTables,
+    kexp: int,
+    *,
+    sample: float = _SELECT_SAMPLE,
+) -> int:
+    """Dictionary entry minimizing this stage's coded length.
+
+    Scores against the continuous per-level weights, so all candidates share one
+    cached array and quantized tables are only ever built for the winner.
+    """
+    codes = np.asarray(codes, np.uint32).ravel()
+    if len(codes) == 0:
+        return 0
+    n_levels = tables.cdfs.shape[0]
+    syms = _narrow(codes, tables.radius, kexp)
+    levels = np.asarray(levels64, np.uint8).ravel().astype(np.int64)
+    if syms.shape != levels.shape:
+        raise ValueError("codes and levels must have the same flattened length")
+    if sample < 1.0:
+        step = max(1, len(syms) // max(_SELECT_MIN, int(len(syms) * sample)))
+        if step > 1:
+            syms, levels = syms[::step], levels[::step]
+
+    weights = _level_weights(int(kexp), n_levels)
+    floor = 1.0 / tables.total  # _quantize_pmf never leaves a symbol below this
+    idx = np.arange(n_levels)
+    best_id, best_cost = 0, np.inf
+    for shape_id in _shape_ids(int(kexp)):
+        d, w = SHAPES[shape_id]
+        p = weights[levels, syms]
+        if w:
+            broad = weights[np.minimum(idx + d, n_levels - 1)[levels], syms]
+            p = (1.0 - w) * p + w * broad
+        cost = -np.log2(np.maximum(p, floor)).sum()
+        if cost < best_cost:
+            best_id, best_cost = shape_id, float(cost)
+    return best_id
+
+
+@lru_cache(maxsize=32)
+def _level_weights(kexp: int, n_levels: int) -> np.ndarray:
+    """Row-normalized continuous per-level bin probabilities for one window.
+
+    The shared basis for every dictionary entry, and the only full-alphabet array
+    the selection pass needs.
+    """
+    span = (1 << kexp) - 1
+    alphabet = 2 * span + 2
+    eb = 1.0
+    lo = eb / SCALE_LO_DIV
+    hi = eb * SCALE_HI_MULT
+    grid = np.exp(np.linspace(np.log(lo), np.log(hi), n_levels)).astype(np.float64)
+    q = np.arange(-span, span + 1, dtype=np.float64)
+    left = q * (2.0 * eb) - eb
+    right = q * (2.0 * eb) + eb
+    w = np.empty((n_levels, alphabet), np.float64)
+    for i, b in enumerate(grid):
+        w[i, 1:] = _laplace_cdf_np(right, b) - _laplace_cdf_np(left, b)
+        w[i, 0] = w[i, 1:].max() * 1e-9  # outlier marker
+    w /= w.sum(1, keepdims=True)
+    return w
+
+
 def scale_to_level(scale: np.ndarray, eb: float, n_levels: int = 64) -> np.ndarray:
     """Quantize Laplacian scale values to the shared 64-level log grid."""
     scale = np.asarray(scale, np.float32)
@@ -119,7 +247,7 @@ def build_laplace_tables(
     precision = int(precision)
     if eb <= 0:
         raise ValueError("eb must be > 0")
-    cdfs = _build_laplace_cdfs_cached(full_kexp(radius), n_levels, precision)
+    cdfs = _build_cdfs_cached(full_kexp(radius), 0, n_levels, precision)
     lo = eb / SCALE_LO_DIV
     hi = eb * SCALE_HI_MULT
     grid = np.exp(np.linspace(np.log(lo), np.log(hi), n_levels)).astype(np.float32)
@@ -128,16 +256,18 @@ def build_laplace_tables(
     )
 
 
-@lru_cache(maxsize=128)
-def _build_laplace_cdfs_cached(
+@lru_cache(maxsize=8)
+def _build_cdfs_cached(
     kexp: int,
+    shape: int,
     n_levels: int,
     precision: int,
 ) -> np.ndarray:
     """CDFs in normalized units; invariant to the absolute error bound.
 
     Symbol 0 is the outlier marker; symbol ``i > 0`` is bin index
-    ``q = i - 1 - (2**kexp - 1)``.
+    ``q = i - 1 - (2**kexp - 1)``. ``shape`` indexes :data:`SHAPES`; entry 0 is
+    the pure Laplace.
     """
     span = (1 << kexp) - 1
     alphabet = 2 * span + 2
@@ -145,24 +275,15 @@ def _build_laplace_cdfs_cached(
     if alphabet > total:
         raise ValueError("precision is too small for the quantizer alphabet")
 
-    eb = 1.0
-    lo = eb / SCALE_LO_DIV
-    hi = eb * SCALE_HI_MULT
-    grid = np.exp(np.linspace(np.log(lo), np.log(hi), n_levels)).astype(np.float64)
-    q = np.arange(-span, span + 1, dtype=np.float64)
-    left = q * (2.0 * eb) - eb
-    right = q * (2.0 * eb) + eb
+    weights = _level_weights(kexp, n_levels)
+    d, w = SHAPES[shape]
+    if w:
+        broad = weights[np.minimum(np.arange(n_levels) + d, n_levels - 1)]
+        weights = (1.0 - w) * weights + w * broad
 
     cdfs = np.empty((n_levels, alphabet + 1), np.uint32)
-    for i, b in enumerate(grid):
-        weights = np.empty(alphabet, np.float64)
-        weights[1:] = _laplace_cdf_np(right, b) - _laplace_cdf_np(left, b)
-        weights[0] = weights[1:].max() * 1e-9  # outlier marker
-        pmf = _quantize_pmf(weights, total)
-        cdf = np.empty(alphabet + 1, np.uint32)
-        cdf[0] = 0
-        cdf[1:] = np.cumsum(pmf, dtype=np.uint64)
-        cdfs[i] = cdf
+    cdfs[:, 0] = 0
+    cdfs[:, 1:] = np.cumsum(_quantize_pmf_rows(weights, total), axis=1, dtype=np.uint64)
     return cdfs
 
 
@@ -172,6 +293,7 @@ def model_bits(
     tables: RansTables,
     *,
     kexp: int | None = None,
+    shape: int = 0,
 ) -> float:
     codes = np.asarray(codes, np.uint32).ravel()
     levels = np.asarray(levels64, np.uint8).ravel()
@@ -181,7 +303,7 @@ def model_bits(
         return 0.0
     if kexp is None:
         kexp = full_kexp(tables.radius)
-    cdfs = tables.cdfs_for(kexp)
+    cdfs = tables.cdfs_for(kexp, shape)
     all_syms = _narrow(codes, tables.radius, kexp)
     probs = np.empty(len(codes), np.float64)
     for level in range(cdfs.shape[0]):
@@ -199,6 +321,7 @@ def rans_encode(
     tables: RansTables,
     *,
     kexp: int | None = None,
+    shape: int = 0,
 ) -> bytes:
     import constriction
 
@@ -216,7 +339,7 @@ def rans_encode(
     if kexp is None:
         kexp = full_kexp(tables.radius)
 
-    models = _ans_models(kexp, n_levels, tables.precision)
+    models = _ans_models(kexp, shape, n_levels, tables.precision)
     enc = constriction.stream.stack.AnsCoder()
     syms_i32 = _narrow(codes, tables.radius, kexp).astype(np.int32)
     for level in range(n_levels - 1, -1, -1):
@@ -233,6 +356,7 @@ def rans_decode(
     tables: RansTables,
     *,
     kexp: int | None = None,
+    shape: int = 0,
 ) -> np.ndarray:
     import constriction
 
@@ -252,7 +376,7 @@ def rans_decode(
         kexp = full_kexp(tables.radius)
     words = np.frombuffer(blob, dtype="<u4").astype(np.uint32, copy=False)
     dec = constriction.stream.stack.AnsCoder(words)
-    models = _ans_models(kexp, n_levels, tables.precision)
+    models = _ans_models(kexp, shape, n_levels, tables.precision)
     syms = np.empty(len(levels), np.int64)
     for level in range(n_levels):
         idx = np.flatnonzero(levels == level)
@@ -264,22 +388,52 @@ def rans_decode(
     return out
 
 
-@lru_cache(maxsize=64)
-def _ans_models(kexp: int, n_levels: int, precision: int):
-    """Build reusable compiled models.
+# A model set costs n_levels * 2**(kexp+1) * 4 bytes, so counting entries is the
+# wrong bound: one field can want a dozen shapes at kexp 15 (160 MB) and dozens
+# more at kexp <= 8 (under 2 MB combined). Budget by bytes and evict least
+# recently used, which keeps the small windows resident for free and only ever
+# rebuilds the wide ones.
+_MODEL_BUDGET_BYTES = 192 << 20
+_model_cache: "OrderedDict[tuple[int, int, int, int], tuple]" = OrderedDict()
+_model_bytes = 0
 
-    The discretized Laplace PMFs are invariant to ``eb`` because both bin
-    boundaries and the scale grid grow linearly with it.
+
+def _ans_models(kexp: int, shape: int, n_levels: int, precision: int):
+    """Build reusable compiled models, cached under a byte budget.
+
+    The discretized PMFs are invariant to ``eb`` because both bin boundaries and
+    the scale grid grow linearly with it.
     """
+    global _model_bytes
     import constriction
 
-    cdfs = _build_laplace_cdfs_cached(int(kexp), int(n_levels), int(precision))
-    return tuple(
+    key = (int(kexp), int(shape), int(n_levels), int(precision))
+    hit = _model_cache.get(key)
+    if hit is not None:
+        _model_cache.move_to_end(key)
+        return hit
+
+    cdfs = _build_cdfs_cached(*key)
+    models = tuple(
         constriction.stream.model.Categorical(
             np.diff(cdf.astype(np.int64)).astype(np.float32), perfect=False
         )
         for cdf in cdfs
     )
+    size = int(cdfs.shape[0]) * int(cdfs.shape[1]) * 4
+    _model_cache[key] = models
+    _model_bytes += size
+    while len(_model_cache) > 1 and _model_bytes > _MODEL_BUDGET_BYTES:
+        old, _ = _model_cache.popitem(last=False)
+        _model_bytes -= int(old[2]) * ((1 << (old[0] + 1)) + 1) * 4
+    return models
+
+
+def _clear_model_cache() -> None:
+    """Drop cached models; for tests that measure construction cost."""
+    global _model_bytes
+    _model_cache.clear()
+    _model_bytes = 0
 
 
 def _laplace_cdf_np(x, b):
@@ -288,25 +442,53 @@ def _laplace_cdf_np(x, b):
 
 
 def _quantize_pmf(weights: np.ndarray, total: int) -> np.ndarray:
+    return _quantize_pmf_rows(np.asarray(weights, np.float64)[None], total)[0]
+
+
+def _quantize_pmf_rows(weights: np.ndarray, total: int) -> np.ndarray:
+    """Quantize each row of ``weights`` to counts summing to ``total``.
+
+    Batched over levels because building a full-width table one level at a time
+    costs ~250 ms, which a per-stage shape dictionary would pay many times over.
+    """
     w = np.asarray(weights, np.float64)
-    scaled = w / w.sum() * total
-    pmf = np.floor(scaled).astype(np.int64)
-    pmf = np.maximum(pmf, 1)
-    diff = int(total - pmf.sum())
-    frac = scaled - np.floor(scaled)
-    if diff > 0:
-        order = np.argsort(-frac)
-        bulk, rem = divmod(diff, len(pmf))
-        if bulk:
-            pmf += bulk
-        if rem:
-            pmf[order[:rem]] += 1
-    elif diff < 0:
-        order = np.argsort(frac)
-        avail = pmf[order] - 1
-        cum = np.cumsum(avail)
-        take = np.clip(-diff - (cum - avail), 0, avail)
-        pmf[order] -= take
-        if take.sum() < -diff:
+    if w.ndim != 2:
+        raise ValueError("weights must be 2-D")
+    n_rows, alphabet = w.shape
+    scaled = w / w.sum(1, keepdims=True) * total
+    floor = np.floor(scaled)
+    pmf = np.maximum(floor.astype(np.int64), 1)
+    frac = scaled - floor
+    diff = total - pmf.sum(1)
+
+    # Surplus rows: spread whole passes, then one extra count to the largest
+    # remainders. Deficit rows: reclaim from the smallest remainders, never
+    # below the floor of 1 that keeps every symbol decodable.
+    up = np.flatnonzero(diff > 0)
+    if len(up):
+        d = diff[up]
+        bulk, rem = np.divmod(d, alphabet)
+        pmf[up] += bulk[:, None]
+        order = np.argsort(-frac[up], axis=1, kind="stable")
+        rank = np.empty_like(order)
+        np.put_along_axis(
+            rank, order, np.broadcast_to(np.arange(alphabet), order.shape), axis=1
+        )
+        pmf[up] += rank < rem[:, None]
+
+    down = np.flatnonzero(diff < 0)
+    if len(down):
+        need = -diff[down]
+        order = np.argsort(frac[down], axis=1, kind="stable")
+        avail = np.take_along_axis(pmf[down], order, axis=1) - 1
+        cum = np.cumsum(avail, axis=1)
+        take = np.clip(need[:, None] - (cum - avail), 0, avail)
+        if np.any(take.sum(1) < need):
             raise ValueError("could not normalize PMF at requested precision")
+        rows = pmf[down]
+        np.put_along_axis(
+            rows, order, np.take_along_axis(rows, order, axis=1) - take, axis=1
+        )
+        pmf[down] = rows
+
     return pmf.astype(np.uint32)
