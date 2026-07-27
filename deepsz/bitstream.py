@@ -3,10 +3,12 @@
 File = a fixed little-endian header, the spatial shape, and one zstd frame.
 
 The stage payload (produced by the codec, opaque here) contains, per stage:
-  [n_codes u32][entropy blob len u64][entropy blob][n_outliers u32][outliers f32...]
+  [n_codes u32][kexp u8 | blob len u56][entropy blob][n_outliers u32][outliers f32...]
 
 The entropy blob is canonical Huffman unless the header sets ``FLAG_RANS``, in
 which case it uses scale-conditioned context coding over the same code array.
+``kexp`` is the rANS coder window for that stage (0 on the Huffman path); it
+shares the length word so that per-stage alphabet sizing costs no bytes.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import numpy as np
 import zstandard
 
 MAGIC = b"DEEPSZ01"
-VERSION = 1
+VERSION = 2
 
 
 FLAG_MOCK = 1 << 0
@@ -166,22 +168,39 @@ def pack_stage(
 ) -> bytes:
     blob_codes = np.asarray(codes, np.uint32)
     out = np.asarray(outliers, np.float32)
+    kexp = 0  # unused on the Huffman path
     if rans_levels is None:
         from .huffman import huffman_encode
 
         hblob = huffman_encode(blob_codes)
     else:
-        from .rans import rans_encode
+        from .rans import choose_kexp, rans_encode
 
         if rans_tables is None:
             raise ValueError("rans_tables are required with rans_levels")
-        hblob = rans_encode(blob_codes, rans_levels, rans_tables)
+        # Size the alphabet to the window this stage actually uses. The decoder
+        # needs the exponent to pick the same tables, and it rides in the top
+        # byte of the blob-length field rather than costing a byte of its own:
+        # a dedicated byte would swamp the near-empty coarse stages, where a
+        # whole schedule level can be a few dozen points spread over hundreds
+        # of stages (measured +72% on one such level).
+        kexp = choose_kexp(blob_codes, rans_tables.radius)
+        hblob = rans_encode(blob_codes, rans_levels, rans_tables, kexp=kexp)
     return (
-        struct.pack("<IQ", len(blob_codes), len(hblob))
+        struct.pack("<IQ", len(blob_codes), _pack_hlen(len(hblob), kexp))
         + hblob
         + struct.pack("<I", len(out))
         + out.tobytes()
     )
+
+
+_HLEN_BITS = 56  # blob length occupies the low bits; the coder window the top 8
+
+
+def _pack_hlen(hlen: int, kexp: int) -> int:
+    if hlen >= 1 << _HLEN_BITS:
+        raise ValueError("stage entropy blob is too large to frame")
+    return hlen | (int(kexp) << _HLEN_BITS)
 
 
 def unpack_stage(
@@ -191,7 +210,9 @@ def unpack_stage(
     rans_levels: np.ndarray | None = None,
     rans_tables=None,
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    n_codes, hlen = struct.unpack_from("<IQ", buf, off)
+    n_codes, framed = struct.unpack_from("<IQ", buf, off)
+    hlen = framed & ((1 << _HLEN_BITS) - 1)
+    kexp = framed >> _HLEN_BITS
     off += 12
     if rans_levels is None:
         from .huffman import huffman_decode
@@ -202,7 +223,9 @@ def unpack_stage(
 
         if rans_tables is None:
             raise ValueError("rans_tables are required with rans_levels")
-        codes = rans_decode(buf[off : off + hlen], rans_levels, rans_tables)
+        if not kexp:
+            raise ValueError("rANS stage record has no coder window")
+        codes = rans_decode(buf[off : off + hlen], rans_levels, rans_tables, kexp=kexp)
     if len(codes) != n_codes:
         raise ValueError("stage code count mismatch")
     off += hlen

@@ -35,7 +35,7 @@ from .predictor import (
     default_interp_end_mode,
 )
 from .quantizer import dequantize, quantize
-from .rans import build_laplace_tables, model_bits, scale_to_level
+from .rans import build_laplace_tables, choose_kexp, model_bits, scale_to_level
 
 
 def compress(
@@ -378,7 +378,9 @@ def _compress_region(field, masks, ebs, predictor, radius, round_output, stats):
         if use_rans:
             tables = build_laplace_tables(eb, radius)
             levels64 = scale_to_level(scale, eb).reshape(-1)
-            stats["stage_model_bits"][stage_idx] += model_bits(codes, levels64, tables)
+            stats["stage_model_bits"][stage_idx] += model_bits(
+                codes, levels64, tables, kexp=choose_kexp(codes, radius)
+            )
             part = pack_stage(codes, outliers, rans_levels=levels64, rans_tables=tables)
         else:
             part = pack_stage(codes, outliers)
