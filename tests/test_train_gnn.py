@@ -8,16 +8,18 @@ torch = pytest.importorskip("torch")
 from scripts.train_gnn import (
     discretized_laplace_nll,
     sample_noise,
-    sample_synthetic_batch,
-    mixed_batch_sizes,
     normalize_tensor,
     training_autocast,
     run_chunked_scene,
     ModelEMA,
+)
+from deepsz.gnn_predictor import build_model
+from deepsz.synthetic_data import (
+    sample_synthetic_batch,
+    mixed_batch_sizes,
     _warp,
     _turbulent_advect,
 )
-from deepsz.gnn_predictor import build_model
 
 
 def test_noise_range_samples_log_uniformly():
@@ -220,7 +222,7 @@ def test_advection_raises_local_anisotropy():
     """Advected turbulent fields have more elongated (streaky/filamentary) local
     structure than the phase-random spectrum-only field, measured by the mean
     anisotropy of the gradient structure tensor."""
-    import scripts.train_gnn as gnn
+    import deepsz.synthetic_data as gnn
 
     shape = (96, 96)
 

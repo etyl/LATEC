@@ -2,6 +2,7 @@
 # (install torchvision from https://download.pytorch.org/whl/cu118).
 numpy
 scipy
+pyyaml
 zstandard
 constriction~=0.4.2
 pillow

@@ -1,0 +1,28 @@
+# Synthetic training-field distribution for scripts/train_gnn.py.
+# 2-D fields mixed with anisotropic 4-D fields; see
+# deepsz/synthetic_data.py (sample_synthetic_batch) for how these are used.
+# Overridable per run with the matching --synthetic-* CLI flags.
+
+
+# Target fraction of training points drawn from 4-D fields (0=all 2-D, 1=all 4-D).
+frac: 0.5
+# Probability a field is turbulent (power-law + advection) vs a smooth Gaussian field.
+turbulence_frac: 0.4
+# Max number of random hyperplane jump discontinuities added per field (0..N).
+max_discontinuities: 3
+# Probability a field gets any discontinuities at all (0=never, 1=always).
+discontinuity_frac: 0.25
+
+# Side length (pixels) of each square 2-D training crop.
+crop: 128
+# Log-uniform band (pixels) for the 2-D fields' per-axis correlation length.
+correlation_2d: [2.0, 32.0]
+
+#  shape of each 4-D training field.
+shape_4d: [16, 16, 16, 16]
+# Log-uniform band (grid cells) for the 4-D fields' per-axis correlation length.
+correlation_4d: [1.0, 8.0]
+# Number of 4-D fields per training batch (2-D batch size is derived from this + frac).
+batch_4d: 1
+# Anchor stride for synthetic fields, must be a power of two (sets levels = log2(stride)).
+stride: 8
