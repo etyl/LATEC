@@ -42,7 +42,6 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import itertools
-import math
 import os
 import warnings
 from pathlib import Path
@@ -54,7 +53,7 @@ from .levels import point_levels, stage_masks
 # torch is imported lazily inside the class / model so that importing this
 # module (e.g. for FLAG constants) stays cheap.
 
-CKPT_VERSION = 6
+CKPT_VERSION = 7
 
 # Query-tile for the message pass: caps the transient (B, L, m, K, d) buffers so
 # GPU peak scales with _M_TILE, not the stage's full M (line_pool is per-query,
@@ -688,22 +687,6 @@ def build_model(d: int = 32, agg_level: int = 2):
         def forward(self, ctx, value_emb):  # (B, N, d), (B, N, d) -> (B, N, d)
             return self.net(torch.cat([ctx, value_emb], dim=-1))
 
-    class CoarseProj(nn.Module):
-        """Project a chunk's per-level mean finalized embedding into the
-        context space MixEmbed expects for halo neighbours, conditioned on the
-        level's stride so one MLP serves every level. Used only by the chunked
-        codec path: out-of-chunk neighbours are represented as
-        ``mix(coarse[chunk, level], InitEmbed(value))`` instead of their dense
-        finalized embedding (which is never stored)."""
-
-        def __init__(self):
-            super().__init__()
-            self.net = _mlp(torch, [d + 1, h, d])
-
-        def forward(self, mean_emb, log_s):  # (..., K, d), scalar
-            cond = mean_emb.new_full((*mean_emb.shape[:-1], 1), float(log_s))
-            return self.net(torch.cat([mean_emb, cond], dim=-1))
-
     class GNN(nn.Module):
         def __init__(self):
             super().__init__()
@@ -716,7 +699,6 @@ def build_model(d: int = 32, agg_level: int = 2):
             self.axis_pool = AttnPool()
             self.head = PredHead()
             self.mix = MixEmbed()
-            self.coarse = CoarseProj()
 
         def _line_messages(self, E, block):
             """Per-line messages for one precomputed query ``block``, built
@@ -854,7 +836,7 @@ def _load_inference_model(checkpoint_path, torch, device):
     version = int(ckpt.get("version", 1))
     if version != CKPT_VERSION:
         raise ValueError(
-            "Axial GNN checkpoint format v6 is required. Retrain with "
+            "Axial GNN checkpoint format v7 is required. Retrain with "
             "scripts/train_gnn.py."
         )
     d = int(ckpt["d"])
@@ -1103,8 +1085,9 @@ class GNNPredictor:
 
 # ---------------------------------------------------------------------------
 # Chunked inference: the tensor is coded chunk by chunk (global anchors first),
-# dense embeddings exist only for the current chunk + halo, and finished chunks
-# leave behind one CoarseProj'd mean embedding per level (see ChunkedGNNPredictor).
+# dense embeddings exist only for the current chunk + halo; out-of-chunk
+# neighbours are represented from their reconstructed value alone (see
+# value_halo_embed / ChunkedGNNPredictor).
 # ---------------------------------------------------------------------------
 
 
@@ -1177,10 +1160,6 @@ class _ChunkGeoms:
         # / not-yet-decoded neighbour lines point at).
         idx0 = np.indices(self.chunk_shape).reshape(ndim, -1)  # chunk-frame
         self.interior_flat = np.ravel_multi_index(idx0 + stride, self.padded_shape)
-        lv = point_levels(list(idx0), levels, stride, block)
-        self.level_pos = [
-            np.nonzero(lv == l)[0].astype(np.int64) + 1 for l in range(levels + 1)
-        ]
 
         # Padded-flat halo cells that appear as a *valid* neighbour of some
         # stage: the thin band the field must actually hold. Derived from the
@@ -1293,23 +1272,20 @@ class _CompactGeom:
 
 class _CompactFrame:
     """Per-chunk compact field layout: geoms with remapped indices, and the
-    (contiguous) halo row block plus the metadata to fill it from coarse+value.
-    ``n_compact`` = 1 dummy + interior + usable-referenced halo."""
+    (contiguous) halo row block plus the metadata to fill it from the halo
+    cells' reconstructed values. ``n_compact`` = 1 dummy + interior +
+    usable-referenced halo."""
 
     __slots__ = (
         "geoms",
         "n_interior",
         "n_compact",
         "halo_rows",
-        "h_ids",
-        "h_lv",
         "h_gflat",
     )
 
     def __init__(self, cg, origin, shape, edges, grid, coded, torch, device):
-        halo_present, h_ids, h_lv, h_gflat = chunk_halo_info(
-            cg, origin, shape, edges, grid, coded
-        )
+        halo_present, h_gflat = chunk_halo_info(cg, origin, shape, edges, grid, coded)
         self.n_interior = int(len(cg.interior_flat))
         present = np.concatenate([cg.interior_flat, halo_present])
         self.n_compact = 1 + len(present)
@@ -1320,18 +1296,17 @@ class _CompactFrame:
         # halo cells are laid out right after interior, so their rows are a
         # contiguous slice — no remap needed to fill them.
         self.halo_rows = slice(self.n_interior + 1, self.n_compact)
-        self.h_ids, self.h_lv, self.h_gflat = h_ids, h_lv, h_gflat
+        self.h_gflat = h_gflat
 
 
 def chunk_halo_info(cg, origin, shape, edges, grid, coded):
     """Usable, referenced halo cells for one chunk of a chunk grid.
 
     Walks only the referenced band ``cg.ref_halo_flat`` (never the O(shell)
-    padded frame). Returns ``(halo_present, chunk_ids, lv, gflat)`` for the band
-    cells that are inside the tensor and already decoded (coded chunk, or a
-    global anchor): their padded flat index, owning chunk id, dyadic level and
-    global flat index. Shared by the inference predictor and the trainer so both
-    build identical context."""
+    padded frame). Returns ``(halo_present, gflat)`` for the band cells that
+    are inside the tensor and already decoded (coded chunk, or a global
+    anchor): their padded flat index and global flat index. Shared by the
+    inference predictor and the trainer so both build identical context."""
     ndim = len(shape)
     gc = cg.ref_halo_coords + np.asarray(origin, np.int64)
     shp = np.asarray(shape)
@@ -1342,45 +1317,17 @@ def chunk_halo_info(cg, origin, shape, edges, grid, coded):
     ok = np.asarray(coded)[chunk_ids] | (lv == 0)
     halo_present = cg.ref_halo_flat[inb][ok]
     gflat = np.ravel_multi_index([gci[ok][:, k] for k in range(ndim)], shape)
-    return halo_present, chunk_ids[ok], lv[ok], gflat
-
-
-def anchor_finalize(model, vals, ndim):
-    """Finalized embedding of anchor points as the codec computes it: anchors
-    have nothing known before them, so their pooled context is the line pool's
-    null token and the finalized embedding is a pure function of the value.
-    ``vals``: (B, M) normalized values -> (B, M, ndim, d)."""
-    B, M = vals.shape
-    null = model.line_pool.null_v.view(1, 1, 1, -1).expand(B, M, ndim, -1)
-    return model.finalize(null, vals)
+    return halo_present, gflat
 
 
 def value_halo_embed(model, vals, ndim):
     """Representation of an out-of-chunk known neighbour: the reconstructed
     value's InitEmbed broadcast over the ndim axes. The extended-block schedule
     carries cross-chunk context through the decoded recon array, so the halo
-    needs no per-chunk coarse embedding. ``vals``: (B, H) normalized ->
+    needs nothing more than the value itself. ``vals``: (B, H) normalized ->
     (B, H, ndim, d)."""
     ve = model.init(vals.unsqueeze(-1))  # (B, H, d)
     return ve.unsqueeze(2).expand(*ve.shape[:-1], ndim, ve.shape[-1])
-
-
-def chunk_coarse(model, E_pad, cg, torch):
-    """Per-level coarse embeddings of a finished chunk: mean of the finalized
-    interior embeddings per level -> CoarseProj (conditioned on the level
-    stride). Levels with no points in this (ragged) chunk stay zero — they are
-    never read, since a halo point of that level would itself be such an
-    interior point. Returns (B, levels + 1, ndim, d)."""
-    B = E_pad.shape[0]
-    out = E_pad.new_zeros(B, cg.levels + 1, cg.ndim, model.d)
-    for l, pos in enumerate(cg.level_pos):
-        if not len(pos):
-            continue
-        idx = torch.from_numpy(pos).to(E_pad.device)  # compact rows
-        mean = E_pad.index_select(1, idx).mean(dim=1)  # (B, K, d)
-        s = cg.stride if l == 0 else max(cg.stride >> l, 1)
-        out[:, l] = model.coarse(mean, math.log2(s))
-    return out
 
 
 class ChunkedGNNPredictor:

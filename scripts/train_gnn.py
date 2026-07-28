@@ -37,12 +37,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from deepsz.gnn_predictor import (
     CKPT_VERSION,
     _CompactFrame,
-    anchor_finalize,
     build_chunk_geoms,
     build_model,
     build_stage_geoms,
-    chunk_coarse,
     stage_forward,
+    value_halo_embed,
 )
 from deepsz.levels import stage_masks
 from deepsz.synthetic_data import (
@@ -439,7 +438,7 @@ def run_stages(
 
 def _run_chunk(model, cg, geoms, E, known_vals, x, gidx, eb, device, reveal):
     """One chunk of the chunked-scene step: the codec's local stage chain with
-    teacher forcing. Returns (nll bits, n holes, abs err, finalized E)."""
+    teacher forcing. Returns (nll bits, n holes, abs err)."""
     nll = torch.zeros((), device=device)
     abs_err = torch.zeros((), device=device)
     npix = 0
@@ -456,25 +455,19 @@ def _run_chunk(model, cg, geoms, E, known_vals, x, gidx, eb, device, reveal):
         abs_err = abs_err + (pred.detach() - tgt).abs().sum()
         npix += tgt.numel()
         reveal(gidx[s])
-    last = cg.chain[-1]
-    g = geoms[last]
-    if g is not None:  # finalize the last stage so the coarse means see it
-        if ctx is None:
-            ctx = model.embed(E, g)
-        finalized = model.finalize(ctx, known_vals[:, gidx[last]]).to(E.dtype)
-        E = E.index_copy(1, g.query_idx, finalized)
-    return nll, npix, abs_err, E
+    return nll, npix, abs_err
 
 
 def run_chunked_scene(
     model, x, hw, axis, order, levels, stride, d, device, eb, agg_level=None
 ):
     """Teacher-forced two-chunk closed loop, mirroring the chunked codec: the
-    n-D scene (``hw`` = full shape) is split in half along ``axis``; anchors revealed
-    and give every chunk its level-0 coarse embedding, then the chunks are
-    coded in ``order`` — the first sees only anchor context across the border,
-    the second sees the first's per-level coarse embeddings as coded halo.
-    Same geometry/halo/coarse code as ChunkedGNNPredictor, with gradients."""
+    n-D scene (``hw`` = full shape) is split in half along ``axis``; anchors are
+    revealed, then the chunks are coded in ``order`` — the first sees only
+    anchor context across the border, the second reads the first's
+    reconstructed values as halo (``value_halo_embed``), same as
+    ChunkedGNNPredictor's wave halo fill. Same geometry/halo code, with
+    gradients."""
     B, N = x.shape
     shape = tuple(int(s) for s in hw)
     ndim = len(shape)
@@ -489,9 +482,7 @@ def run_chunked_scene(
         nz = (torch.rand(B, idx.numel(), device=device) * 2 - 1) * eb[:, None]
         known_vals[:, idx] = (x[:, idx] + nz).clamp(0, 1)
 
-    # global anchor pass + per-chunk level-0 coarse
-    coarse = torch.zeros(B, 2, levels + 1, ndim, d, device=device)
-    origins, aidx = [], []
+    origins = []
     for ci in range(2):
         starts = tuple(g * e for g, e in zip(np.unravel_index(ci, grid), edges))
         origins.append(starts)
@@ -500,12 +491,7 @@ def run_chunked_scene(
             for o, e in zip(starts, edges)
         ]
         mg = np.meshgrid(*axes, indexing="ij")
-        aidx.append(np.ravel_multi_index([m.reshape(-1) for m in mg], shape))
-    for ci in range(2):
-        reveal(aidx[ci])
-    for ci in range(2):
-        fin = anchor_finalize(model, known_vals[:, aidx[ci]], ndim)
-        coarse[:, ci, 0] = model.coarse(fin.mean(1), math.log2(stride))
+        reveal(np.ravel_multi_index([m.reshape(-1) for m in mg], shape))
 
     cg = build_chunk_geoms(edges, levels, stride, 1, torch, device, agg_level)
     coded = np.zeros(2, bool)
@@ -516,11 +502,8 @@ def run_chunked_scene(
         frame = _CompactFrame(cg, origins[ci], shape, edges, grid, coded, torch, device)
         E = torch.zeros(B, frame.n_compact, ndim, d, device=device)
         if len(frame.h_gflat):  # trailing halo block
-            ids_t = torch.from_numpy(frame.h_ids).to(device)
-            lv_t = torch.from_numpy(frame.h_lv.astype(np.int64)).to(device)
             gflat_t = torch.from_numpy(frame.h_gflat).to(device)
-            cvec = coarse[:, ids_t, lv_t]  # (B, Hs, K, d)
-            halo = model.finalize(cvec, known_vals[:, gflat_t])
+            halo = value_halo_embed(model, known_vals[:, gflat_t], ndim)
             E = torch.cat([E[:, : frame.halo_rows.start], halo], dim=1)
         gidx = [
             None
@@ -532,11 +515,10 @@ def run_chunked_scene(
             ).to(device)
             for c in cg.coords
         ]
-        n1, np1, a1, E = _run_chunk(
+        n1, np1, a1 = _run_chunk(
             model, cg, frame.geoms, E, known_vals, x, gidx, eb, device, reveal
         )
         nll, npix, abs_err = nll + n1, npix + np1, abs_err + a1
-        coarse[:, ci] = chunk_coarse(model, E, cg, torch)
         coded[ci] = True
     return nll, npix, {"abs_err": abs_err}
 

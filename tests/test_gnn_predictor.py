@@ -149,7 +149,7 @@ def test_mask_stage_forward_accepts_predict_idx():
     assert np.isfinite(values.numpy()).all()
 
 
-@pytest.mark.parametrize("version", [None, 2, 3, 4, 5])
+@pytest.mark.parametrize("version", [None, 2, 3, 4, 5, 6])
 def test_gnn_predictor_rejects_old_checkpoint(tmp_path, version):
     model = build_model(d=8).eval()
     path = tmp_path / f"v{version or 1}.pt"
@@ -158,7 +158,7 @@ def test_gnn_predictor_rejects_old_checkpoint(tmp_path, version):
         checkpoint["version"] = version
     torch.save(checkpoint, path)
 
-    with pytest.raises(ValueError, match="format v6"):
+    with pytest.raises(ValueError, match="format v7"):
         GNNPredictor(path, 0.0, 1.0, levels=2, anchor_stride=4, anchor_block=1)
 
 
