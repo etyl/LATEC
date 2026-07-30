@@ -157,7 +157,7 @@ def _progress_bar(tag, n, unit="wave"):
 
 def _geometry_stages(ndim: int, levels: int) -> int:
     """Number of masks/geometries in the dimension-generic stage schedule."""
-    return 1 + levels * ((1 << ndim) - 1)
+    return 1 + levels * (2 * ndim - 1)
 
 
 def _as_numpy(x: Any) -> np.ndarray:
@@ -464,11 +464,11 @@ _GATE_END_MODE = END_QUAD | END_EXTRAP
 # Adaptive finest-level gate. The finest level (stride-1 sub-stages) carries the
 # large majority of the bits, and on smooth fields interpolation beats the model
 # there almost everywhere. Spending one swept gate word per finest sub-stage is
-# accurate but the finest level has 2^ndim - 1 sub-stages per chunk. gate_fine
+# accurate but the finest level has 2*ndim - 1 sub-stages per chunk. gate_fine
 # instead chooses a *single* descriptor per chunk (predictor, direction, T,
 # shift) from the chunk's first finest sub-stage and reuses it across the rest,
 # storing one word per chunk. The threshold is still data-chosen (adaptive) --
-# unlike a hardcoded rule -- but the per-chunk metadata drops by ~2^ndim. The
+# unlike a hardcoded rule -- but the per-chunk metadata drops accordingly. The
 # error bound is enforced by quantization regardless of predictor, so this only
 # ever trades rate, never correctness; disable per stream with gate_fine=False.
 
@@ -589,7 +589,16 @@ def _interp_axis_at_t(torch, W, coords, axis, s, shape, cubic, end_mode, ends):
 def _interp_stage_pred_t(
     torch, recon_t, sls, coords_t, stride, axes, center, *, cubic, end_mode, ends
 ):
-    """Chunk-local interpolation from the causal device reconstruction."""
+    """Chunk-local interpolation from the causal device reconstruction.
+
+    ``axes`` is the sub-stage's candidate axis set (see ``levels.stage_plan``):
+    a single axis for a weight-1 sub-stage, or the full range for a fused
+    weight >= 2 sub-stage whose points' actual odd axes vary per point. Each
+    point's own odd-axis membership is re-derived here from its coordinates
+    rather than assumed uniform across the stage. Combined with a plain
+    sequential ``where`` walk (never ``argmax``/``max`` over a tie) so ties
+    among several True axes resolve the same way every call -- required for
+    the encoder and decoder to land on bit-identical gate candidates."""
     W = recon_t[(slice(None), *sls)].double()
     shape = tuple(W.shape[1:])
 
@@ -598,10 +607,23 @@ def _interp_stage_pred_t(
             torch, W, coords_t, a, stride, shape, cubic, end_mode, ends[a]
         )
 
+    def is_odd(a):
+        return (coords_t[a] // stride % 2 == 1).unsqueeze(0)
+
     if center == 0 or len(axes) == 1:
-        ip = sum(axis_pred(a) for a in axes) / len(axes)
+        total = count = None
+        for a in axes:
+            v = axis_pred(a)
+            m = is_odd(a).double()
+            total = v * m if total is None else total + v * m
+            count = m if count is None else count + m
+        ip = total / count
     else:
-        ip = axis_pred(axes[0] if center == 1 else axes[-1])
+        ip = None
+        order = reversed(axes) if center == 1 else axes  # first-/last-wins
+        for a in order:
+            v = axis_pred(a)
+            ip = v if ip is None else torch.where(is_odd(a), v, ip)
     return ip.to(torch.float32)  # (C, n)
 
 
@@ -1353,9 +1375,9 @@ class GNNCompressorCodec:
         # gate_fine (opt-in, default off): at the finest (stride-1) level store one
         # adaptively-chosen gate descriptor per chunk instead of one swept word per
         # finest sub-stage. The threshold is still data-chosen (picked from the
-        # chunk's first finest sub-stage and reused across its 2^ndim - 1 finest
+        # chunk's first finest sub-stage and reused across its 2*ndim - 1 finest
         # sub-stages), so it keeps per-chunk adaptivity while cutting the finest
-        # level's metadata ~2^ndim. It reuses one descriptor across sub-stages, so
+        # level's metadata accordingly. It reuses one descriptor across sub-stages, so
         # its rate is >= the fully per-sub-stage gate (gate_fine=False); since
         # packing already makes the per-sub-stage words cheap, that default is
         # usually as good or better. gate_fine helps most when finest metadata,

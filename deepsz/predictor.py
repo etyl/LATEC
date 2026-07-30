@@ -145,14 +145,18 @@ class InterpPredictor:
 
     Each dyadic level is split into codec sub-stages ordered by how many axes a
     point straddles as a midpoint (``levels.stage_plan``): the one-odd-axis
-    edge-midpoints first, then the multi-odd-axis centres. Because they are
-    separate stages the codec quantizes each into ``recon`` before the next
-    reads it — SZ3's interleaved quantize/predict order — so a point's ±stride
-    neighbours along each of its odd axes are already reconstructed, and it is
-    predicted by averaging the single-axis interpolation over exactly those
-    axes (2 neighbours for an edge-midpoint, 4 for a 2-D cell centre). The
-    predictor supplies its own ``stage_masks``; the decoder rebuilds the
-    identical schedule from the header dims alone.
+    edge-midpoints first (kept one sub-stage per axis), then every multi-axis
+    weight fused into a single sub-stage (all 2-D cell centres, all 3-D face
+    centres, ...). Because they are separate stages the codec quantizes each
+    into ``recon`` before the next reads it — SZ3's interleaved quantize/predict
+    order — so a point's ±stride neighbours along each of its odd axes are
+    already reconstructed, and it is predicted by averaging the single-axis
+    interpolation over exactly those axes (2 neighbours for an edge-midpoint, 4
+    for a 2-D cell centre). A fused sub-stage mixes points with different odd
+    axes, so ``predict`` re-derives each point's own set from its coordinates
+    rather than trusting one tuple for the whole stage. The predictor supplies
+    its own ``stage_masks``; the decoder rebuilds the identical schedule from
+    the header dims alone.
 
     SZ3's interpolation has no fixed input size, so the codec runs it over the
     whole field as a single region without padding or prediction seams.
@@ -250,13 +254,26 @@ class InterpPredictor:
             if self.end_mode is not None
             else default_interp_end_mode(len(shape))
         )
+
+        def is_odd(a):  # this point's own midpoint axes, not the stage-wide
+            # candidate set: a fused sub-stage (weight >= 2) mixes points whose
+            # odd axes differ, e.g. all 3-D face centres share one sub-stage.
+            return coords[a] // s % 2 == 1
+
         if center == 0 or len(axes) == 1:
-            out = sum(
-                _interp_axis_at(W, coords, a, s, self.order, shape, end_mode)
-                for a in axes
-            ) / len(axes)
+            total = count = None
+            for a in axes:
+                v = _interp_axis_at(W, coords, a, s, self.order, shape, end_mode)
+                m = is_odd(a)[None].astype(np.float64)
+                total = v * m if total is None else total + v * m
+                count = m if count is None else count + m
+            out = total / count
         else:
-            a = axes[0] if center == 1 else axes[-1]
-            out = _interp_axis_at(W, coords, a, s, self.order, shape, end_mode)
+            out = None
+            order = reversed(axes) if center == 1 else axes  # first-/last-wins
+            for a in order:
+                v = _interp_axis_at(W, coords, a, s, self.order, shape, end_mode)
+                take = is_odd(a)[None]
+                out = v if out is None else np.where(take, v, out)
         out = out.astype(np.float32)  # (C, M)
         return out if pos is not None else out.reshape(recon.shape)

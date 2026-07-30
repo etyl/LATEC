@@ -86,6 +86,52 @@ def test_compact_gather_matches_full_grid(order, center, end_mode):
         known |= mask
 
 
+@pytest.mark.parametrize("order", ["linear", "cubic"])
+@pytest.mark.parametrize("center", [0, 1, 2])
+def test_fused_stage_matches_per_point_reference_3d(order, center):
+    """3-D fused weight>=2 sub-stages (e.g. all 3 face-centre axis sets sharing
+    one sub-stage) mix points with different odd axes; predict() must re-derive
+    each point's own odd set rather than use one axes tuple for the whole
+    stage. Reference combines the whole-grid per-axis interpolations using
+    that same per-point rule instead of trusting ``axes`` uniformly."""
+    shape, levels, stride, block = (16, 16, 16), 2, 4, 1
+    recon = np.random.RandomState(0).rand(2, *shape).astype(np.float32) * 50
+    pred = InterpPredictor(order, levels, stride, block, center=center, end_mode=0)
+    known = np.zeros(shape, bool)
+    saw_fused = False
+    for mask, s, axes in stage_plan(shape, levels, stride, block):
+        if axes and mask.any():
+            got = pred.predict(recon, known, mask)
+            W = recon.astype(np.float64)
+
+            def odd_full(a):  # this axis's midpoints, whole grid, (1,)*4 broadcast
+                sel = (np.arange(shape[a]) // s) % 2 == 1
+                sh = [1, 1, 1, 1]
+                sh[a + 1] = shape[a]
+                return sel.reshape(sh)
+
+            if center == 0 or len(axes) == 1:
+                total = count = None
+                for a in axes:
+                    v = _interp_axis_full(W, a + 1, s, order, 0)
+                    m = odd_full(a).astype(np.float64)
+                    total = v * m if total is None else total + v * m
+                    count = m if count is None else count + m
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    ref = np.broadcast_to(total / count, W.shape)  # count==0 off-stage; sliced away below
+            else:
+                ref = None
+                for a in reversed(axes) if center == 1 else axes:
+                    v = _interp_axis_full(W, a + 1, s, order, 0)
+                    ref = v if ref is None else np.where(odd_full(a), v, ref)
+                ref = np.broadcast_to(ref, W.shape)
+            if len(axes) > 1:
+                saw_fused = True
+            assert np.array_equal(got, ref.astype(np.float32)[:, mask])
+        known |= mask
+    assert saw_fused  # confirms the test actually exercised a fused sub-stage
+
+
 def test_end_mode_roundtrips_through_flags_and_holds_bound():
     """Every line-end mode decodes from the stream flags alone (no factory) and
     keeps the bound; the encoder's recon matches the decoder's output."""

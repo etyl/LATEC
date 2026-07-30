@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from deepsz.levels import stage_masks
+from deepsz.levels import stage_masks, stage_plan
 
 
 # all levels == log2(stride) so the schedule densifies to stride 1 (guard)
@@ -21,13 +21,47 @@ from deepsz.levels import stage_masks
 def test_partition(shape, levels, stride, block):
     masks = stage_masks(shape, levels, stride, block)
     ndim = len(shape)
-    # anchor + (2^ndim - 1) sub-stages per level (one per non-empty odd-axis set)
-    assert len(masks) == 1 + (2**ndim - 1) * levels
+    # anchor + (2*ndim - 1) sub-stages per level: one per axis (weight 1) plus
+    # one fused sub-stage per weight >= 2 (all same-weight axis sets together)
+    assert len(masks) == 1 + (2 * ndim - 1) * levels
     total = np.zeros(shape, int)
     for m in masks:
         assert m.shape == shape
         total += m.astype(int)
     assert (total == 1).all()  # disjoint and exhaustive
+
+
+def test_weight1_stays_separate_weight2_plus_fuses():
+    """3-D: the 3 weight-1 (edge-midpoint) sub-stages stay one-per-axis, but
+    the 3 weight-2 (face-centre) axis sets are revealed together as one fused
+    sub-stage, and the weight-3 (cube-interior) sub-stage is unchanged (it was
+    already a single combination)."""
+    shape, levels, stride, block = (16, 16, 16), 1, 2, 1
+    plan = stage_plan(shape, levels, stride, block)
+    # [anchor, axis0, axis1, axis2, fused-weight2, weight3]
+    assert len(plan) == 6
+    axes = [ax for _, _, ax in plan]
+    assert axes == [(), (0,), (1,), (2,), (0, 1, 2), (0, 1, 2)]
+
+    # the fused weight-2 mask equals the union of the 3 individual face masks
+    s = plan[4][1]  # finest-level stride (levels=1, so max(stride >> 1, 1))
+    coords = [np.arange(n) for n in shape]
+
+    def combo(ax_pair):
+        m = np.ones(shape, bool)
+        for j, cj in enumerate(coords):
+            sel = (
+                ((cj % s) == 0) & ((cj % (2 * s)) != 0)
+                if j in ax_pair
+                else (cj % (2 * s)) == 0
+            )
+            sh = [1, 1, 1]
+            sh[j] = cj.shape[0]
+            m &= sel.reshape(sh)
+        return m
+
+    union = combo((0, 1)) | combo((0, 2)) | combo((1, 2))
+    assert np.array_equal(plan[4][0], union)
 
 
 def test_anchor_geometry():

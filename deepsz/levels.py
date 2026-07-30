@@ -12,9 +12,17 @@ axes a point straddles, the more reconstructed neighbours it sees. In 2-D this
 recovers the classic order: horizontal/vertical edge-midpoints (one odd axis,
 two coarse neighbours) then the cell centre (two odd axes, four neighbours).
 
-The rule is dimension-agnostic — the same weight ordering drives 2-D images and
-n-D grids (matching the rank-generic GNN predictor), yielding ``2^ndim - 1``
-sub-stages per level — and the disjoint masks union to the full grid. Encoder,
+Grouping every distinct axis *set* into its own sub-stage costs ``2^ndim - 1``
+of them per level — exponential in rank. Only the weight-1 sets (one sub-stage
+per axis, e.g. the 3 edge-midpoint directions in 3-D) carry distinct enough
+geometry to keep separate; every axis set of the same weight >= 2 (all 3 face
+centres in 3-D, all 4 face-diagonals in 4-D, ...) is revealed together as one
+fused sub-stage, since they differ only in *which* axes are odd and prediction
+re-derives that per point from its own coordinates (``levels.py`` builds no
+per-point axes metadata; ``predictor.py``/``gnn_codec.py`` recompute
+``(coord // stride) % 2 == 1`` where needed). That yields ``2*ndim - 1``
+sub-stages per level — linear in rank, identical to the exponential form at
+ndim <= 2 — and the disjoint masks still union to the full grid. Encoder,
 decoder, and the GNN trainer all derive it from the header parameters alone.
 """
 
@@ -32,6 +40,21 @@ def _axis_mask(mask1d: np.ndarray, axis: int, ndim: int) -> np.ndarray:
     return mask1d.reshape(shape)
 
 
+def _combo_mask(
+    coords: list[np.ndarray], axes: tuple[int, ...], s: int, shape: tuple[int, ...], ndim: int
+) -> np.ndarray:
+    """Points on the stride-``s`` lattice that are midpoints (odd multiples of
+    ``s``) on exactly ``axes`` and on the coarse (``2s``) grid elsewhere."""
+    mask = np.ones(shape, bool)
+    for j, cj in enumerate(coords):
+        if j in axes:
+            sel = ((cj % s) == 0) & ((cj % (2 * s)) != 0)
+        else:
+            sel = (cj % (2 * s)) == 0
+        mask &= _axis_mask(sel, j, ndim)
+    return mask
+
+
 def stage_plan(
     shape: tuple[int, ...],
     levels: int,
@@ -39,10 +62,16 @@ def stage_plan(
     anchor_block: int = 1,
 ) -> list[tuple[np.ndarray, int, tuple[int, ...]]]:
     """Ordered sub-stages as (mask, stride, axes) for a grid of arbitrary rank.
-    ``axes`` is the tuple of axes on which the sub-stage's points are midpoints
-    (an odd multiple of ``stride``); the interp predictor averages the
-    single-axis interpolation over exactly those axes. The anchor stage has
-    ``axes == ()``. ``stage_masks`` drops the metadata."""
+
+    ``axes`` is the *candidate* set of axes on which this sub-stage's points
+    may be midpoints: a single axis for the weight-1 sub-stages (kept
+    separate, so ``axes`` names it exactly), or ``range(ndim)`` for a fused
+    weight >= 2 sub-stage, since its points' actual odd-axis sets vary (all
+    same-weight combinations are revealed together). Callers that need a
+    point's real odd axes re-derive them from its own coordinates —
+    ``(coord // stride) % 2 == 1`` — which is exact for every point in this
+    schedule. The anchor stage has ``axes == ()``. ``stage_masks`` drops the
+    metadata."""
     shape = tuple(int(n) for n in shape)
     ndim = len(shape)
     if ndim < 1:
@@ -76,20 +105,22 @@ def stage_plan(
         s = max(anchor_stride >> k, 1)
         # weight w = number of axes a point is a midpoint on; low -> high so a
         # point's ±s neighbours along its odd axes are already decoded.
-        for w in range(1, ndim + 1):
+        for axis in range(ndim):  # weight 1: kept separate, one sub-stage each
+            mask = _combo_mask(coords, (axis,), s, shape, ndim) & ~covered
+            if k == levels and ndim == 1:  # only sub-stage this level: absorbs remainder
+                mask |= ~covered
+            plan.append((mask, s, (axis,)))
+            covered |= mask
+
+        for w in range(2, ndim + 1):  # weight >= 2: fuse same-weight axis sets
+            mask = np.zeros(shape, bool)
             for axes in itertools.combinations(range(ndim), w):
-                mask = np.ones(shape, bool)
-                for j, cj in enumerate(coords):
-                    if j in axes:  # midpoint (odd multiple of s) on this axis
-                        sel = ((cj % s) == 0) & ((cj % (2 * s)) != 0)
-                    else:  # on the coarse (stride 2s) grid
-                        sel = (cj % (2 * s)) == 0
-                    mask &= _axis_mask(sel, j, ndim)
-                mask &= ~covered
-                if k == levels and w == ndim:  # final sub-stage absorbs remainder
-                    mask |= ~covered
-                plan.append((mask, s, axes))
-                covered |= mask
+                mask |= _combo_mask(coords, axes, s, shape, ndim)
+            mask &= ~covered
+            if k == levels and w == ndim:  # final sub-stage absorbs remainder
+                mask |= ~covered
+            plan.append((mask, s, tuple(range(ndim))))
+            covered |= mask
 
     return plan
 
@@ -111,7 +142,8 @@ def stage_strides(ndim: int, levels: int, anchor_stride: int) -> list[int]:
 
     The stride sequence is a pure function of the schedule shape: stage 0 (the
     anchors) has stride ``anchor_stride``; each dyadic level ``k`` contributes
-    ``2^ndim - 1`` sub-stages all at stride ``max(anchor_stride >> k, 1)``. It is
+    ``2*ndim - 1`` sub-stages (``ndim`` weight-1 + ``ndim - 1`` fused weight >= 2,
+    see ``stage_plan``) all at stride ``max(anchor_stride >> k, 1)``. It is
     independent of the grid extent, so this reproduces ``[stride for _, stride,
     _ in stage_plan(shape, ...)]`` for any ``shape`` of rank ``ndim`` without
     materialising a single stage mask (the mask build is O(levels * n_points),
@@ -129,7 +161,7 @@ def stage_strides(ndim: int, levels: int, anchor_stride: int) -> list[int]:
             f"{anchor_stride}: need levels >= log2(anchor_stride) = "
             f"{anchor_stride.bit_length() - 1} to densify to stride 1"
         )
-    per_level = (1 << ndim) - 1
+    per_level = 2 * ndim - 1
     strides = [anchor_stride]
     for k in range(1, levels + 1):
         strides += [max(anchor_stride >> k, 1)] * per_level
