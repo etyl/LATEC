@@ -70,10 +70,19 @@ class GpuSampler:
     Prefers NVML (``pynvml``); falls back to parsing ``nvidia-smi``; degrades to
     a no-op if neither is available (e.g. CPU-only box) so the benchmark still
     runs. ``.summary()`` returns mean/peak utilisation (%) and peak used MiB, or
-    ``None`` fields when no samples were taken."""
+    ``None`` fields when no samples were taken.
 
-    def __init__(self, device_index: int = 0, interval: float = 0.1):
+    The device is identified by **UUID**, not by ordinal: NVML and ``nvidia-smi``
+    enumerate physical GPUs, whereas a torch ordinal is an index into
+    ``CUDA_VISIBLE_DEVICES``. Under the usual ``CUDA_VISIBLE_DEVICES=<free gpu>``
+    workflow those disagree, and sampling by ordinal silently reported a
+    *different card's* utilisation -- the neighbour's job, not this run's."""
+
+    def __init__(
+        self, device_index: int = 0, interval: float = 0.1, uuid: str | None = None
+    ):
         self.index = device_index
+        self.uuid = uuid
         self.interval = interval
         self.util: list[float] = []
         self.mem: list[float] = []
@@ -82,12 +91,21 @@ class GpuSampler:
         self._thread: threading.Thread | None = None
         self._sample = self._pick_backend()
 
+    def _uuid_str(self) -> str:
+        """NVML spells GPU UUIDs ``GPU-<hex>``; torch drops the prefix."""
+        u = str(self.uuid)
+        return u if u.startswith("GPU-") else f"GPU-{u}"
+
     def _pick_backend(self):
         try:
             import pynvml
 
             pynvml.nvmlInit()
-            h = pynvml.nvmlDeviceGetHandleByIndex(self.index)
+            h = (
+                pynvml.nvmlDeviceGetHandleByIndex(self.index)
+                if self.uuid is None
+                else pynvml.nvmlDeviceGetHandleByUUID(self._uuid_str().encode())
+            )
 
             def sample():
                 r = pynvml.nvmlDeviceGetUtilizationRates(h)
@@ -105,7 +123,7 @@ class GpuSampler:
                 "--query-gpu=utilization.gpu,memory.used",
                 "--format=csv,noheader,nounits",
                 "-i",
-                str(self.index),
+                str(self.index) if self.uuid is None else self._uuid_str(),
             )
 
             def sample():
@@ -346,8 +364,15 @@ def main(argv=None):
         gpu_base_alloc = gpu_base_resv = 0
 
     with HostMemorySampler() as host_memory:
-        gpu_index = torch_device.index or 0
-        with GpuSampler(device_index=gpu_index, interval=args.poll_interval) as gpu:
+        gpu_index = 0 if torch_device.index is None else torch_device.index
+        gpu_uuid = None
+        if is_cuda:  # physical identity, immune to CUDA_VISIBLE_DEVICES remapping
+            gpu_uuid = getattr(
+                torch.cuda.get_device_properties(torch_device), "uuid", None
+            )
+        with GpuSampler(
+            device_index=gpu_index, interval=args.poll_interval, uuid=gpu_uuid
+        ) as gpu:
             sync()
             t0 = time.perf_counter()
             stream = codec.compress(sub)
