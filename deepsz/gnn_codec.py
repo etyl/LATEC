@@ -653,6 +653,11 @@ def _laplace_bits_t(torch, absr, b, eb, radius):
     Scales are snapped to the same 64-level grid as ``scale_to_level``. Regular
     symbols are capped at the rANS table precision (24 bits), while outliers pay
     that marker cost plus the raw float32 stored by ``pack_stage``.
+
+    ``absr`` and ``b`` may carry a leading candidate axis, so ``_gate_select_t``
+    can score every gate setting in one pass. Dropping to float32 was measured
+    and is NOT worth it (<1% either way): this is launch-bound, not ALU-bound,
+    so the win comes from batching the candidates, not from cheaper arithmetic.
     """
     lo = eb / SCALE_LO_DIV
     hi = eb * SCALE_HI_MULT
@@ -690,24 +695,29 @@ def _gate_select_t(torch, r_g, r_is, b, eb, radius=1 << 15):
     # and would make the gate choice, and thus the stream, non-deterministic.
     onehot = (bucket.unsqueeze(-1) == torch.arange(nb, device=dev)).double()  # (n, nb)
 
-    def cum(r, bb):
-        w = _laplace_bits_t(torch, r, bb, eb, radius).sum(0)  # (n,)
-        binc = (w.unsqueeze(-1) * onehot).sum(0)  # (nb,)
-        return torch.cumsum(binc, 0)
-
-    base = cum(r_g, b)
-    tot = base[-1]
+    # Every candidate rate estimate (the ungated baseline, plus each classical
+    # predictor at each shift) is evaluated in ONE batched pass. Scored one at
+    # a time they issued ~13x the kernel launches for identical arithmetic, and
+    # this encode is launch-bound. The per-bucket sum is a matmul against the
+    # one-hot rather than an (n, nb) product per candidate, so the big
+    # transient never materialises either.
     nsh = len(_GATE_SHIFTS)
+    A = torch.stack([r_g] + [r for r in r_is for _ in _GATE_SHIFTS])  # (R, C, n)
+    Bb = torch.stack(
+        [b] + [b * 2.0**-sh for _ in r_is for sh in _GATE_SHIFTS]
+    ).unsqueeze(1)  # (R, 1, n)
+    W = _laplace_bits_t(torch, A, Bb, eb, radius).sum(1)  # (R, n)
+    cums = torch.cumsum(W @ onehot, -1)  # (R, nb)
+
+    base = cums[0]
+    tot = base[-1]
     # For a boundary at bucket k (split index k in [0, nb-2]):
     #   low-side  cost = interp(buckets<=k)  + gnn(buckets>k)  = ci[k] + (tot-base[k])
     #   high-side cost = gnn(buckets<=k)     + interp(buckets>k) = base[k] + (ci[-1]-ci[k])
-    low_rows, high_rows = [], []
-    for r_i in r_is:
-        for sh in _GATE_SHIFTS:
-            ci = cum(r_i, b * 2.0**-sh)
-            low_rows.append(tot - base[:-1] + ci[:-1])
-            high_rows.append(base[:-1] + (ci[-1] - ci[:-1]))
-    costs = torch.stack(low_rows + high_rows)  # (2 * n_predictor * n_shift, nb-1)
+    ci = cums[1:]  # (n_predictor * n_shift, nb), same order as before
+    low = tot - base[:-1] + ci[:, :-1]
+    high = base[:-1] + (ci[:, -1:] - ci[:, :-1])
+    costs = torch.cat([low, high])  # (2 * n_predictor * n_shift, nb-1)
     mv, fi = costs.reshape(-1).min(0)
     fired = mv < tot
     ncol = nb - 1
