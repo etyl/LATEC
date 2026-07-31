@@ -141,6 +141,42 @@ def _nearest_steps(pat: np.ndarray, dvec, P: int, res=None) -> np.ndarray:
 
 
 _NEAREST_TILE_CACHE: dict = {}
+_NEAREST_MEMO_CACHE: dict = {}  # (id(pat), dvec, P) -> (pat ref, partial tile)
+_MEMO_UNSOLVED = 255  # sentinel; valid answers are 0..P
+_MEMO_MAX_CELLS = 1 << 20  # same ceiling as the full-tile path below
+
+
+def _nearest_steps_memo(pat: np.ndarray, dvec, P: int, res) -> np.ndarray:
+    """`_nearest_steps` memoized per residue, across chunk shapes.
+
+    The answer depends only on a query's residue mod P, and ``pat`` is the
+    schedule's period tile (``_period_prefixes``) -- neither depends on the
+    chunk shape. Grow mode gives every chunk of a small grid its own shape, so
+    the same (stage, direction) answers were recomputed once per shape: on a
+    64^4 field at chunk 32 that is 16 shapes and 39% of encode wall. Solve each
+    residue once for the whole encode instead and gather thereafter; a chunk's
+    first visit still pays the full sweep, later ones are O(M).
+
+    The table is a lazily filled ``P**ndim`` byte per (pat, dvec) -- filled only
+    at the residues a stage actually queries, which sum to one tile across the
+    whole schedule. Keyed on ``id(pat)`` (cheap; ``pat.tobytes()`` would hash a
+    megabyte per call) with the array itself pinned in the entry so the id
+    cannot be recycled onto a different pattern."""
+    key = (id(pat), tuple(int(c) for c in dvec), P)
+    hit = _NEAREST_MEMO_CACHE.get(key)
+    if hit is None:
+        table = np.full(pat.size, _MEMO_UNSOLVED, np.uint8)
+        _NEAREST_MEMO_CACHE[key] = (pat, table)  # pat ref pins id(pat)
+    else:
+        table = hit[1]
+    flat = np.ravel_multi_index(tuple(res), pat.shape)
+    vals = table[flat]
+    miss = vals == _MEMO_UNSOLVED
+    if miss.any():
+        solved = _nearest_steps(pat, dvec, P, tuple(r[miss] for r in res))
+        table[flat[miss]] = solved
+        vals = table[flat]
+    return vals.astype(np.int64)
 
 
 def _nearest_steps_at(
@@ -159,6 +195,8 @@ def _nearest_steps_at(
     # query counts sum to only P**ndim, so evaluating at query residues is the
     # linear-work strategy for chunk geometry.
     if query_only:
+        if pat.size <= _MEMO_MAX_CELLS and P < _MEMO_UNSOLVED:
+            return _nearest_steps_memo(pat, dvec, P, res)
         return _nearest_steps(pat, dvec, P, res)
     if pat.size > 1 << 20 or pat.size > P * M:
         return _nearest_steps(pat, dvec, P, res)
@@ -430,18 +468,35 @@ def _build_message_blocks(geom, torch):
     return blocks
 
 
+_PERIOD_PREFIX_CACHE: dict = {}
+
+
 def _period_prefixes(shape, levels, stride, block):
     """Periodic `known`-before-stage pattern for every stage, on one period tile
     (P=stride). Because each schedule mask is a per-axis residue condition mod a
     divisor of the anchor stride, the real `known` mask satisfies
     ``known[idx] == pat[idx % P]``; evaluating the schedule on a P-sized grid
-    yields that period tile with no boundary truncation."""
+    yields that period tile with no boundary truncation.
+
+    Cached on the *rank* rather than ``shape``: the tile is ``(stride,) * ndim``,
+    so two chunk shapes of the same rank share these patterns exactly. Grow mode
+    gives every chunk of a small grid its own shape (extent stride+1 on internal
+    high faces, stride on the domain face -> 2^ndim shapes), and each one used to
+    rebuild all the stage masks of a full period tile. Returned arrays are shared
+    and must be treated as read-only."""
+    key = (len(shape), levels, stride, block)
+    hit = _PERIOD_PREFIX_CACHE.get(key)
+    if hit is not None:
+        return hit
     P = stride
     tile = (P,) * len(shape)
     pats, cum = [], np.zeros(tile, bool)
     for mask in stage_masks(tile, levels, stride, block):
-        pats.append(cum.copy())  # known BEFORE this stage
+        pat = cum.copy()  # known BEFORE this stage
+        pat.flags.writeable = False  # shared across chunk shapes
+        pats.append(pat)
         cum |= mask
+    _PERIOD_PREFIX_CACHE[key] = pats
     return pats
 
 
