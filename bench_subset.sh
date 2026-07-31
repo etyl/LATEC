@@ -24,7 +24,11 @@ module purge
 module load pytorch-gpu
 
 export PYTHONUNBUFFERED=1          # flush progress to the SLURM .out live
-export DEEPSZ_M_TILE=$((32**4))    # M-tiling off for this explicitly sized chunk
+# M-tiling left at the codec default (65536). This used to force tiling off on
+# the grounds that no sub-stage exceeds a chunk-sized tile -- true before
+# same-weight axis sets were fused, after which the largest 4-D sub-stage is
+# ~6x a chunk's per-residue stage and drives GPU peak. Override with
+# DEEPSZ_M_TILE=... to sweep it.
 
 # GNN checkpoint (same one eval_tensor.sh uses; override with CKPT=...).
 CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260729-072714-1835b5/gnn_predictor.pt}

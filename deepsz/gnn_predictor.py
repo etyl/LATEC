@@ -57,12 +57,25 @@ CKPT_VERSION = 7
 
 # Query-tile for the message pass: caps the transient (B, L, m, K, d) buffers so
 # GPU peak scales with _M_TILE, not the stage's full M (line_pool is per-query,
-# so tiling is math-identical within a stream). Off by default: a fixed tile
-# shreds the whole-tensor path (a big 2D stage has M~150k -> ~150 tiny blocks,
-# ~2x slower/image) and is normally unnecessary with one chunk at a time and
-# fp16 buffers. Set DEEPSZ_M_TILE=1024 only when a large chunk is tight on VRAM.
-# Stored in meta so decode replays it.
-_M_TILE = int(os.environ.get("DEEPSZ_M_TILE", 1 << 30))  # effectively no tiling
+# so tiling is math-identical within a stream). Stored in meta so decode replays
+# the exact float path.
+#
+# The cost is launch count -- blocks = sum_stages ceil(M_s / tile), and the
+# message pass is launch-bound -- but peak memory saturates long before that
+# starts to bite, leaving a wide free band. Measured on a 32^4 4-D chunk (36
+# stages, largest M = 393216), single chunk, idle V100, best of 5:
+#
+#   tile      off   131072   65536   32768   16384    8192    4096    2048   1024
+#   blocks     36       39      44      59      90     143     277     539   1043
+#   time     1.00x    1.02x   1.00x   1.02x   1.05x   1.17x   1.47x   2.05x  3.20x
+#   peak MiB 6600     4574    3515    3404    3402    3402    3402    3402   3402
+#
+# 65536 is the knee: -47% peak for no measurable time. It is also the size a
+# sub-stage would have had before same-weight axis sets were fused into one
+# (chunk points / 2^ndim), so it splits a fused sub-stage back to the residency
+# the pre-fusion schedule had. Well clear of the small-tile cliff that would
+# shred the whole-tensor 2-D path, where a big stage is only a few blocks.
+_M_TILE = int(os.environ.get("DEEPSZ_M_TILE", 1 << 16))
 
 
 def _cuda_working_budget(torch, device, fraction: float = 0.8) -> int:
