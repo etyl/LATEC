@@ -740,7 +740,16 @@ def build_model(d: int = 32, agg_level: int = 2):
 
         def forward(self, e, eb):
             B, M, _ = e.shape
-            eb = torch.as_tensor(eb, dtype=e.dtype, device=e.device).reshape(-1)
+            # A python-float eb must NOT go through ``as_tensor``: that is a
+            # pageable host->device copy, which blocks until the stream drains.
+            # As the first op of every stage forward it caps CPU run-ahead in a
+            # launch-bound encode (measured: 0.04ms on an idle stream, 430ms
+            # behind queued work). ``full`` passes the value as a kernel
+            # argument instead -- same bits, no copy, no sync.
+            if isinstance(eb, (int, float)):
+                eb = torch.full((1,), float(eb), dtype=e.dtype, device=e.device)
+            else:
+                eb = torch.as_tensor(eb, dtype=e.dtype, device=e.device).reshape(-1)
             if eb.numel() == 1:
                 eb = eb.expand(B)
             elif eb.numel() != B:
