@@ -586,26 +586,30 @@ def _interp_axis_at_t(torch, W, coords, axis, s, shape, cubic, end_mode, ends):
     return out.index_copy_(1, eidx, near)
 
 
-def _interp_stage_pred_t(
-    torch, recon_t, sls, coords_t, stride, axes, center, *, cubic, end_mode, ends
-):
-    """Chunk-local interpolation from the causal device reconstruction.
+def _axis_preds_t(torch, W, coords_t, stride, axes, cubic, end_mode, ends):
+    """Per-axis interpolated value for every candidate axis, ``{a: (C, n) f64}``.
 
     ``axes`` is the sub-stage's candidate axis set (see ``levels.stage_plan``):
     a single axis for a weight-1 sub-stage, or the full range for a fused
-    weight >= 2 sub-stage whose points' actual odd axes vary per point. Each
-    point's own odd-axis membership is re-derived here from its coordinates
+    weight >= 2 sub-stage whose points' actual odd axes vary per point.
+    """
+    shape = tuple(W.shape[1:])
+    return {
+        a: _interp_axis_at_t(
+            torch, W, coords_t, a, stride, shape, cubic, end_mode, ends[a]
+        )
+        for a in axes
+    }
+
+
+def _combine_axis_preds(torch, preds, coords_t, stride, axes, center):
+    """Reduce per-axis predictions to one per point, following ``center``.
+
+    Each point's own odd-axis membership is re-derived here from its coordinates
     rather than assumed uniform across the stage. Combined with a plain
     sequential ``where`` walk (never ``argmax``/``max`` over a tie) so ties
     among several True axes resolve the same way every call -- required for
     the encoder and decoder to land on bit-identical gate candidates."""
-    W = recon_t[(slice(None), *sls)].double()
-    shape = tuple(W.shape[1:])
-
-    def axis_pred(a):
-        return _interp_axis_at_t(
-            torch, W, coords_t, a, stride, shape, cubic, end_mode, ends[a]
-        )
 
     def is_odd(a):
         return (coords_t[a] // stride % 2 == 1).unsqueeze(0)
@@ -613,38 +617,37 @@ def _interp_stage_pred_t(
     if center == 0 or len(axes) == 1:
         total = count = None
         for a in axes:
-            v = axis_pred(a)
             m = is_odd(a).double()
-            total = v * m if total is None else total + v * m
+            v = preds[a] * m
+            total = v if total is None else total + v
             count = m if count is None else count + m
         ip = total / count
     else:
         ip = None
         order = reversed(axes) if center == 1 else axes  # first-/last-wins
         for a in order:
-            v = axis_pred(a)
-            ip = v if ip is None else torch.where(is_odd(a), v, ip)
+            ip = preds[a] if ip is None else torch.where(is_odd(a), preds[a], ip)
     return ip.to(torch.float32)  # (C, n)
 
 
 def _gate_interps(torch, recon_t, sls, interp_dev, s, center, end_mode):
     """The three gate interp candidates for one stage: (cubic, first-axis linear,
     last-axis linear). Shared by encoder and decoder so both see identical
-    fallbacks; the caller selects among them by the stored/derived gate kind."""
+    fallbacks; the caller selects among them by the stored/derived gate kind.
+
+    The two linear candidates differ only in how per-axis predictions are
+    *combined* (first-wins vs last-wins), so the per-axis interpolation is done
+    once and reduced twice; likewise the float64 view of the chunk is taken once
+    for all three. Same arithmetic per candidate, a third fewer gathers."""
     coords_t, st_i, ax_i, ends_i = interp_dev[s]
-    ip_cubic = _interp_stage_pred_t(
-        torch, recon_t, sls, coords_t, st_i, ax_i, center, cubic=True,
-        end_mode=end_mode, ends=ends_i,
+    W = recon_t[(slice(None), *sls)].double()
+    cub = _axis_preds_t(torch, W, coords_t, st_i, ax_i, True, end_mode, ends_i)
+    lin = _axis_preds_t(torch, W, coords_t, st_i, ax_i, False, end_mode, ends_i)
+    return (
+        _combine_axis_preds(torch, cub, coords_t, st_i, ax_i, center),
+        _combine_axis_preds(torch, lin, coords_t, st_i, ax_i, 1),
+        _combine_axis_preds(torch, lin, coords_t, st_i, ax_i, 2),
     )
-    ip_linear = _interp_stage_pred_t(
-        torch, recon_t, sls, coords_t, st_i, ax_i, 1, cubic=False,
-        end_mode=end_mode, ends=ends_i,
-    )
-    ip_linear_last = _interp_stage_pred_t(
-        torch, recon_t, sls, coords_t, st_i, ax_i, 2, cubic=False,
-        end_mode=end_mode, ends=ends_i,
-    )
-    return ip_cubic, ip_linear, ip_linear_last
 
 
 def _laplace_bits_t(torch, absr, b, eb, radius):
@@ -676,6 +679,31 @@ def _laplace_bits_t(torch, absr, b, eb, radius):
     return torch.where(k >= radius, torch.full_like(regular, 56.0), regular)
 
 
+_GATE_CONST_CACHE: dict = {}
+
+
+def _gate_consts(torch, dev):
+    """Device copies of the gate's fixed tables: ``(T, shifts, 2**T, arange(nb))``.
+
+    These depend on nothing but the module constants, yet a per-stage
+    ``torch.tensor(..., device=cuda)`` is a *pageable* host->device copy that
+    blocks until the stream drains -- measured at ~2.4ms a call behind queued
+    work, which for two calls per stage was 11% of a 64^4 encode. Building them
+    once per device removes the copy from the critical path entirely.
+    """
+    c = _GATE_CONST_CACHE.get(dev)
+    if c is None:
+        GTf = torch.tensor(_GATE_T, dtype=torch.float64, device=dev)
+        c = (
+            GTf.to(torch.int64),
+            torch.tensor(_GATE_SHIFTS, dtype=torch.int64, device=dev),
+            torch.exp2(GTf),
+            torch.arange(_GATE_T.size + 1, device=dev),
+        )
+        _GATE_CONST_CACHE[dev] = c
+    return c
+
+
 def _gate_select_t(torch, r_g, r_is, b, eb, radius=1 << 15):
     """Choose the best (classical predictor, direction, T, shift) for one stage.
 
@@ -685,15 +713,13 @@ def _gate_select_t(torch, r_g, r_is, b, eb, radius=1 << 15):
     b >= eb*2^T). The selection is branch-free so it issues no host sync.
     """
     dev = b.device
-    GTf = torch.tensor(_GATE_T, dtype=torch.float64, device=dev)
-    GTi = GTf.to(torch.int64)
-    SHi = torch.tensor(_GATE_SHIFTS, dtype=torch.int64, device=dev)
+    GTi, SHi, GT2, buckets = _gate_consts(torch, dev)
     nb = _GATE_T.size + 1
-    bucket = torch.bucketize(b.double(), eb * torch.exp2(GTf))
+    bucket = torch.bucketize(b.double(), eb * GT2)
     # one-hot bucket membership: per-bucket sums via a plain (deterministic)
     # reduction, not bincount/scatter_add -- those use atomic float adds on CUDA
     # and would make the gate choice, and thus the stream, non-deterministic.
-    onehot = (bucket.unsqueeze(-1) == torch.arange(nb, device=dev)).double()  # (n, nb)
+    onehot = (bucket.unsqueeze(-1) == buckets).double()  # (n, nb)
 
     # Every candidate rate estimate (the ungated baseline, plus each classical
     # predictor at each shift) is evaluated in ONE batched pass. Scored one at
