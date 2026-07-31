@@ -108,17 +108,36 @@ def _nearest_steps(pat: np.ndarray, dvec, P: int, res=None) -> np.ndarray:
     line is periodic in t with period dividing P, so the nearest hit is the first
     within [1,P]. With ``res`` (a tuple of ndim residue arrays, len M), evaluated
     only at those M query residues -> O(P*M); without it, at every residue of the
-    P^ndim tile -> O(P^(ndim+1)). Query points are all we ever index, so pass res."""
+    P^ndim tile -> O(P^(ndim+1)). Query points are all we ever index, so pass res.
+
+    Resolved points are dropped from the sweep as they are hit, so the cost is
+    ``sum_t |still unresolved at t|`` rather than ``(largest t needed) * M``.
+    Most points hit at t = 1 or 2 and a handful need the full period, and one
+    laggard used to drag every other point through every remaining step. That
+    matters most for a *fused* sub-stage (``levels.stage_plan``), which mixes
+    points of several odd-axis combinations whose hit distances differ, so its
+    worst case applies to 2^ndim-ish times as many points as an unfused one."""
     if res is None:
         res = np.indices(pat.shape)  # every residue: (ndim, P, ...)
-    t0 = np.zeros(res[0].shape, np.int64)  # 0 == no hit yet
+    shape = res[0].shape
+    t0 = np.zeros(shape, np.int64).ravel()  # 0 == no hit yet
+    live = np.arange(t0.size)  # flat positions still unresolved
+    r = [np.ravel(res[k]) for k in range(pat.ndim)]
+    # The period is a stride, so it is a power of two: wrap with a mask rather
+    # than numpy's (much slower) signed remainder. Two's complement makes
+    # ``x & (P - 1)`` agree with ``x % P`` for negative x too.
+    wrap = (lambda x: x & (P - 1)) if P & (P - 1) == 0 else (lambda x: x % P)
     for t in range(1, P + 1):
-        r = tuple((res[k] + t * dvec[k]) % P for k in range(pat.ndim))
-        take = (t0 == 0) & pat[r]
-        t0[take] = t
-        if np.all(t0):
+        hit = pat[tuple(wrap(r[k] + t * dvec[k]) for k in range(pat.ndim))]
+        if not hit.any():
+            continue
+        t0[live[hit]] = t
+        keep = ~hit
+        live = live[keep]
+        if live.size == 0:
             break
-    return t0
+        r = [rk[keep] for rk in r]
+    return t0.reshape(shape)
 
 
 _NEAREST_TILE_CACHE: dict = {}
