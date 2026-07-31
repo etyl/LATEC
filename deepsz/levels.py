@@ -33,26 +33,22 @@ import itertools
 import numpy as np
 
 
-def _axis_mask(mask1d: np.ndarray, axis: int, ndim: int) -> np.ndarray:
-    """Broadcast a per-index 1-D selector along ``axis`` of an ndim grid."""
-    shape = [1] * ndim
-    shape[axis] = mask1d.shape[0]
-    return mask1d.reshape(shape)
+def _combo_slices(axes: tuple[int, ...], s: int, ndim: int) -> tuple[slice, ...]:
+    """Index tuple selecting the points that are midpoints (odd multiples of
+    ``s``) on exactly ``axes`` and on the coarse (``2s``) grid elsewhere.
 
-
-def _combo_mask(
-    coords: list[np.ndarray], axes: tuple[int, ...], s: int, shape: tuple[int, ...], ndim: int
-) -> np.ndarray:
-    """Points on the stride-``s`` lattice that are midpoints (odd multiples of
-    ``s``) on exactly ``axes`` and on the coarse (``2s``) grid elsewhere."""
-    mask = np.ones(shape, bool)
-    for j, cj in enumerate(coords):
-        if j in axes:
-            sel = ((cj % s) == 0) & ((cj % (2 * s)) != 0)
-        else:
-            sel = (cj % (2 * s)) == 0
-        mask &= _axis_mask(sel, j, ndim)
-    return mask
+    Both per-axis conditions are plain arithmetic progressions -- odd multiples
+    of ``s`` are ``s::2s``, multiples of ``2s`` are ``0::2s`` -- so the set is a
+    cross product of strided slices and can be written straight into a zeroed
+    mask. The equivalent broadcast form (``ones`` then one ``&=`` per axis)
+    touched the whole dense grid ``ndim + 1`` times per sub-stage, and the fused
+    weight >= 2 loop below built one such grid per axis set only to ``|=`` them
+    together; at rank 4 that was the most expensive host operation in a warm
+    encode."""
+    return tuple(
+        slice(s, None, 2 * s) if j in axes else slice(0, None, 2 * s)
+        for j in range(ndim)
+    )
 
 
 def stage_plan(
@@ -92,7 +88,6 @@ def stage_plan(
             f"{anchor_stride.bit_length() - 1} to densify to stride 1"
         )
 
-    coords = [np.arange(n) for n in shape]
     covered = np.zeros(shape, bool)
 
     anchor = np.zeros(shape, bool)
@@ -106,7 +101,9 @@ def stage_plan(
         # weight w = number of axes a point is a midpoint on; low -> high so a
         # point's ±s neighbours along its odd axes are already decoded.
         for axis in range(ndim):  # weight 1: kept separate, one sub-stage each
-            mask = _combo_mask(coords, (axis,), s, shape, ndim) & ~covered
+            mask = np.zeros(shape, bool)
+            mask[_combo_slices((axis,), s, ndim)] = True
+            mask &= ~covered
             if k == levels and ndim == 1:  # only sub-stage this level: absorbs remainder
                 mask |= ~covered
             plan.append((mask, s, (axis,)))
@@ -115,7 +112,7 @@ def stage_plan(
         for w in range(2, ndim + 1):  # weight >= 2: fuse same-weight axis sets
             mask = np.zeros(shape, bool)
             for axes in itertools.combinations(range(ndim), w):
-                mask |= _combo_mask(coords, axes, s, shape, ndim)
+                mask[_combo_slices(axes, s, ndim)] = True
             mask &= ~covered
             if k == levels and w == ndim:  # final sub-stage absorbs remainder
                 mask |= ~covered
