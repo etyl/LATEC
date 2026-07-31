@@ -315,7 +315,16 @@ class _StageGeom:
             return x.to(device) if device is not None else x
 
         self.query_idx = t(self.idx_np.astype(np.int64))
-        res = tuple((Q[:, k] % P) for k in range(ndim)) if self.M else None
+        # P is normally a stride, hence a power of two: mask instead of numpy's
+        # (much slower) remainder, as in `_nearest_steps`. Query coords are
+        # non-negative, so the two agree exactly.
+        mod = (lambda x: x & (P - 1)) if P & (P - 1) == 0 else (lambda x: x % P)
+        res = tuple(mod(Q[:, k]) for k in range(ndim)) if self.M else None
+        # Row-major strides of `shape`, so a neighbour's flat index is one dot
+        # product. Out-of-bounds rows produce garbage here, but `valid` masks
+        # them to 0 below -- which is why this can skip the clip that
+        # `ravel_multi_index` would otherwise require.
+        nstrides = np.cumprod((1,) + tuple(shape)[:0:-1])[::-1].astype(np.int64)
         line_data = {k: [] for k in ("ip", "in_", "dp", "dn", "vp", "vn")}
         cos, lognnz = [], []
         for d in half_directions(ndim, agg_level):
@@ -330,12 +339,13 @@ class _StageGeom:
                     pat, sd, P, res, query_only=query_only
                 )  # (M,) at query residues
                 nb = Q + step[:, None] * sd  # neighbour coords
-                inb = np.all((nb >= 0) & (nb < shp), axis=1)
-                valid = (
-                    (step >= 1) & (step <= limit) & inb
-                )  # legacy: in-bounds & <=limit
-                nbc = np.clip(nb, 0, shp - 1)
-                flat = np.ravel_multi_index([nbc[:, k] for k in range(ndim)], shape)
+                valid = (step >= 1) & (step <= limit)  # legacy: <=limit
+                for k in range(ndim):  # ... & in-bounds, axis by axis so the
+                    if sd[k] > 0:  # (M, ndim) bool temporaries never exist
+                        valid &= nb[:, k] < shp[k]
+                    elif sd[k] < 0:
+                        valid &= nb[:, k] >= 0
+                flat = nb @ nstrides  # garbage off-grid; masked to 0 just below
                 # legacy defaults where no neighbour: idx 0, dist 1.0 (finite, so
                 # log2 stays defined; the pool masks these lines out via `valid`).
                 ln["i" + side] = t(np.where(valid, flat, 0).astype(np.int64))
@@ -1273,11 +1283,16 @@ class _ChunkGeoms:
             if seen
             else np.zeros(0, np.int64)
         )
-        self.ref_halo_flat = ref[~np.isin(ref, self.interior_flat)].astype(np.int64)
-        self.ref_halo_coords = (
-            np.stack(np.unravel_index(self.ref_halo_flat, self.padded_shape), 1)
-            - stride
-        )
+        # "Not interior" is a box test on padded coords, not a set membership
+        # test: interior_flat holds every cell of the chunk, so `isin` against it
+        # sorts ~1M indices per shape and cost more than the rest of this
+        # constructor. Unravel `ref` once and reuse it for the coords below.
+        rc = np.stack(np.unravel_index(ref, self.padded_shape), 1) - stride
+        outside = np.zeros(len(ref), bool)
+        for k in range(ndim):
+            outside |= (rc[:, k] < 0) | (rc[:, k] >= self.chunk_shape[k])
+        self.ref_halo_flat = ref[outside].astype(np.int64)
+        self.ref_halo_coords = rc[outside]
 
 
 _CHUNK_GEOM_CACHE: dict = {}
