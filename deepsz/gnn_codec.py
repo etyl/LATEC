@@ -7,6 +7,7 @@ import json
 import os
 import struct
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -875,7 +876,7 @@ def _compress_chunked(
         f"{predictor.n_chunks} model passes"
     )
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
-    index_cache: dict = {}  # cshape -> device stage schedule (see _chunk_device_plan)
+    index_cache: OrderedDict = OrderedDict()  # bounded; see _cached_chunk_plan
     full_strides = np.cumprod((1,) + shape[:0:-1])[::-1].astype(np.int64)
     gates_t: list = [] if gate else None  # per stage-chunk gate byte, device scalars
     # Finest level = stride-1 sub-stages; with gate_fine one descriptor per chunk
@@ -889,15 +890,13 @@ def _compress_chunked(
             ids = [ci]
             cshape = tuple(sl.stop - sl.start for sl in predictor.chunk_slices(ids[0]))
             low_ax = predictor.low_axes(ids[0])
-            key = (cshape, low_ax)
-            if key not in index_cache:
-                index_cache[key] = _chunk_device_plan(
-                    torch, dev, cshape, shape, predictor.levels, stride, block, low_ax
-                )
             (
                 full_counts, counts, pos_dev, recon_off_dev, interp_dev,
                 pred_idx_dev, center, end_mode,
-            ) = index_cache[key]
+            ) = _cached_chunk_plan(
+                index_cache, torch, dev, cshape, shape, predictor.levels,
+                stride, block, low_ax,
+            )
             fine_desc = None  # (kind, dir, T, shift) chosen once per chunk (gate_fine)
             # The chunk value block is uploaded once, not once per stage.
             vblocks = [
@@ -1130,6 +1129,59 @@ def _chunk_device_plan(
     )
 
 
+# Chunk plans are keyed by (chunk shape, low_axes), and in grow mode each axis is
+# independently first / middle / last, so the key space is 3 ** ndim -- 81 at rank
+# 4. Caching all of them defeats the point of chunking: device memory climbs with
+# every newly seen combination instead of staying bounded, reaching ~4.7 GB of
+# plans by the last chunk of a 128^4 encode.
+#
+# The budget is in *bytes*, not entries, because a plan is chunk-sized: a fixed
+# entry count would be far too much memory for large chunks and needless eviction
+# for small ones (at 64^4 there are only 16 chunks, so any cap below 16 pays
+# rebuilds for reuse it was going to get anyway). Raster order varies the last axis
+# fastest, so the live working set is the 3 ** 2 = 9 combinations of the two
+# fastest axes, and a budget that holds ~17 of the 58.5 MiB rank-4 plans keeps
+# essentially all the reuse while bounding the cache an order of magnitude below
+# the unbounded 81.
+_PLAN_CACHE_MIB = float(os.environ.get("DEEPSZ_PLAN_CACHE_MIB", 1024))
+
+
+def _plan_device_bytes(obj, seen=None):
+    """Device bytes held by one cached plan (tensors nested in its lists/dicts)."""
+    seen = set() if seen is None else seen
+    if id(obj) in seen:
+        return 0
+    seen.add(id(obj))
+    if hasattr(obj, "element_size") and hasattr(obj, "nelement"):
+        return obj.element_size() * obj.nelement() if obj.is_cuda else 0
+    if isinstance(obj, dict):
+        return sum(_plan_device_bytes(v, seen) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(_plan_device_bytes(v, seen) for v in obj)
+    return 0
+
+
+def _cached_chunk_plan(cache, torch, dev, cshape, shape, levels, stride, block, low_ax):
+    """``_chunk_device_plan`` behind a byte-budgeted LRU, shared by encode/decode.
+
+    Eviction is safe against the in-flight plan: the entry just used is moved to
+    the most-recent end before anything is dropped, so the victim is never the one
+    the caller is about to read. One entry is always kept, whatever the budget."""
+    key = (cshape, low_ax)
+    hit = cache.get(key)
+    if hit is not None:
+        cache.move_to_end(key)
+        return hit[0]
+    plan = _chunk_device_plan(torch, dev, cshape, shape, levels, stride, block, low_ax)
+    cache[key] = (plan, _plan_device_bytes(plan))
+    budget = _PLAN_CACHE_MIB * 2**20
+    total = sum(nbytes for _, nbytes in cache.values())
+    while len(cache) > 1 and total > budget:
+        _, (_, dropped) = cache.popitem(last=False)
+        total -= dropped
+    return plan
+
+
 def _decompress_chunked(
     payload: bytes,
     shape: tuple[int, ...],
@@ -1168,7 +1220,7 @@ def _decompress_chunked(
     waves = [list(range(predictor.n_chunks))]  # raster order, mirrors encode
     _log(f"decode: anchors done, {predictor.n_chunks} chunks/model passes")
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
-    index_cache: dict = {}  # cshape -> device stage schedule (see _chunk_device_plan)
+    index_cache: OrderedDict = OrderedDict()  # bounded; see _cached_chunk_plan
     full_strides = np.cumprod((1,) + shape[:0:-1])[::-1].astype(np.int64)
     recon_flat = recon_t.reshape(c, -1)
     # Mirror the encoder's adaptive finest gate: one descriptor per chunk covering
@@ -1182,15 +1234,13 @@ def _decompress_chunked(
             ids = [ci]
             cshape = tuple(sl.stop - sl.start for sl in predictor.chunk_slices(ids[0]))
             low_ax = predictor.low_axes(ids[0])
-            key = (cshape, low_ax)
-            if key not in index_cache:
-                index_cache[key] = _chunk_device_plan(
-                    torch, dev, cshape, shape, predictor.levels, stride, block, low_ax
-                )
             (
                 full_counts, counts, _, recon_off_dev, interp_dev,
                 pred_idx_dev, center, end_mode,
-            ) = index_cache[key]
+            ) = _cached_chunk_plan(
+                index_cache, torch, dev, cshape, shape, predictor.levels,
+                stride, block, low_ax,
+            )
             fine_desc = None  # (kind, dir, T, shift) read once per chunk (gate_fine)
             origin_bases = [
                 int(
