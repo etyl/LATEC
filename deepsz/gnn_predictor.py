@@ -1228,12 +1228,12 @@ class _ChunkGeoms:
 
         masks = stage_masks(self.chunk_shape, levels, stride, block)
         pats = _period_prefixes(self.chunk_shape, levels, stride, block)
-        self.geoms, self.coords = [], []  # per stage; None for empty stages
+        self.geoms = []  # per stage; None for empty stages
+        self._offsets: dict = {}  # tensor strides -> per-stage flat offsets
         for s, mask in enumerate(masks):
             Q = np.stack(np.nonzero(mask), axis=1)  # chunk-frame coords
             if not len(Q):
                 self.geoms.append(None)
-                self.coords.append(None)
                 if progress is not None:
                     progress(1)
                 continue
@@ -1250,7 +1250,6 @@ class _ChunkGeoms:
                     precompute_messages=False,
                 )
             )
-            self.coords.append(Q)
             if progress is not None:
                 progress(1)
         # prediction chain: stage 0 is always the base (anchors, possibly empty
@@ -1293,6 +1292,38 @@ class _ChunkGeoms:
             outside |= (rc[:, k] < 0) | (rc[:, k] >= self.chunk_shape[k])
         self.ref_halo_flat = ref[outside].astype(np.int64)
         self.ref_halo_coords = rc[outside]
+
+    def stage_offsets(self, strides):
+        """Per-stage flat offsets of a stage's points from the chunk origin, in
+        the *full tensor's* index space (``None`` for empty stages).
+
+        Adding a chunk's origin-flat gives the recon rows the stage reads, which
+        is the only thing the chunk-frame coordinates were ever used for. Keeping
+        the coordinates themselves would cost ``ndim`` int64 columns per point
+        for every cached chunk shape -- two thirds of this object -- so they are
+        recovered on demand from the stage's padded-flat query index and the
+        result is memoized per stride vector (one vector per encode)."""
+        key = tuple(int(s) for s in strides)
+        off = self._offsets.get(key)
+        if off is None:
+            pst = np.cumprod((1,) + self.padded_shape[:0:-1])[::-1].astype(np.int64)
+            off = []
+            for g in self.geoms:
+                if g is None:
+                    off.append(None)
+                    continue
+                # Unravel and re-ravel in one sweep, axis by axis, so the (M, ndim)
+                # coordinate block never exists -- it would be as large as the
+                # array this method exists to avoid storing.
+                rem = g.idx_np.astype(np.int64, copy=True)
+                o = np.zeros(len(rem), np.int64)
+                for k in range(self.ndim):
+                    ck = rem // pst[k]
+                    rem -= ck * pst[k]
+                    o += (ck - self.halo) * key[k]
+                off.append(o)
+            self._offsets[key] = off
+        return off
 
 
 _CHUNK_GEOM_CACHE: dict = {}
@@ -1655,11 +1686,9 @@ class ChunkedGNNPredictor:
         obase = origins @ strides  # (B,)
         self._wave_gidx = [
             None
-            if c is None
-            else torch.from_numpy((c @ strides)[None, :] + obase[:, None]).to(
-                self.device
-            )
-            for c in cg.coords
+            if off is None
+            else torch.from_numpy(off[None, :] + obase[:, None]).to(self.device)
+            for off in cg.stage_offsets(strides)
         ]  # (B, M) long
         self._cg = cg
         self._wave_ids = list(chunk_ids)

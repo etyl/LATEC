@@ -505,15 +505,13 @@ def run_chunked_scene(
             gflat_t = torch.from_numpy(frame.h_gflat).to(device)
             halo = value_halo_embed(model, known_vals[:, gflat_t], ndim)
             E = torch.cat([E[:, : frame.halo_rows.start], halo], dim=1)
+        # ravel(c + o) = c @ strides + o @ strides for in-bounds coords, and the
+        # per-stage `c @ strides` is cached on the chunk geometry (stage_offsets).
+        strides = np.cumprod((1,) + tuple(shape)[:0:-1])[::-1].astype(np.int64)
+        obase = int(np.asarray(origins[ci], np.int64) @ strides)
         gidx = [
-            None
-            if c is None
-            else torch.from_numpy(
-                np.ravel_multi_index(
-                    [(c[:, k] + origins[ci][k]) for k in range(ndim)], shape
-                )
-            ).to(device)
-            for c in cg.coords
+            None if off is None else torch.from_numpy(off + obase).to(device)
+            for off in cg.stage_offsets(strides)
         ]
         n1, np1, a1 = _run_chunk(
             model, cg, frame.geoms, E, known_vals, x, gidx, eb, device, reveal

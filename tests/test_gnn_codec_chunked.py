@@ -31,7 +31,7 @@ from deepsz.gnn_predictor import (
     build_model,
     chunk_halo_info,
 )
-from deepsz.levels import stage_plan
+from deepsz.levels import stage_masks, stage_plan
 
 STRIDE = 4
 LEVELS = 2
@@ -754,3 +754,40 @@ def test_out_of_tensor_halo_never_usable():
     out = np.any((gc < 0) | (gc >= np.array(shape)), axis=1)
     out_flat = cg.ref_halo_flat[out]
     assert not np.isin(out_flat, present).any()
+
+
+@pytest.mark.parametrize(
+    "edges, shape",
+    [((16, 16), (32, 16)), ((9, 8, 8), (18, 16, 16)), ((5, 5, 4, 4), (10, 10, 8, 8))],
+)
+def test_stage_offsets_match_ravel_multi_index(edges, shape):
+    """``stage_offsets`` replaces per-stage chunk coordinates, which the wave
+    loop only ever used to address the full tensor. It must reproduce
+    ``ravel_multi_index(coords + origin)`` exactly, for every chunk origin and
+    at every rank -- an off-by-one here would silently read the wrong recon
+    cells rather than fail loudly."""
+    stride, levels = 4, 2
+    cg = build_chunk_geoms(edges, levels, stride, 1, torch, None)
+    strides = np.cumprod((1,) + tuple(shape)[:0:-1])[::-1].astype(np.int64)
+    offsets = cg.stage_offsets(strides)
+    assert len(offsets) == len(cg.geoms)
+    masks = stage_masks(edges, levels, stride, 1)
+    origin = tuple(n - e for n, e in zip(shape, edges))  # far chunk on every axis
+    for g, off, mask in zip(cg.geoms, offsets, masks):
+        if g is None:
+            assert off is None
+            continue
+        coords = np.stack(np.nonzero(mask), axis=1)
+        expect = np.ravel_multi_index(
+            [coords[:, k] + origin[k] for k in range(len(shape))], shape
+        )
+        assert np.array_equal(off + int(np.asarray(origin) @ strides), expect)
+
+
+def test_stage_offsets_are_memoized_per_strides():
+    """One vector of tensor strides per encode, so the derivation runs once."""
+    cg = build_chunk_geoms((8, 8), 2, 4, 1, torch, None)
+    s1 = np.array([8, 1], np.int64)
+    first = cg.stage_offsets(s1)
+    assert cg.stage_offsets(np.array([8, 1], np.int64)) is first
+    assert cg.stage_offsets(np.array([16, 1], np.int64)) is not first
