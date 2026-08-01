@@ -681,7 +681,8 @@ def test_halo_links_activate_when_neighbour_coded():
         total = 0
         for s in cg.chain[1:]:  # refinement stages only
             g = frame.geoms[s]
-            for ip, v in ((g.ip, g.vp), (g.in_, g.vn)):
+            gip, gin, _, _, gvp, gvn = g.lines(0, g.M)
+            for ip, v in ((gip, gvp), (gin, gvn)):
                 in_halo = ip > frame.n_interior
                 total += int((v & in_halo).sum())
         return total
@@ -720,11 +721,12 @@ def test_compact_geometry_precomputes_message_selections(monkeypatch):
     assert cg.geoms[stage].message_blocks is None
 
     block = geom.message_blocks[0]
-    valid = geom.vp | geom.vn
+    g_ip, _, _, _, g_vp, g_vn = geom.lines(0, geom.M)
+    valid = g_vp | g_vn
     live = valid.reshape(-1).nonzero(as_tuple=True)[0]
     np.testing.assert_array_equal(block.valid.numpy(), valid.numpy())
     np.testing.assert_array_equal(block.live_idx.numpy(), live.numpy())
-    np.testing.assert_array_equal(block.ip.numpy(), geom.ip.reshape(-1)[live].numpy())
+    np.testing.assert_array_equal(block.ip.numpy(), g_ip.reshape(-1)[live].numpy())
 
     def unexpected(*args, **kwargs):
         raise AssertionError("embed recomputed static geometry metadata")

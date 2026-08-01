@@ -263,17 +263,44 @@ def _line_static(dvec, torch, device=None):
     return vec / torch.sqrt(nnz), 0.5 * torch.log2(nnz)
 
 
+def _slice_lines(self, m0, m1):
+    """``(ip, in_, dp, dn, vp, vn)`` for queries ``[m0:m1]``, sliced from stored
+    tensors.
+
+    The geometries that use this hold their flat neighbour indices outright,
+    because theirs are not of the form ``query_idx + step * (d . strides)``:
+    ``_LegacyGeom`` reads an arbitrary ``known`` mask rather than a periodic
+    pattern, and ``_CompactGeom`` has pushed its indices through a remap. Both
+    are built per grid or per chunk instead of being cached per chunk *shape*,
+    so there is no ``2 ** ndim`` multiplier to amortise either."""
+    return (
+        self.ip[:, m0:m1],
+        self.in_[:, m0:m1],
+        self.dp[:, m0:m1],
+        self.dn[:, m0:m1],
+        self.vp[:, m0:m1],
+        self.vn[:, m0:m1],
+    )
+
+
 class _StageGeom:
     """Neighbour geometry for one stage: the fixed set of ``M`` query points and,
-    per half-direction, the +/- side neighbour's flat index / step distance /
-    validity as torch tensors of length M. Query points only — no full-grid
-    tensors — so memory scales with the stage, not the image."""
+    per half-direction, the +/- side neighbour's *step distance* and validity as
+    torch tensors of length M. Query points only — no full-grid tensors — so
+    memory scales with the stage, not the image.
+
+    The flat neighbour index is **derived, not stored** (see ``lines``). Since a
+    neighbour sits at ``Q + step * d``, its flat index is
+    ``ravel(Q) + step * (d . strides)`` -- one small integer per line-end, not a
+    64-bit index and a 32-bit distance. The stored form is ~3.5x smaller, which
+    matters because a grow-mode encode caches one of these per *chunk shape* and
+    there are ``2 ** ndim`` distinct shapes: at rank 4 the flat-index form put
+    ~2 GB of device memory behind a cache that only ever holds 16 entries."""
 
     __slots__ = (
-        "ip",
-        "in_",
-        "dp",
-        "dn",
+        "sp",
+        "sn",
+        "off",
         "vp",
         "vn",
         "cos",
@@ -325,14 +352,16 @@ class _StageGeom:
         # them to 0 below -- which is why this can skip the clip that
         # `ravel_multi_index` would otherwise require.
         nstrides = np.cumprod((1,) + tuple(shape)[:0:-1])[::-1].astype(np.int64)
-        line_data = {k: [] for k in ("ip", "in_", "dp", "dn", "vp", "vn")}
-        cos, lognnz = [], []
+        # Steps are bounded by `limit`, so they fit a 16-bit slot in every real
+        # configuration; widen rather than silently wrap if that ever changes.
+        sdt = np.int16 if limit < 2**15 else np.int32
+        line_data = {k: [] for k in ("sp", "sn", "vp", "vn")}
+        offs, cos, lognnz = [], [], []
         for d in half_directions(ndim, agg_level):
             ln = {}
             for side, sd in (("p", np.asarray(d)), ("n", -np.asarray(d))):
                 if not self.M:
-                    ln["i" + side] = t(np.zeros(0, np.int64))
-                    ln["d" + side] = t(np.zeros(0, np.float32))
+                    ln["s" + side] = t(np.zeros(0, sdt))
                     ln["v" + side] = t(np.zeros(0, bool))
                     continue
                 step = _nearest_steps_at(
@@ -345,27 +374,52 @@ class _StageGeom:
                         valid &= nb[:, k] < shp[k]
                     elif sd[k] < 0:
                         valid &= nb[:, k] >= 0
-                flat = nb @ nstrides  # garbage off-grid; masked to 0 just below
-                # legacy defaults where no neighbour: idx 0, dist 1.0 (finite, so
-                # log2 stays defined; the pool masks these lines out via `valid`).
-                ln["i" + side] = t(np.where(valid, flat, 0).astype(np.int64))
-                ln["d" + side] = t(np.where(valid, step, 1).astype(np.float32))
+                # Only the step survives; `lines` rebuilds the index and the
+                # distance from it, including the legacy where-invalid defaults.
+                ln["s" + side] = t(np.where(valid, step, 0).astype(sdt))
                 ln["v" + side] = t(valid)
-            line_data["ip"].append(ln["ip"])
-            line_data["in_"].append(ln["in"])
-            line_data["dp"].append(ln["dp"])
-            line_data["dn"].append(ln["dn"])
+            line_data["sp"].append(ln["sp"])
+            line_data["sn"].append(ln["sn"])
             line_data["vp"].append(ln["vp"])
             line_data["vn"].append(ln["vn"])
+            # Flat-index displacement of one step along +d; the -d side is -off.
+            offs.append(int(np.asarray(d) @ nstrides))
             c, ld = _line_static(d, torch, device)
             cos.append(c)
             lognnz.append(ld)
         for name, values in line_data.items():
             setattr(self, name, torch.stack(values, dim=0))
+        self.off = t(np.asarray(offs, np.int64))
         self.cos = torch.stack(cos, dim=0)
         self.lognnz = torch.stack(lognnz, dim=0).unsqueeze(1)
         self.message_blocks = (
             _build_message_blocks(self, torch) if precompute_messages else None
+        )
+
+    def lines(self, m0, m1):
+        """``(ip, in_, dp, dn, vp, vn)`` for queries ``[m0:m1]``, rebuilt from the
+        stored steps.
+
+        Reproduces the legacy stored form exactly, defaults included: flat index
+        0 and distance 1.0 where a side has no neighbour (1.0 keeps ``log2``
+        finite; the pool masks those lines out via ``vp``/``vn`` anyway). Called
+        once per query tile per stage, on a tile-sized slice, so the wide int64
+        index tensor exists only for the tile being consumed."""
+        q = self.query_idx[m0:m1].unsqueeze(0)  # (1, m)
+        vp, vn = self.vp[:, m0:m1], self.vn[:, m0:m1]
+        sp, sn = self.sp[:, m0:m1].long(), self.sn[:, m0:m1].long()
+        off = self.off.unsqueeze(1)  # (L, 1)
+        # Invalid line-ends were stored as step 0, which makes both defaults fall
+        # out arithmetically: masking by validity gives index 0, and clamping the
+        # step up to 1 gives distance 1.0. Tensor methods only -- ``torch`` is
+        # imported lazily in this module and is not in scope here.
+        return (
+            (q + sp * off) * vp,
+            (q - sn * off) * vn,
+            sp.clamp(min=1).to(self.cos.dtype),
+            sn.clamp(min=1).to(self.cos.dtype),
+            vp,
+            vn,
         )
 
 
@@ -428,6 +482,8 @@ class _LegacyGeom:
         self.lognnz = torch.stack(lognnz, dim=0).unsqueeze(1)
         self.message_blocks = _build_message_blocks(self, torch)
 
+    lines = _slice_lines
+
 
 class _MessageBlock:
     """Static selections for one tiled block of a geometry's message pass."""
@@ -459,12 +515,7 @@ def _build_message_blocks(geom, torch):
     blocks = []
     for m0 in range(0, geom.M, _M_TILE):
         m1 = min(m0 + _M_TILE, geom.M)
-        ip = geom.ip[:, m0:m1]
-        in_ = geom.in_[:, m0:m1]
-        dp = geom.dp[:, m0:m1]
-        dn = geom.dn[:, m0:m1]
-        vp = geom.vp[:, m0:m1]
-        vn = geom.vn[:, m0:m1]
+        ip, in_, dp, dn, vp, vn = geom.lines(m0, m1)
         L, M = vp.shape
         valid = vp | vn
         live_idx = valid.reshape(-1).nonzero(as_tuple=True)[0]
@@ -1275,8 +1326,9 @@ class _ChunkGeoms:
         for g in self.geoms:
             if g is None:
                 continue
-            seen.append(g.ip[g.vp])
-            seen.append(g.in_[g.vn])
+            ip, in_, _, _, vp, vn = g.lines(0, g.M)
+            seen.append(ip[vp])
+            seen.append(in_[vn])
         ref = (
             torch.unique(torch.cat(seen)).cpu().numpy()
             if seen
@@ -1399,17 +1451,34 @@ class _CompactGeom:
     does, halo only when that cell is decoded and referenced. Shares every other
     tensor with the base geometry."""
 
-    __slots__ = _StageGeom.__slots__
+    __slots__ = (
+        "ip",
+        "in_",
+        "dp",
+        "dn",
+        "vp",
+        "vn",
+        "cos",
+        "lognnz",
+        "query_idx",
+        "idx_np",
+        "M",
+        "ndim",
+        "message_blocks",
+    )
 
     def __init__(self, base, remap, torch):
-        for name in ("dp", "dn", "cos", "lognnz", "idx_np", "M", "ndim"):
+        for name in ("cos", "lognnz", "idx_np", "M", "ndim"):
             setattr(self, name, getattr(base, name))
-        self.ip = remap(base.ip)
-        self.in_ = remap(base.in_)
+        ip, in_, self.dp, self.dn, vp, vn = base.lines(0, base.M)
+        self.ip = remap(ip)
+        self.in_ = remap(in_)
         self.query_idx = remap(base.query_idx)
-        self.vp = base.vp & (self.ip != 0)
-        self.vn = base.vn & (self.in_ != 0)
+        self.vp = vp & (self.ip != 0)
+        self.vn = vn & (self.in_ != 0)
         self.message_blocks = _build_message_blocks(self, torch)
+
+    lines = _slice_lines
 
 
 class _CompactFrame:

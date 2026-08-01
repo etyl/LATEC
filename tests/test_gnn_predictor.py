@@ -40,11 +40,11 @@ def test_geometry_matches_scan(shape, levels, stride, block, max_radius):
             qidx = np.ravel_multi_index(np.nonzero(mask), shape)
             ref = _LegacyGeom(cum, max_radius, torch, query_idx=qidx)
             assert np.array_equal(g.query_idx.numpy(), qidx)
-            for k in ("ip", "in_", "dp", "dn", "vp", "vn"):
-                assert np.array_equal(getattr(g, k).numpy(), getattr(ref, k).numpy()), (
-                    k,
-                    gi,
-                )
+            # `_StageGeom` stores steps and rebuilds (idx, dist) in `lines`; the
+            # comparison is against the values, so it covers the derivation too.
+            got, want = g.lines(0, g.M), ref.lines(0, ref.M)
+            for k, a, b in zip(("ip", "in_", "dp", "dn", "vp", "vn"), got, want):
+                assert np.array_equal(a.numpy(), b.numpy()), (k, gi)
             dirs = np.asarray(half_directions(len(shape)), np.float32)
             nnz = np.count_nonzero(dirs, axis=1).astype(np.float32)
             expected_cos = dirs / np.sqrt(nnz)[:, None]
