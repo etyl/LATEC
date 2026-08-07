@@ -1,4 +1,4 @@
-"""DeepSZ container format.
+"""LATEC container format.
 
 File = a fixed little-endian header, the spatial shape, and one zstd frame.
 
@@ -21,7 +21,7 @@ from dataclasses import dataclass
 import numpy as np
 import zstandard
 
-MAGIC = b"DEEPSZ01"
+MAGIC = b"LATEC001"
 VERSION = 3
 
 
@@ -118,7 +118,7 @@ class Header:
             eb_ratio,
         ) = struct.unpack_from(_HEADER_FMT, buf, 0)
         if magic != MAGIC:
-            raise ValueError(f"not a DeepSZ stream (bad magic {magic!r})")
+            raise ValueError(f"not a LATEC stream (bad magic {magic!r})")
         if version != VERSION:
             raise ValueError(f"unsupported version {version}")
         (ndim,) = struct.unpack_from("<B", buf, _HEADER_SIZE)

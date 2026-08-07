@@ -3,10 +3,10 @@
 import numpy as np
 import pytest
 
-from deepsz.bitstream import END_MODE_SHIFT
-from deepsz.codec import compress, decompress
-from deepsz.levels import stage_plan
-from deepsz.predictor import (
+from latec.bitstream import END_MODE_SHIFT
+from latec.codec import compress, decompress
+from latec.levels import stage_plan
+from latec.predictor import (
     END_EXTRAP,
     END_MODE_MAX,
     END_QUAD,
@@ -140,7 +140,7 @@ def test_end_mode_roundtrips_through_flags_and_holds_bound():
     for end_mode in END_MODES:
         pred = InterpPredictor("cubic", end_mode=end_mode, **kw)
         stream, stats = compress(img, eb, pred, eb_ratio=0.9, **kw)
-        from deepsz.bitstream import read_stream
+        from latec.bitstream import read_stream
 
         header, _ = read_stream(stream)
         assert (header.flags >> END_MODE_SHIFT) & END_MODE_MAX == end_mode

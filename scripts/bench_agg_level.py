@@ -47,8 +47,8 @@ def _ensure_rans_backend():
 
         return "constriction"
     except ImportError:
-        import deepsz.bitstream as bitstream
-        import deepsz.rans as rans
+        import latec.bitstream as bitstream
+        import latec.rans as rans
 
         def fake_encode(codes, levels64, tables):
             return np.asarray(codes, np.uint32).ravel().astype("<u4").tobytes()
@@ -80,7 +80,7 @@ def closed_loop_ms(values, predictor, masks, ebs, radius, device):
     GNN predict calls only (stage 0 anchors are coded directly, not predicted)."""
     import torch
 
-    from deepsz.quantizer import dequantize, quantize
+    from latec.quantizer import dequantize, quantize
 
     def sync():
         if torch.device(device).type == "cuda":
@@ -137,7 +137,7 @@ def parse_args(argv=None):
         type=int,
         default=16384,
         help="cap the per-stage query tile so the whole-tensor path "
-        "fits in RAM (set before importing deepsz)",
+        "fits in RAM (set before importing latec)",
     )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
@@ -152,18 +152,18 @@ def main(argv=None):
     args = parse_args(argv)
     # _M_TILE is read from the environment at import time; set it first so the
     # whole-tensor path tiles the (B, L, M, K, d) message buffers into RAM.
-    os.environ["DEEPSZ_M_TILE"] = str(args.m_tile)
+    os.environ["LATEC_M_TILE"] = str(args.m_tile)
 
     backend = _ensure_rans_backend()
     import torch
 
-    from deepsz.gnn_predictor import (
+    from latec.gnn_predictor import (
         CKPT_VERSION,
         GNNPredictor,
         build_model,
         half_directions,
     )
-    from deepsz.levels import stage_ebs, stage_masks
+    from latec.levels import stage_ebs, stage_masks
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     shape = tuple(args.shape)
@@ -285,7 +285,7 @@ def main(argv=None):
     # the error bound. Encoder and decoder load agg_level from the checkpoint,
     # so the reconstruction must satisfy |x - recon| <= eb at every level.
     print("\nCodec roundtrip error-bound check (whole-tensor path):")
-    from deepsz.gnn_codec import GNNCompressorCodec
+    from latec.gnn_codec import GNNCompressorCodec
 
     # GNNCompressorCodec normalizes internally and treats error_bound as
     # relative to (max - min); convert args.eb (absolute, used in the PASS/FAIL

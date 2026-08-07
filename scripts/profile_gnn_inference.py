@@ -21,10 +21,10 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from deepsz.codec import compress, decompress
-from deepsz.gnn_predictor import GNNPredictor
-from deepsz.levels import stage_ebs, stage_masks
-from deepsz.quantizer import dequantize, quantize
+from latec.codec import compress, decompress
+from latec.gnn_predictor import GNNPredictor
+from latec.levels import stage_ebs, stage_masks
+from latec.quantizer import dequantize, quantize
 
 
 def parse_args(argv=None):

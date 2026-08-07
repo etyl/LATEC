@@ -1,4 +1,4 @@
-"""Progressive stage schedule for the DeepSZ closed loop.
+"""Progressive stage schedule for the LATEC closed loop.
 
 Stage 0 (anchors): ``anchor_block^ndim`` pixel blocks whose corners lie on the
 ``anchor_stride`` grid — coded by direct quantization. Each dyadic level

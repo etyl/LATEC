@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from deepsz.rans import (
+from latec.rans import (
     N_SHAPES,
     SHAPES,
     build_laplace_tables,
@@ -205,7 +205,7 @@ def test_selected_shape_never_costs_more_than_laplace():
 
 def test_quantize_pmf_rows_matches_the_scalar_path():
     """The batched quantizer is a pure speedup, not a different table."""
-    from deepsz.rans import _quantize_pmf, _quantize_pmf_rows
+    from latec.rans import _quantize_pmf, _quantize_pmf_rows
 
     rng = np.random.RandomState(6)
     total = 1 << 20
@@ -223,7 +223,7 @@ def test_model_cache_respects_its_byte_budget():
     One field can want a dozen shapes at the widest window, which is ~160 MB of
     tables on its own, so the cache is bounded by bytes rather than entries.
     """
-    from deepsz import rans
+    from latec import rans
 
     rans._clear_model_cache()
     budget = rans._MODEL_BUDGET_BYTES
@@ -247,7 +247,7 @@ def test_wide_windows_offer_only_the_cheap_entries():
     Every entry must still decode at a wide window even though the encoder will
     not select it, so an id restriction can never make a stream unreadable.
     """
-    from deepsz.rans import _WIDE_KEXP, _shape_ids
+    from latec.rans import _WIDE_KEXP, _shape_ids
 
     assert _shape_ids(_WIDE_KEXP - 1) == tuple(range(N_SHAPES))
     wide = _shape_ids(_WIDE_KEXP)

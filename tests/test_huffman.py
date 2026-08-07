@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from deepsz.huffman import huffman_decode, huffman_encode
+from latec.huffman import huffman_decode, huffman_encode
 
 
 @pytest.mark.parametrize(

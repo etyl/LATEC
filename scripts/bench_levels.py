@@ -45,7 +45,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from deepsz.quantizer import _recon_from_codes
+from latec.quantizer import _recon_from_codes
 
 CKPT = os.environ.get("CKPT", "checkpoints/d64.pt")
 EB = float(os.environ.get("EB", "1e-4"))
@@ -102,7 +102,7 @@ def load_field():
 
 
 def analytic_pts(n):
-    from deepsz.levels import point_levels
+    from latec.levels import point_levels
 
     c = np.indices((n,) * NDIM)
     lv = point_levels([c[i] for i in range(NDIM)], LEVELS, STRIDE, BLOCK)
@@ -130,7 +130,7 @@ class LevelStats:
         e = round(float(eb), 15)
         s = np.asarray(scale, dtype=np.float64).ravel()
         self.nsc[e] += s.size
-        from deepsz.rans import SCALE_HI_MULT, SCALE_LO_DIV
+        from latec.rans import SCALE_HI_MULT, SCALE_LO_DIV
 
         self.sat_hi[e] += int((s >= SCALE_HI_MULT * float(eb) * 0.999).sum())
         self.sat_lo[e] += int((s <= float(eb) / SCALE_LO_DIV * 1.001).sum())
@@ -187,8 +187,8 @@ class LevelStats:
 
 def hook_all(stats):
     """Wrap `quantize` in every module that owns a reference, restore on exit."""
-    import deepsz.codec as cc
-    import deepsz.gnn_codec as gc
+    import latec.codec as cc
+    import latec.gnn_codec as gc
 
     mods = [cc, gc]
     saved = []
@@ -231,7 +231,7 @@ def _laplace_bits(absr, b, eb):
     grid), capped at 32 bits = the codec's raw-f32 outlier escape.
     ponytail: ignores the 64-level scale-grid rounding and rANS overhead; use
     it to compare columns within the what-if, not against the real stream."""
-    from deepsz.rans import SCALE_HI_MULT, SCALE_LO_DIV
+    from latec.rans import SCALE_HI_MULT, SCALE_LO_DIV
 
     b = np.clip(b.astype(np.float64), eb / SCALE_LO_DIV, eb * SCALE_HI_MULT)
     k = np.rint(np.abs(absr).astype(np.float64) / (2 * eb))
@@ -267,14 +267,14 @@ class WhatIfGate:
         self._plans = {}
 
     def grab(self, pr, s, recon, eb, pred, scale):
-        from deepsz.gnn_codec import _GATE_END_MODE
-        from deepsz.predictor import _interp_axis_at, default_interp_center
+        from latec.gnn_codec import _GATE_END_MODE
+        from latec.predictor import _interp_axis_at, default_interp_center
 
         for bi, ci in enumerate(pr._wave_ids):
             sls = tuple(pr.chunk_slices(ci))
             cshape = tuple(sl.stop - sl.start for sl in sls)
             if cshape not in self._plans:
-                from deepsz.levels import stage_plan
+                from latec.levels import stage_plan
 
                 self._plans[cshape] = stage_plan(
                     cshape, pr.levels, pr.anchor_stride, pr.anchor_block
@@ -393,7 +393,7 @@ class WhatIfGate:
 
 
 def attach_whatif(wi):
-    from deepsz.gnn_predictor import ChunkedGNNPredictor as _P
+    from latec.gnn_predictor import ChunkedGNNPredictor as _P
 
     orig = _P.predict_wave_stage
 
@@ -407,8 +407,8 @@ def attach_whatif(wi):
 
 
 def run_interp(field):
-    import deepsz.codec as cc
-    from deepsz.predictor import InterpPredictor
+    import latec.codec as cc
+    from latec.predictor import InterpPredictor
 
     pred = InterpPredictor(
         order="cubic", levels=LEVELS, anchor_stride=STRIDE, anchor_block=BLOCK
@@ -427,7 +427,7 @@ def run_interp(field):
 
 
 def run_gnn(field):
-    from deepsz.gnn_codec import GNNCompressorCodec
+    from latec.gnn_codec import GNNCompressorCodec
 
     kw = dict(
         error_bound=EB,

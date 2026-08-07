@@ -24,7 +24,7 @@ from .bitstream import pack_stage, unpack_stage
 from .rans import SCALE_HI_MULT, SCALE_LO_DIV, build_laplace_tables, scale_to_level
 
 
-_MAGIC = b"DEEPSZGN"
+_MAGIC = b"LATECGNN"
 _VERSION = 13
 _PREFIX = "<8sII"
 _PREFIX_SIZE = struct.calcsize(_PREFIX)
@@ -122,8 +122,8 @@ def _per_step_eb_ratio(coarse_factor: float, levels: int) -> float:
 
 
 def _log(msg):
-    # ponytail: env-gated so tests/CLI stay quiet; set DEEPSZ_PROGRESS=1 to see it
-    if not os.environ.get("DEEPSZ_PROGRESS"):
+    # ponytail: env-gated so tests/CLI stay quiet; set LATEC_PROGRESS=1 to see it
+    if not os.environ.get("LATEC_PROGRESS"):
         return
     sys.stderr.write(msg + "\n")
     sys.stderr.flush()
@@ -144,7 +144,7 @@ def _cuda_peak(predictor):
 
 
 def _progress_bar(tag, n, unit="wave"):
-    # env-gated (DEEPSZ_PROGRESS) so tests/CLI stay quiet; disabled bar is a no-op.
+    # env-gated (LATEC_PROGRESS) so tests/CLI stay quiet; disabled bar is a no-op.
     from tqdm import tqdm
 
     return tqdm(
@@ -152,7 +152,7 @@ def _progress_bar(tag, n, unit="wave"):
         desc=tag,
         unit=unit,
         file=sys.stderr,
-        disable=not os.environ.get("DEEPSZ_PROGRESS"),
+        disable=not os.environ.get("LATEC_PROGRESS"),
     )
 
 
@@ -233,12 +233,12 @@ def _write_stream(meta: dict[str, Any], payload: bytes, zstd_level: int) -> byte
 
 def _read_stream(stream: bytes) -> tuple[dict[str, Any], bytes]:
     if len(stream) < _PREFIX_SIZE:
-        raise ValueError("not a DeepSZ GNN stream")
+        raise ValueError("not a LATEC GNN stream")
     magic, version, header_len = struct.unpack_from(_PREFIX, stream, 0)
     if magic != _MAGIC:
-        raise ValueError(f"not a DeepSZ GNN stream (bad magic {magic!r})")
+        raise ValueError(f"not a LATEC GNN stream (bad magic {magic!r})")
     if version != _VERSION:
-        raise ValueError(f"unsupported DeepSZ GNN stream version {version}")
+        raise ValueError(f"unsupported LATEC GNN stream version {version}")
     off = _PREFIX_SIZE
     meta = json.loads(stream[off : off + header_len].decode("utf-8"))
     payload = zstandard.ZstdDecompressor().decompress(stream[off + header_len :])
@@ -309,7 +309,7 @@ def _decompress_region(
         ).reshape(1, n)
         known |= pos
     if off != len(payload):
-        raise ValueError("trailing bytes in DeepSZ GNN payload")
+        raise ValueError("trailing bytes in LATEC GNN payload")
     return recon[0]
 
 
@@ -1143,7 +1143,7 @@ def _chunk_device_plan(
 # fastest axes, and a budget that holds ~17 of the 58.5 MiB rank-4 plans keeps
 # essentially all the reuse while bounding the cache an order of magnitude below
 # the unbounded 81.
-_PLAN_CACHE_MIB = float(os.environ.get("DEEPSZ_PLAN_CACHE_MIB", 1024))
+_PLAN_CACHE_MIB = float(os.environ.get("LATEC_PLAN_CACHE_MIB", 1024))
 
 
 def _plan_device_bytes(obj, seen=None):
@@ -1348,14 +1348,14 @@ def _decompress_chunked(
             bar.update(1)
     bar.close()
     if off != len(payload):
-        raise ValueError("trailing bytes in DeepSZ GNN payload")
+        raise ValueError("trailing bytes in LATEC GNN payload")
     if gates is not None and gi != len(gates):
         raise ValueError("gate list length does not match the stream")
     return recon_t[0].cpu().numpy()
 
 
 class GNNCompressorCodec:
-    """Usable Python codec for GNN-backed DeepSZ tensor compression.
+    """Usable Python codec for GNN-backed LATEC tensor compression.
 
     The codec is initialized from a GNN checkpoint path. ``compress`` accepts a
     numpy array or torch tensor of any rank and returns bytes. ``uncompress``

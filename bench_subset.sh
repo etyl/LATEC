@@ -24,7 +24,7 @@ module purge
 module load pytorch-gpu
 
 export PYTHONUNBUFFERED=1          # flush progress to the SLURM .out live
-unset DEEPSZ_M_TILE
+unset LATEC_M_TILE
 
 # GNN checkpoint (same one eval_tensor.sh uses; override with CKPT=...).
 CKPT=${CKPT:-./checkpoints/v7-d64-1agg.pt}

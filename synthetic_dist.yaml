@@ -1,6 +1,6 @@
 # Synthetic training-field distribution for scripts/train_gnn.py.
 # 2-D fields mixed with anisotropic 4-D fields; see
-# deepsz/synthetic_data.py (sample_synthetic_batch) for how these are used.
+# latec/synthetic_data.py (sample_synthetic_batch) for how these are used.
 # Overridable per run with the matching --synthetic-* CLI flags.
 
 

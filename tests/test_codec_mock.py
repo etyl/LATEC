@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from deepsz.codec import compress, decompress
+from latec.codec import compress, decompress
 from tests.helpers import NearestPredictor
 
 

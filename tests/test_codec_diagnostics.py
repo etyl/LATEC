@@ -1,7 +1,7 @@
 import numpy as np
 
-from deepsz.codec import compress, decompress
-from deepsz.predictor import InterpPredictor
+from latec.codec import compress, decompress
+from latec.predictor import InterpPredictor
 
 
 def _normalized_smooth(h=72, w=80):

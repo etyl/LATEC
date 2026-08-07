@@ -17,8 +17,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from deepsz import GNNCompressorCodec
-from deepsz.gnn_predictor import CKPT_VERSION, build_model
+from latec import GNNCompressorCodec
+from latec.gnn_predictor import CKPT_VERSION, build_model
 
 
 @pytest.fixture()

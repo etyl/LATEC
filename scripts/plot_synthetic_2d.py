@@ -1,6 +1,6 @@
 """Plot a grid of 2-D synthetic training fields, drawn with the exact same
 generator and default settings used by scripts/train_gnn.py (see
-deepsz/synthetic_data.py:sample_synthetic_batch and synthetic_dist.yaml).
+latec/synthetic_data.py:sample_synthetic_batch and synthetic_dist.yaml).
 
 Usage:
     python scripts/plot_synthetic_2d.py                # 20 samples, random seed
@@ -20,8 +20,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from deepsz.synthetic_data import DEFAULT_SYNTHETIC_DIST as _SYN
-from deepsz.synthetic_data import sample_synthetic_batch
+from latec.synthetic_data import DEFAULT_SYNTHETIC_DIST as _SYN
+from latec.synthetic_data import sample_synthetic_batch
 
 
 def main():

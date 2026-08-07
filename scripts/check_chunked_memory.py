@@ -31,8 +31,8 @@ def _ensure_rans_backend():
 
         return "constriction"
     except ImportError:
-        import deepsz.bitstream as bitstream
-        import deepsz.rans as rans
+        import latec.bitstream as bitstream
+        import latec.rans as rans
 
         def fake_encode(codes, levels64, tables):
             return np.asarray(codes, np.uint32).ravel().astype("<u4").tobytes()
@@ -72,8 +72,8 @@ def main():
     backend = _ensure_rans_backend()
     import torch
 
-    from deepsz import GNNCompressorCodec
-    from deepsz.gnn_predictor import CKPT_VERSION, build_model
+    from latec import GNNCompressorCodec
+    from latec.gnn_predictor import CKPT_VERSION, build_model
 
     ckpt = args.checkpoint
     if ckpt is None:

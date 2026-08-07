@@ -1,1 +1,1 @@
-"""DeepSZ test package."""
+"""LATEC test package."""

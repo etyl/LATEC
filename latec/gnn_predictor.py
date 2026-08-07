@@ -1,4 +1,4 @@
-"""Lightweight, dimension-agnostic GNN predictor for the DeepSZ closed loop.
+"""Lightweight, dimension-agnostic GNN predictor for the LATEC closed loop.
 
 Same interface as the other predictors (see predictor.py):
     predict(recon, known) -> pred
@@ -75,7 +75,7 @@ CKPT_VERSION = 7
 # (chunk points / 2^ndim), so it splits a fused sub-stage back to the residency
 # the pre-fusion schedule had. Well clear of the small-tile cliff that would
 # shred the whole-tensor 2-D path, where a big stage is only a few blocks.
-_M_TILE = int(os.environ.get("DEEPSZ_M_TILE", 1 << 16))
+_M_TILE = int(os.environ.get("LATEC_M_TILE", 1 << 16))
 
 
 def _cuda_working_budget(torch, device, fraction: float = 0.8) -> int:
@@ -1105,11 +1105,11 @@ class GNNPredictor:
         # dynamic=True: one graph for every stage/chunk M, no recompile storm.
         # enc and dec both compile (flag replayed) so their float paths match.
         if self.compile and not getattr(self, "_compiled", False):
-            # DEEPSZ_COMPILE_MODE=reduce-overhead -> CUDA graphs, kills per-kernel
+            # LATEC_COMPILE_MODE=reduce-overhead -> CUDA graphs, kills per-kernel
             # launch latency on the ~30 tiny message-pass kernels (launch-bound).
             # ponytail: CUDA graphs want static shapes; with varying stage M they
             # recapture per new shape, so it only wins once shapes settle/repeat.
-            mode = os.environ.get("DEEPSZ_COMPILE_MODE") or None
+            mode = os.environ.get("LATEC_COMPILE_MODE") or None
             self.model.embed = self._torch.compile(
                 self.model.embed, dynamic=True, mode=mode
             )
@@ -1574,11 +1574,11 @@ class ChunkedGNNPredictor:
         # aren't in the GEMMs). dynamic=True keeps one graph across all M sizes;
         # enc and dec both compile (flag replayed) so their float paths match.
         if self.compile and not getattr(self, "_compiled", False):
-            # DEEPSZ_COMPILE_MODE=reduce-overhead -> CUDA graphs, kills per-kernel
+            # LATEC_COMPILE_MODE=reduce-overhead -> CUDA graphs, kills per-kernel
             # launch latency on the ~30 tiny message-pass kernels (launch-bound).
             # ponytail: CUDA graphs want static shapes; with varying stage M they
             # recapture per new shape, so it only wins once shapes settle/repeat.
-            mode = os.environ.get("DEEPSZ_COMPILE_MODE") or None
+            mode = os.environ.get("LATEC_COMPILE_MODE") or None
             self.model.embed = self._torch.compile(
                 self.model.embed, dynamic=True, mode=mode
             )
@@ -1673,7 +1673,7 @@ class ChunkedGNNPredictor:
                 f"(field {field_bytes / 1e9:.1f} + stage activation "
                 f"{act_bytes / 1e9:.1f} GB for tile={m:,} of M={M:,} queries "
                 f"x L={L} lines, budget {budget / 1e9:.1f} GB). Lower "
-                f"DEEPSZ_M_TILE or --chunk-size. Continuing because "
+                f"LATEC_M_TILE or --chunk-size. Continuing because "
                 f"this estimate is advisory.",
                 RuntimeWarning,
                 stacklevel=2,

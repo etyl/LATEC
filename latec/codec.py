@@ -1,4 +1,4 @@
-"""Closed-loop DeepSZ codec: progressive prediction and quantization.
+"""Closed-loop LATEC codec: progressive prediction and quantization.
 
 The encoder simulates the decoder: reconstructions fed back into the predictor
 are built exclusively from dequantize() outputs, never from the original data,
@@ -287,7 +287,7 @@ def compress(
 
 
 def decompress(stream: bytes, predictor_factory=None) -> np.ndarray:
-    """Decompress a DeepSZ stream. ``predictor_factory(header) -> predictor``;
+    """Decompress a LATEC stream. ``predictor_factory(header) -> predictor``;
     defaults to InterpPredictor for interpolation streams. GNN streams need a
     factory that builds a GNNPredictor from the checkpoint."""
     header, payload = read_stream(stream)

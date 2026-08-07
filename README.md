@@ -1,6 +1,6 @@
-# DeepSZ
+# LATEC
 
-DeepSZ is an error-bounded lossy compressor for images and scientific tensors.
+LATEC is an error-bounded lossy compressor for images and scientific tensors.
 It uses progressive closed-loop prediction with either SZ3-style interpolation
 or a trained, dimension-agnostic graph neural network (GNN). Quantized residuals
 are entropy-coded and wrapped in a zstd frame.
@@ -11,7 +11,7 @@ requested absolute error bound.
 
 ## Installation
 
-DeepSZ requires Python 3.10 or newer.
+LATEC requires Python 3.10 or newer.
 
 ```bash
 pip install -e ".[image,test]"       # interpolation, CLI, and development tools
@@ -23,7 +23,7 @@ pip install -e ".[gnn,image,test]"   # add PyTorch-backed GNN compression
 The tensor-oriented GNN API accepts NumPy arrays or PyTorch tensors of any rank:
 
 ```python
-from deepsz import GNNCodec
+from latec import GNNCodec
 
 codec = GNNCodec("data/gnn_predictor.pt", error_bound=0.01)
 stream = codec.compress(array_or_tensor)
@@ -42,8 +42,8 @@ force the whole-tensor path.
 The lower-level API supports both predictors and returns codec diagnostics:
 
 ```python
-from deepsz import compress, decompress
-from deepsz.predictor import InterpPredictor
+from latec import compress, decompress
+from latec.predictor import InterpPredictor
 
 predictor = InterpPredictor("cubic", levels=4, anchor_stride=16)
 stream, stats = compress(values, 0.01, predictor)
@@ -53,9 +53,9 @@ reconstructed = decompress(stream)
 ## Command Line
 
 ```bash
-deepsz compress input.png output.msz --eb 2 --predictor interp
-deepsz decompress output.msz reconstructed.png
-deepsz eval input.png --eb 2 --predictor interp
+latec compress input.png output.msz --eb 2 --predictor interp
+latec decompress output.msz reconstructed.png
+latec eval input.png --eb 2 --predictor interp
 ```
 
 Use `--predictor gnn --gnn-checkpoint PATH` for checkpoint-backed prediction.
@@ -106,7 +106,7 @@ memory while preserving the dependency order between chunks.
 
 ## Repository Layout
 
-- `deepsz/` contains codecs, predictors, scheduling, quantization, and entropy coding.
+- `latec/` contains codecs, predictors, scheduling, quantization, and entropy coding.
 - `tests/` contains deterministic unit and round-trip coverage.
 - `scripts/` contains training, evaluation, plotting, and profiling utilities.
 - Root shell launchers contain cluster resource configurations and experiment defaults.

@@ -1,4 +1,4 @@
-"""Train the lightweight GNN predictor (deepsz/gnn_predictor.py) purely on
+"""Train the lightweight GNN predictor (latec/gnn_predictor.py) purely on
 synthetic scientific-like fields: 2-D fields mixed with anisotropic 4-D fields,
 both from the same generator (smooth Gaussian random fields *and* power-law
 turbulence, with random-hyperplane discontinuities). No natural images or
@@ -34,7 +34,7 @@ from tqdm import tqdm
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from deepsz.gnn_predictor import (
+from latec.gnn_predictor import (
     CKPT_VERSION,
     _CompactFrame,
     build_chunk_geoms,
@@ -43,8 +43,8 @@ from deepsz.gnn_predictor import (
     stage_forward,
     value_halo_embed,
 )
-from deepsz.levels import stage_masks
-from deepsz.synthetic_data import (
+from latec.levels import stage_masks
+from latec.synthetic_data import (
     DEFAULT_SYNTHETIC_DIST as _SYN,
     make_eval_field,
     mixed_batch_sizes,
@@ -77,7 +77,7 @@ def normalize_tensor(tensor: np.ndarray) -> np.ndarray:
 
 
 def qz(pred, truth, eb):
-    """Linear-quantised reconstruction (deepsz.quantizer): pred + the residual
+    """Linear-quantised reconstruction (latec.quantizer): pred + the residual
     snapped to the 2*eb grid, so |recon - truth| <= eb. Works on np or torch."""
     round_ = torch.round if torch.is_tensor(truth) else np.round
     if torch.is_tensor(eb) and torch.is_tensor(truth) and eb.ndim == 1:
@@ -287,7 +287,7 @@ def eval_tensor_codec(model, d, args, tensor, eb, device, ckpt_path):
     The codec loads weights from disk, so the live model is frozen to `ckpt_path`
     first (overwritten each call; the model cache keys on mtime so this reloads).
     """
-    from deepsz.gnn_codec import GNNCompressorCodec
+    from latec.gnn_codec import GNNCompressorCodec
 
     torch.save(
         {
@@ -300,7 +300,7 @@ def eval_tensor_codec(model, d, args, tensor, eb, device, ckpt_path):
     )
     # compile=False: each eval loads a fresh model instance, so compiling here
     # recompiles from scratch every 500 steps and (under
-    # DEEPSZ_COMPILE_MODE=reduce-overhead) allocates CUDA-graph pools sized by
+    # LATEC_COMPILE_MODE=reduce-overhead) allocates CUDA-graph pools sized by
     # the eval tensor each time — RAM, not speed. Eval timing is therefore
     # eager-mode pessimistic; benchmark deployed speed with eval_tensor.py.
     codec = GNNCompressorCodec(ckpt_path, str(device))
@@ -874,7 +874,7 @@ def main():
 
     model = build_model(args.d, args.agg_level).to(device)
     if args.compile:
-        mode = os.environ.get("DEEPSZ_COMPILE_MODE") or None
+        mode = os.environ.get("LATEC_COMPILE_MODE") or None
         # dynamic=True is required: embed specializes on geom.M (per-stage
         # query count) and the schedule has hundreds of distinct M values --
         # static shapes blow the recompile limit and fall back to eager.

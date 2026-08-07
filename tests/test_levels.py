@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from deepsz.levels import stage_masks, stage_plan
+from latec.levels import stage_masks, stage_plan
 
 
 # all levels == log2(stride) so the schedule densifies to stride 1 (guard)

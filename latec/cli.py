@@ -1,9 +1,9 @@
-"""DeepSZ command line: compress / decompress / eval.
+"""LATEC command line: compress / decompress / eval.
 
 Examples:
-    deepsz compress photo.png photo.msz --eb 2
-    deepsz decompress photo.msz rec.png
-    deepsz eval photo.png --eb 2 --levels 3
+    latec compress photo.png photo.msz --eb 2
+    latec decompress photo.msz rec.png
+    latec eval photo.png --eb 2 --levels 3
 """
 
 from __future__ import annotations
@@ -264,7 +264,7 @@ def cmd_eval(args):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="deepsz", description=__doc__)
+    ap = argparse.ArgumentParser(prog="latec", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("compress", help="compress an image to a .msz stream")

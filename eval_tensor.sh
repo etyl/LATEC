@@ -15,7 +15,7 @@ module purge
 module load pytorch-gpu
 
 export PYTHONUNBUFFERED=1   # flush progress to the SLURM .out live
-unset DEEPSZ_M_TILE
+unset LATEC_M_TILE
 
 # D128 checkpoint
 # CKPT=${CKPT:-/lustre/fswork/projects/rech/lzs/uhq13gg/MAT-SZ/data/runs/20260710-115201-7bbb4e/gnn_predictor.pt}

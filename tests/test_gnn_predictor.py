@@ -5,7 +5,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from deepsz.gnn_predictor import (
+from latec.gnn_predictor import (
     CKPT_VERSION,
     GNNPredictor,
     build_model,
@@ -13,8 +13,8 @@ from deepsz.gnn_predictor import (
     half_directions,
     stage_forward,
 )
-from deepsz.gnn_predictor import _LegacyGeom
-from deepsz.levels import stage_masks
+from latec.gnn_predictor import _LegacyGeom
+from latec.levels import stage_masks
 
 
 @pytest.mark.parametrize(

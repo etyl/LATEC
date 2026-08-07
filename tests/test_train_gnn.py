@@ -13,8 +13,8 @@ from scripts.train_gnn import (
     run_chunked_scene,
     ModelEMA,
 )
-from deepsz.gnn_predictor import build_model
-from deepsz.synthetic_data import (
+from latec.gnn_predictor import build_model
+from latec.synthetic_data import (
     sample_synthetic_batch,
     mixed_batch_sizes,
     _warp,
@@ -222,7 +222,7 @@ def test_advection_raises_local_anisotropy():
     """Advected turbulent fields have more elongated (streaky/filamentary) local
     structure than the phase-random spectrum-only field, measured by the mean
     anisotropy of the gradient structure tensor."""
-    import deepsz.synthetic_data as gnn
+    import latec.synthetic_data as gnn
 
     shape = (96, 96)
 

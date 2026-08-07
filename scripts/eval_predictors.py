@@ -1,4 +1,4 @@
-"""Evaluate DeepSZ predictors (GNN vs. interpolation) against SZ3 on Kodak.
+"""Evaluate LATEC predictors (GNN vs. interpolation) against SZ3 on Kodak.
 
 Runs each method through the same closed-loop codec (identical quantizer +
 Huffman/zstd stage) so the comparison isolates the predictor, and reports
@@ -23,10 +23,10 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from deepsz.baselines import sz3_roundtrip
-from deepsz.bitstream import FLAG_COMPILED, FLAG_CUBIC, FLAG_FP16, FLAG_GNN, Header
-from deepsz.codec import compress, decompress
-from deepsz.predictor import InterpPredictor
+from latec.baselines import sz3_roundtrip
+from latec.bitstream import FLAG_COMPILED, FLAG_CUBIC, FLAG_FP16, FLAG_GNN, Header
+from latec.codec import compress, decompress
+from latec.predictor import InterpPredictor
 
 METHODS = ("gnn-rans", "gnn", "interp", "interp-linear", "sz3")
 
@@ -45,9 +45,9 @@ def load_image(path: Path) -> np.ndarray:
 
 
 def make_predictor(method: str, img: np.ndarray, args):
-    """Encoder-side predictor for a DeepSZ closed-loop method."""
+    """Encoder-side predictor for a LATEC closed-loop method."""
     if method in ("gnn", "gnn-rans"):
-        from deepsz.gnn_predictor import GNNPredictor
+        from latec.gnn_predictor import GNNPredictor
 
         p = GNNPredictor(
             args.gnn_checkpoint,
@@ -69,7 +69,7 @@ def make_predictor(method: str, img: np.ndarray, args):
 def build_predictor_for_decompress(method: str, hdr: Header, args):
     """Decoder-side predictor; params come from the stream header."""
     if hdr.flags & FLAG_GNN:
-        from deepsz.gnn_predictor import GNNPredictor
+        from latec.gnn_predictor import GNNPredictor
 
         p = GNNPredictor(
             args.gnn_checkpoint,
@@ -115,7 +115,7 @@ def eval_gnn_chunked(img: np.ndarray, eb: float, args) -> dict:
     the coarse-halo path that big tensors are forced onto. tune=rd is not
     supported there; it degrades to fast (run both arms with --tune fast for
     a fair chunked-vs-unchunked comparison)."""
-    from deepsz.gnn_codec import GNNCompressorCodec
+    from latec.gnn_codec import GNNCompressorCodec
 
     # GNNCompressorCodec normalizes internally and treats error_bound as
     # relative to (max - min); convert eb (absolute, used in _quality() below,
@@ -153,7 +153,7 @@ def eval_gnn_chunked(img: np.ndarray, eb: float, args) -> dict:
     return r
 
 
-def eval_deepsz(img: np.ndarray, eb: float, method: str, args) -> dict:
+def eval_latec(img: np.ndarray, eb: float, method: str, args) -> dict:
     if method in ("gnn", "gnn-rans") and args.chunk_size is not None:
         return eval_gnn_chunked(img, eb, args)
     t0 = time.time()
@@ -503,7 +503,7 @@ def main():
                     r = (
                         eval_sz3(img, eb)
                         if method == "sz3"
-                        else eval_deepsz(img, eb, method, args)
+                        else eval_latec(img, eb, method, args)
                     )
                 except Exception as exc:
                     tqdm.write(f"{img_path.name} eb={eb:g} {method}: ERROR: {exc}")

@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-Core library code lives in `deepsz/`. Compression orchestration is in `codec.py` and `gnn_codec.py`; predictors, quantization, entropy coding, level scheduling, and bitstream handling have dedicated modules. The command-line entry point is `deepsz/cli.py`. Keep reusable functionality in this package rather than in experiment scripts.
+Core library code lives in `latec/`. Compression orchestration is in `codec.py` and `gnn_codec.py`; predictors, quantization, entropy coding, level scheduling, and bitstream handling have dedicated modules. The command-line entry point is `latec/cli.py`. Keep reusable functionality in this package rather than in experiment scripts.
 
 `tests/` contains pytest tests organized by component, such as `test_quantizer.py` and `test_gnn_codec.py`. `scripts/` holds training, evaluation, profiling, and plotting programs. Root-level `train*.sh`, `eval*.sh`, and `profile*.sh` files are Slurm-oriented launchers with cluster-specific defaults.
 
@@ -22,7 +22,7 @@ Agents must not submit large or long-running jobs on Jean Zay. They may inspect 
 - `pytest tests/test_quantizer.py -q` runs one focused module while iterating.
 - `pytest -m slow` runs checkpoint-backed end-to-end tests and may take minutes.
 - `python -m ruff check .` runs the configured import, syntax, and undefined-name checks.
-- `deepsz eval IMAGE --eb 2 --predictor interp` performs a quick local round trip without a trained checkpoint.
+- `latec eval IMAGE --eb 2 --predictor interp` performs a quick local round trip without a trained checkpoint.
 - `python scripts/train_gnn.py --help` and `python scripts/eval_predictors.py --help` document experiment-specific options. Review cluster paths before submitting the shell launchers.
 
 ## Coding Style & Naming Conventions

@@ -1,9 +1,9 @@
-"""Roundtrip-eval DeepSZ on an arbitrary tensor loaded from .npy or torch.
+"""Roundtrip-eval LATEC on an arbitrary tensor loaded from .npy or torch.
 
     python scripts/eval_tensor.py field.npy --eb 1e-3
     python scripts/eval_tensor.py weights.pt --eb 0.01 --rel
 
-Same flags as `deepsz eval`; the only difference is the input is a raw tensor
+Same flags as `latec eval`; the only difference is the input is a raw tensor
 (any dtype/shape the codec accepts, i.e. 2-D or 3-D with 1 or 3 channels)
 instead of an image decoded by PIL.
 """
@@ -19,11 +19,11 @@ from pathlib import Path
 
 import numpy as np
 
-# Use this worktree's deepsz, not a stale pip-installed copy in site-packages.
+# Use this worktree's latec, not a stale pip-installed copy in site-packages.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from deepsz.cli import add_common, build_predictor, run_compress
-from deepsz.codec import decompress
+from latec.cli import add_common, build_predictor, run_compress
+from latec.codec import decompress
 
 
 def _cap_crop(arr: np.ndarray, stride: int, cap: int) -> np.ndarray:
@@ -48,7 +48,7 @@ def report(label, arr, rec, nbytes, eb, t_comp=None, t_dec=None, *, slack=0.0):
     representation error. The GNN codec enforces the bound on its internally
     [0, 1]-normalized tensor, so the float32 normalize/denormalize round trip can
     put a point a few ULPs over ``eb`` in original units even though the internal
-    bound held everywhere; ``deepsz.gnn_codec.roundtrip_slack`` derives that
+    bound held everywhere; ``latec.gnn_codec.roundtrip_slack`` derives that
     allowance. Codecs that work directly in original units (interp, sz3) get 0.
     """
     a = arr.astype(np.float64)
@@ -148,8 +148,8 @@ def main(argv=None):
     if args.predictor == "gnn":
         # GNNCompressorCodec auto-chunks large tensors; the codec.compress path
         # allocates a dense embedding field over the whole tensor and OOMs.
-        os.environ.setdefault("DEEPSZ_PROGRESS", "1")  # per-chunk progress to stderr
-        from deepsz.gnn_codec import GNNCompressorCodec
+        os.environ.setdefault("LATEC_PROGRESS", "1")  # per-chunk progress to stderr
+        from latec.gnn_codec import GNNCompressorCodec
 
         # GNNCompressorCodec normalizes the tensor internally and treats
         # error_bound as relative to (max - min); convert this script's
@@ -192,7 +192,7 @@ def main(argv=None):
     # Only the GNN codec normalizes internally, so only it needs the float32
     # round-trip allowance; interp/sz3 work in original units and get none.
     if args.predictor == "gnn":
-        from deepsz.gnn_codec import roundtrip_slack
+        from latec.gnn_codec import roundtrip_slack
 
         main_slack = roundtrip_slack(float(arr.min()), float(arr.max()))
     else:
@@ -211,8 +211,8 @@ def main(argv=None):
     #  * bits/value is NOT scale-invariant: a small crop costs more bpv than the
     #    whole field for ANY codec. So sz3 runs on the SAME crop (fair vs interp)
     #    AND on the full field (the headline vs the GNN).
-    # DEEPSZ_BASELINE_MAXVOX=0 disables the cap (interp whole-field; may OOM).
-    from deepsz.baselines import _sz3_pysz
+    # LATEC_BASELINE_MAXVOX=0 disables the cap (interp whole-field; may OOM).
+    from latec.baselines import _sz3_pysz
 
     def sz3(field):
         tag = "sz3" if field.shape == arr.shape else f"sz3{list(field.shape)}"
@@ -225,7 +225,7 @@ def main(argv=None):
             report(tag, field, r[1], r[0], eb)
 
     if main_label not in ("interp", "interp-linear"):
-        cap = int(os.environ.get("DEEPSZ_BASELINE_MAXVOX", 1 << 24))
+        cap = int(os.environ.get("LATEC_BASELINE_MAXVOX", 1 << 24))
         sub = _cap_crop(arr, args.anchor_stride, cap) if cap else arr
         cropped = sub.shape != arr.shape
         bargs = copy.copy(args)

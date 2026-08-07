@@ -88,7 +88,7 @@ def ensure_ckpt(path: str) -> str:
         return path
     import torch
 
-    from deepsz.gnn_predictor import CKPT_VERSION, build_model
+    from latec.gnn_predictor import CKPT_VERSION, build_model
 
     torch.manual_seed(0)
     m = build_model(d=D, agg_level=AGG).eval()
@@ -128,21 +128,21 @@ def _run_point() -> None:
 
         torch.compile = _forced
 
-    import deepsz.gnn_codec as gcodec
-    from deepsz.gnn_codec import GNNCompressorCodec, _read_stream
+    import latec.gnn_codec as gcodec
+    from latec.gnn_codec import GNNCompressorCodec, _read_stream
 
     # Neutralize the production gate so the compile flag alone decides: we are
     # measuring where that gate *should* sit, so it must not pre-empt the sweep.
     gcodec._COMPILE_MIN_CHUNKS = 0
 
     compile_on = mode != "off"
-    # The codec reads DEEPSZ_COMPILE_MODE inside _maybe_compile: unset/"" -> plain
+    # The codec reads LATEC_COMPILE_MODE inside _maybe_compile: unset/"" -> plain
     # inductor fusion; "reduce-overhead" -> CUDA graphs (cuts the ~30 tiny per-wave
     # kernel launches, the launch-bound win that grows as chunks repeat the shape).
     if mode == "reduce-overhead":
-        os.environ["DEEPSZ_COMPILE_MODE"] = "reduce-overhead"
+        os.environ["LATEC_COMPILE_MODE"] = "reduce-overhead"
     else:
-        os.environ.pop("DEEPSZ_COMPILE_MODE", None)
+        os.environ.pop("LATEC_COMPILE_MODE", None)
 
     grid = grid_for(nchunks, RANK)
     shape = tuple(CHUNK * g for g in grid)

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from deepsz.bitstream import Header, pack_stage, read_stream, unpack_stage, write_stream
+from latec.bitstream import Header, pack_stage, read_stream, unpack_stage, write_stream
 
 
 def make_header(**kw):

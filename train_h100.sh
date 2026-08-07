@@ -18,11 +18,11 @@ module load pytorch-gpu
 # The profile is launch-bound (thousands of ~10 us kernels per step). Ask
 # torch.compile to use CUDA graphs where shapes permit, reducing CPU dispatch
 # overhead without changing the batch or model.
-export DEEPSZ_COMPILE_MODE=reduce-overhead
+export LATEC_COMPILE_MODE=reduce-overhead
 
 # Training must run embed untiled (max-M kernels, fewest launches). sbatch
-# inherits the submitting shell's env, so drop any stray DEEPSZ_M_TILE.
-unset DEEPSZ_M_TILE
+# inherits the submitting shell's env, so drop any stray LATEC_M_TILE.
+unset LATEC_M_TILE
 
 # 16*128^2 2-D + 4*16^4 4-D synthetic = 524,288 total points (50% 4-D). All
 # training data is synthetic now (no natural images): the 2-D branch draws

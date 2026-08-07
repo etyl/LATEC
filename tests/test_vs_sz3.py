@@ -8,9 +8,9 @@ pipeline matches or beats SZ3, so we assert we stay within 1.3x of its size.
 import numpy as np
 import pytest
 
-from deepsz.baselines import sz3_roundtrip
-from deepsz.codec import compress, decompress
-from deepsz.predictor import InterpPredictor
+from latec.baselines import sz3_roundtrip
+from latec.codec import compress, decompress
+from latec.predictor import InterpPredictor
 from tests.test_codec_mock import smooth_image
 
 

@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-# Use this worktree's deepsz, not a stale pip-installed copy in site-packages.
+# Use this worktree's latec, not a stale pip-installed copy in site-packages.
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -310,7 +310,7 @@ def main(argv=None):
     )
     args = ap.parse_args(argv)
 
-    os.environ.setdefault("DEEPSZ_PROGRESS", "0")
+    os.environ.setdefault("LATEC_PROGRESS", "0")
 
     import torch
 
@@ -336,7 +336,7 @@ def main(argv=None):
     span = max(float(sub.max()) - float(sub.min()), 1.0)
     eb = args.eb * span if args.rel else args.eb
 
-    from deepsz.gnn_codec import GNNCompressorCodec
+    from latec.gnn_codec import GNNCompressorCodec
 
     # GNNCompressorCodec normalizes internally and treats error_bound as
     # relative to (max - min); convert this script's absolute eb (used below

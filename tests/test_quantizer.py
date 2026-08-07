@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from deepsz.quantizer import dequantize, quantize
+from latec.quantizer import dequantize, quantize
 
 
 @pytest.mark.parametrize(

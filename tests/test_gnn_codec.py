@@ -7,8 +7,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from deepsz import GNNCompressorCodec
-from deepsz.gnn_predictor import CKPT_VERSION, build_model
+from latec import GNNCompressorCodec
+from latec.gnn_predictor import CKPT_VERSION, build_model
 
 
 @pytest.fixture()
@@ -83,7 +83,7 @@ def test_bad_levels_string_rejected(tiny_checkpoint):
     ],
 )
 def test_auto_levels_from_shape(shape, expected):
-    from deepsz.gnn_codec import _auto_levels
+    from latec.gnn_codec import _auto_levels
 
     lv = _auto_levels(shape)
     assert lv == expected
@@ -93,7 +93,7 @@ def test_auto_levels_from_shape(shape, expected):
 
 def test_auto_levels_is_rank_driven_not_size_driven():
     """Above the size guard, levels depends only on rank, not extent."""
-    from deepsz.gnn_codec import _auto_levels
+    from latec.gnn_codec import _auto_levels
 
     assert _auto_levels((64, 64, 64, 64)) == _auto_levels((256, 256, 256, 256))
     # higher rank -> shallower schedule (smaller stride keeps a chunk bounded)
@@ -102,7 +102,7 @@ def test_auto_levels_is_rank_driven_not_size_driven():
 
 
 def test_auto_levels_3d_depends_on_aggregation_level():
-    from deepsz.gnn_codec import _auto_levels
+    from latec.gnn_codec import _auto_levels
 
     shape = (256, 256, 256)
     assert _auto_levels(shape, agg_level=1) == 7
@@ -111,7 +111,7 @@ def test_auto_levels_3d_depends_on_aggregation_level():
 
 def test_per_step_eb_ratio_is_depth_normalised():
     """The coarsest level lands on eb * coarse_factor for any schedule depth."""
-    from deepsz.gnn_codec import _per_step_eb_ratio
+    from latec.gnn_codec import _per_step_eb_ratio
 
     for coarse in (0.41, 0.65, 0.25):
         for levels in (2, 5, 7, 9):
@@ -124,7 +124,7 @@ def test_per_step_eb_ratio_is_depth_normalised():
 
 def test_default_coarse_factor_is_point_nine():
     """The default keeps the coarsest stage at 90% of the requested bound."""
-    from deepsz.gnn_codec import _GNN_EB_COARSE_FACTOR, _per_step_eb_ratio
+    from latec.gnn_codec import _GNN_EB_COARSE_FACTOR, _per_step_eb_ratio
 
     assert _GNN_EB_COARSE_FACTOR == pytest.approx(0.9)
     assert _per_step_eb_ratio(_GNN_EB_COARSE_FACTOR, 5) == pytest.approx(
@@ -133,7 +133,7 @@ def test_default_coarse_factor_is_point_nine():
 
 
 def test_numpy_nd_tensor_roundtrip(tiny_checkpoint):
-    from deepsz.gnn_codec import _read_stream
+    from latec.gnn_codec import _read_stream
 
     rng = np.random.RandomState(0)
     x = rng.rand(5, 6, 4).astype(np.float32)

@@ -138,7 +138,7 @@ def _interp_axis_at(W, coords, axis, s, order, shape, end_mode):
 
 
 class InterpPredictor:
-    """SZ3-style interpolation baseline dropped into DeepSZ's closed loop, so
+    """SZ3-style interpolation baseline dropped into LATEC's closed loop, so
     GNN vs. classical interpolation is isolated to the predictor (identical
     quantizer + Huffman/zstd stage, matching SZ3's own pipeline). Torch- and
     checkpoint-free, so streams decode without a model.

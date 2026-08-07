@@ -15,17 +15,17 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("constriction")  # rANS backend; skip if unavailable
 
-from deepsz import GNNCompressorCodec
-import deepsz.gnn_predictor as gp
-from deepsz.gnn_codec import (
+from latec import GNNCompressorCodec
+import latec.gnn_predictor as gp
+from latec.gnn_codec import (
     _GATE_END_MODE,
     _chunk_device_plan,
     _end_plan,
     _interp_axis_at_t,
     roundtrip_slack,
 )
-from deepsz.predictor import END_EXTRAP, END_MODE_MAX, END_QUAD, _interp_axis_at
-from deepsz.gnn_predictor import (
+from latec.predictor import END_EXTRAP, END_MODE_MAX, END_QUAD, _interp_axis_at
+from latec.gnn_predictor import (
     CKPT_VERSION,
     ChunkedGNNPredictor,
     _CompactFrame,
@@ -33,7 +33,7 @@ from deepsz.gnn_predictor import (
     build_model,
     chunk_halo_info,
 )
-from deepsz.levels import stage_masks, stage_plan
+from latec.levels import stage_masks, stage_plan
 
 STRIDE = 4
 LEVELS = 2
@@ -82,7 +82,7 @@ def test_gate_roundtrip_and_header(current_ckpt):
     """Scale-gated interp fallback: the bound holds, decode is driven by the
     header (not the codec flag), and an all-off gate leaves the stream
     byte-identical to gate=False."""
-    from deepsz.gnn_codec import _read_stream, _unpack_gates
+    from latec.gnn_codec import _read_stream, _unpack_gates
 
     rng = np.random.RandomState(7)
     gx, gy = np.meshgrid(
@@ -130,7 +130,7 @@ def test_gate_roundtrip_and_header(current_ckpt):
 @pytest.mark.parametrize("winner", [1, 2, 3])
 def test_gate_rate_selector_can_choose_each_predictor(winner):
     """The chunk-stage rate proxy selects among multiple classical candidates."""
-    from deepsz.gnn_codec import _gate_select_t
+    from latec.gnn_codec import _gate_select_t
 
     eb = 1e-3
     scale = torch.full((32,), eb)
@@ -153,7 +153,7 @@ def test_gate_rate_selector_can_choose_each_predictor(winner):
 def test_gate_rate_selector_can_choose_high_side():
     """The two-sided selector falls back on the HIGH-b region when the model is
     only wrong where it is uncertain (large scale) and interp is fine there."""
-    from deepsz.gnn_codec import _gate_select_t
+    from latec.gnn_codec import _gate_select_t
 
     eb = 1e-3
     n = 64
@@ -180,7 +180,7 @@ def test_gate_fine_adaptive_roundtrip_and_header(current_ckpt):
     """The adaptive finest gate holds the bound and stores at most one descriptor
     per chunk (not one per finest sub-stage); its decision is replayed from the
     header alone."""
-    from deepsz.gnn_codec import _read_stream, _unpack_gates
+    from latec.gnn_codec import _read_stream, _unpack_gates
 
     rng = np.random.RandomState(3)
     gx, gy = np.meshgrid(
@@ -218,7 +218,7 @@ def test_gate_fine_adaptive_roundtrip_and_header(current_ckpt):
 def test_roundtrip_slack_budget():
     """The float32 normalize/denormalize allowance grows with max|v| and span,
     and vanishes for a degenerate range."""
-    from deepsz.gnn_codec import _F32_U
+    from latec.gnn_codec import _F32_U
 
     assert roundtrip_slack(0.0, 1.0) == pytest.approx(_F32_U * 4.0, rel=1e-9)
     # shifting the same span away from zero grows max|v|, so the slack grows
@@ -258,14 +258,14 @@ def test_bound_holds_in_original_units_within_roundtrip_slack(current_ckpt):
 
 
 def test_pack_gates_roundtrip():
-    from deepsz.gnn_codec import _pack_gates, _unpack_gates
+    from latec.gnn_codec import _pack_gates, _unpack_gates
 
     gates = [0, 0, 256, 1 << 10 | 3 << 8 | 13 << 4 | 6, 0, 4095, 0, 0, 0]
     assert _unpack_gates(_pack_gates(gates)) == gates
 
 
 def test_gate_rate_proxy_charges_raw_float_for_outlier():
-    from deepsz.gnn_codec import _laplace_bits_t
+    from latec.gnn_codec import _laplace_bits_t
 
     eb = 1e-3
     radius = 8
@@ -362,7 +362,7 @@ def test_gate_applies_on_whole_tensor_path(current_ckpt):
     gated whole-tensor encode is realised as a single chunk covering the shape
     (grid 1 per axis). The stream then carries chunk metadata and honours the
     bound; the ungated whole-tensor encode stays on the plain numpy path."""
-    from deepsz.gnn_codec import _read_stream
+    from latec.gnn_codec import _read_stream
 
     rng = np.random.RandomState(3)
     x = rng.rand(20, 24).astype(np.float32)
@@ -570,7 +570,7 @@ def test_fp16_flag_roundtrips_and_persists(current_ckpt):
     """fp16=True round-trips within the bound and the flag rides in the stream so
     decode replays the same float path. (autocast only bites on cuda; on cpu this
     checks the plumbing + that enabling it doesn't break the closed loop.)"""
-    from deepsz.gnn_codec import _read_stream
+    from latec.gnn_codec import _read_stream
 
     rng = np.random.RandomState(9)
     x = rng.rand(8, 8).astype(np.float32)
@@ -586,8 +586,8 @@ def test_compile_flag_roundtrips_and_persists(current_ckpt, monkeypatch):
     """compile=True round-trips within the bound and the flag rides in the stream
     so decode replays the same compiled float path. Small workloads skip compile
     (dynamo warmup never amortizes) and record compiled=False."""
-    import deepsz.gnn_codec as gc
-    from deepsz.gnn_codec import _read_stream
+    import latec.gnn_codec as gc
+    from latec.gnn_codec import _read_stream
 
     rng = np.random.RandomState(11)
     x = rng.rand(8, 8).astype(np.float32)
@@ -608,8 +608,8 @@ def test_compile_auto_defers_to_crossover(current_ckpt, monkeypatch):
     """compile='auto' (the default) never compiles while _COMPILE_AUTO_CROSSOVER is
     None (no measured crossover); setting the crossover turns it on past that many
     chunks -- independently of the explicit-compile floor _COMPILE_MIN_CHUNKS."""
-    import deepsz.gnn_codec as gc
-    from deepsz.gnn_codec import _read_stream
+    import latec.gnn_codec as gc
+    from latec.gnn_codec import _read_stream
 
     rng = np.random.RandomState(12)
     x = rng.rand(8, 8).astype(np.float32)  # 4 chunks at chunk_size=STRIDE

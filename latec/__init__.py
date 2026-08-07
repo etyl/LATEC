@@ -1,4 +1,4 @@
-"""DeepSZ: SZ-style error-bounded lossy compression with a pluggable predictor
+"""LATEC: SZ-style error-bounded lossy compression with a pluggable predictor
 (SZ3-style multilevel interpolation by default, or a trained GNN)."""
 
 from .codec import compress, decompress
