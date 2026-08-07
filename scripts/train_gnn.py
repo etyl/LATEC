@@ -435,6 +435,9 @@ def run_stages(
     return nll_sum, npix, known_vals, pred_only, {"bins": bins, "abs_err": abs_err}
 
 
+_CG_CACHE: dict = {}  # chunk geometry reused across training steps
+
+
 def _run_chunk(model, cg, geoms, E, known_vals, x, gidx, eb, device, reveal):
     """One chunk of the chunked-scene step: the codec's local stage chain with
     teacher forcing. Returns (nll bits, n holes, abs err)."""
@@ -492,7 +495,9 @@ def run_chunked_scene(
         mg = np.meshgrid(*axes, indexing="ij")
         reveal(np.ravel_multi_index([m.reshape(-1) for m in mg], shape))
 
-    cg = build_chunk_geoms(edges, levels, stride, 1, torch, device, agg_level)
+    cg = build_chunk_geoms(
+        edges, levels, stride, 1, torch, device, agg_level, cache=_CG_CACHE
+    )
     coded = np.zeros(2, bool)
     nll = torch.zeros((), device=device)
     abs_err = torch.zeros((), device=device)

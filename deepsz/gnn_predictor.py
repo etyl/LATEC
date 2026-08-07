@@ -1378,9 +1378,6 @@ class _ChunkGeoms:
         return off
 
 
-_CHUNK_GEOM_CACHE: dict = {}
-
-
 def build_chunk_geoms(
     chunk_shape,
     levels,
@@ -1390,10 +1387,14 @@ def build_chunk_geoms(
     device=None,
     agg_level=None,
     progress=None,
+    cache=None,
 ):
-    """Cached `_ChunkGeoms` per (chunk shape, schedule, agg_level, device).
+    """`_ChunkGeoms` for one chunk shape, memoised in the caller's ``cache``
+    dict (``None`` builds a fresh one) under (chunk shape, schedule, agg_level,
+    device). The cache is the caller's so its device tensors die with the
+    caller: `ChunkedGNNPredictor` owns one, so they live for one compress.
     Interior chunks all share one entry; ragged edge chunks add at most a few
-    shape variants (ponytail: unbounded like _GEOM_CACHE, bounded in practice).
+    shape variants.
 
     ``agg_level`` caps the neighbourhood aggregation level (see
     `half_directions`); ``None`` keeps the full neighbourhood."""
@@ -1405,12 +1406,13 @@ def build_chunk_geoms(
         agg_level,
         str(device),
     )
-    hit = _CHUNK_GEOM_CACHE.get(key)
+    hit = None if cache is None else cache.get(key)
     if hit is None:
         hit = _ChunkGeoms(
             chunk_shape, levels, stride, block, torch, device, agg_level, progress
         )
-        _CHUNK_GEOM_CACHE[key] = hit
+        if cache is not None:
+            cache[key] = hit
     elif progress is not None:
         progress(len(hit.geoms))
     return hit
@@ -1603,6 +1605,9 @@ class ChunkedGNNPredictor:
         self.levels = int(levels)
         self.anchor_stride = int(anchor_stride)
         self.anchor_block = int(anchor_block)
+        # Chunk geometry (device tensors, GBs) is reused across this tensor's
+        # chunks and dropped with the predictor, not held for the process.
+        self._geom_cache: dict = {}
         # Neighbourhood aggregation level (see GNNPredictor / half_directions),
         # frozen into the checkpoint at training time.
         self.d, self.model, self.checkpoint_hash, self.agg_level = (
@@ -1624,6 +1629,7 @@ class ChunkedGNNPredictor:
         self.n_chunks = int(np.prod(self.grid))
         self.C = int(channels)
         ndim = len(self.shape)
+        self._geom_cache.clear()
         self._check_field_budget(ndim, channels, geometry_progress)
         self.coded = np.zeros(self.n_chunks, bool)
         self._cg = None
@@ -1647,6 +1653,7 @@ class ChunkedGNNPredictor:
             self.device,
             self.agg_level,
             geometry_progress,
+            cache=self._geom_cache,
         )
         n_interior = int(len(cg.interior_flat))
         n_band = int(len(cg.ref_halo_flat))  # upper bound (all referenced)
@@ -1734,6 +1741,7 @@ class ChunkedGNNPredictor:
             torch,
             self.device,
             self.agg_level,
+            cache=self._geom_cache,
         )
         frame = _CompactFrame(
             cg,

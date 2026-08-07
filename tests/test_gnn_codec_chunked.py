@@ -505,7 +505,7 @@ def test_query_only_nearest_search_matches_period_tile_lookup():
 def test_chunk_geometry_uses_query_only_search_and_reports_progress(monkeypatch):
     """Chunk schedules must not rebuild a full period tile for every stage and
     direction.  That path effectively hangs for a 32^4 chunk (76 stages)."""
-    gp._CHUNK_GEOM_CACHE.clear()
+    cache: dict = {}
     seen = []
     original = gp._nearest_steps_at
 
@@ -516,7 +516,7 @@ def test_chunk_geometry_uses_query_only_search_and_reports_progress(monkeypatch)
     monkeypatch.setattr(gp, "_nearest_steps_at", spy)
     updates = []
     geom = gp.build_chunk_geoms(
-        (8, 8), LEVELS, STRIDE, 1, torch, None, 2, updates.append
+        (8, 8), LEVELS, STRIDE, 1, torch, None, 2, updates.append, cache=cache
     )
 
     assert seen and all(seen)
@@ -526,7 +526,7 @@ def test_chunk_geometry_uses_query_only_search_and_reports_progress(monkeypatch)
     cached_updates = []
     assert (
         gp.build_chunk_geoms(
-            (8, 8), LEVELS, STRIDE, 1, torch, None, 2, cached_updates.append
+            (8, 8), LEVELS, STRIDE, 1, torch, None, 2, cached_updates.append, cache=cache
         )
         is geom
     )
