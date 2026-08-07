@@ -303,14 +303,7 @@ def eval_tensor_codec(model, d, args, tensor, eb, device, ckpt_path):
     # DEEPSZ_COMPILE_MODE=reduce-overhead) allocates CUDA-graph pools sized by
     # the eval tensor each time — RAM, not speed. Eval timing is therefore
     # eager-mode pessimistic; benchmark deployed speed with eval_tensor.py.
-    codec = GNNCompressorCodec(
-        ckpt_path,
-        error_bound=eb,
-        levels=(args.levels or 4),
-        device=str(device),
-        fp16=args.fp16,
-        compile=False,
-    )
+    codec = GNNCompressorCodec(ckpt_path, str(device))
 
     base_gpu = 0
     if device.type == "cuda":
@@ -320,7 +313,13 @@ def eval_tensor_codec(model, d, args, tensor, eb, device, ckpt_path):
 
     with _PeakRSS() as rss:
         t0 = time.time()
-        stream = codec.compress(tensor)
+        stream = codec.compress(
+            tensor,
+            error_bound=eb,
+            levels=(args.levels or 4),
+            fp16=args.fp16,
+            compile=False,
+        )
         if device.type == "cuda":
             torch.cuda.synchronize()
         t_comp = time.time() - t0

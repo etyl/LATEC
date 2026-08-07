@@ -1,5 +1,7 @@
 """Public GNN tensor codec API tests."""
 
+from functools import partial
+
 import numpy as np
 import pytest
 
@@ -27,53 +29,38 @@ def tiny_checkpoint(tmp_path):
 
 
 def _codec(path, eb=1e-3):
-    return GNNCompressorCodec(
-        path,
+    codec = GNNCompressorCodec(path)
+    # compression knobs now live on compress(); bind the test defaults once
+    codec.compress = partial(
+        codec.compress,
         error_bound=eb,
         levels=2,
         chunk_size=0,
         fp16=False,
         compile=False,
     )
+    return codec
 
 
-def test_defaults_match_eval_tensor(tiny_checkpoint):
+def test_init_keeps_only_checkpoint_state(tiny_checkpoint):
     codec = GNNCompressorCodec(tiny_checkpoint)
 
-    assert codec.error_bound == 0.01
-    # levels default is now "auto": resolved per input shape at compress time,
-    # so the fixed levels/anchor_stride are unset until then.
-    assert codec.auto_levels is True
-    assert codec.levels is None
-    assert codec.anchor_stride is None
-    assert not hasattr(codec, "max_radius")
-    assert not hasattr(codec, "anchor_block")
-    assert not hasattr(codec, "agg_level")
-    assert codec.chunk_size is None
-    assert not hasattr(codec, "chunk_batch")
-    assert codec.fp16 is True
-    # compile default is now "auto": a benchmark-backed decision (no measured
-    # crossover -> off), so the resolved flag is False and auto_compile is set.
-    assert codec.auto_compile is True
-    assert codec.compile is False
-
-
-@pytest.mark.parametrize("levels", [1, 2, 4, 6])
-def test_anchor_stride_is_derived_from_levels(tiny_checkpoint, levels):
-    codec = GNNCompressorCodec(tiny_checkpoint, levels=levels)
-
-    assert codec.auto_levels is False
-    assert codec.anchor_stride == 1 << levels
+    assert codec.checkpoint_path == tiny_checkpoint
+    assert codec.device in ("cpu", "cuda")
+    # compression knobs must not be stashed on the instance
+    for attr in ("error_bound", "levels", "anchor_stride", "chunk_size", "fp16",
+                 "compile", "radius", "gate", "eb_ratio", "tune", "zstd_level"):
+        assert not hasattr(codec, attr)
 
 
 def test_levels_must_be_positive(tiny_checkpoint):
     with pytest.raises(ValueError, match="levels must be >= 1"):
-        GNNCompressorCodec(tiny_checkpoint, levels=0)
+        _codec(tiny_checkpoint).compress(np.zeros((8, 8), np.float32), levels=0)
 
 
 def test_bad_levels_string_rejected(tiny_checkpoint):
     with pytest.raises(ValueError, match="positive int or 'auto'"):
-        GNNCompressorCodec(tiny_checkpoint, levels="deep")
+        _codec(tiny_checkpoint).compress(np.zeros((8, 8), np.float32), levels="deep")
 
 
 @pytest.mark.parametrize(

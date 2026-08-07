@@ -341,8 +341,8 @@ def main(argv=None):
     # GNNCompressorCodec normalizes internally and treats error_bound as
     # relative to (max - min); convert this script's absolute eb (used below
     # for the PASS/FAIL report) back to that.
-    codec = GNNCompressorCodec(
-        args.gnn_checkpoint,
+    codec = GNNCompressorCodec(args.gnn_checkpoint, device)
+    compress_kw = dict(
         error_bound=eb / span,
         levels=args.levels,
         radius=args.radius,
@@ -352,7 +352,6 @@ def main(argv=None):
         chunk_size=args.chunk_size,
         fp16=args.fp16,
         compile=args.compile,
-        device=device,
     )
 
     if is_cuda:
@@ -375,7 +374,7 @@ def main(argv=None):
         ) as gpu:
             sync()
             t0 = time.perf_counter()
-            stream = codec.compress(sub)
+            stream = codec.compress(sub, **compress_kw)
             sync()
             t_comp = time.perf_counter() - t0
 

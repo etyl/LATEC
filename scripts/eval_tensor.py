@@ -159,8 +159,10 @@ def main(argv=None):
         # sz3/interp baselines below keep the true absolute eb, so the GNN looks
         # far worse than it is. Keep the conversion exact so the comparison is fair.
         gnn_span = max(float(arr.max()) - float(arr.min()), 1e-12)
-        codec = GNNCompressorCodec(
-            args.gnn_checkpoint,
+        codec = GNNCompressorCodec(args.gnn_checkpoint)
+        t0 = time.time()
+        stream = codec.compress(
+            arr,
             error_bound=eb / gnn_span,
             levels=args.levels if levels_explicit else "auto",
             radius=args.radius,
@@ -171,8 +173,6 @@ def main(argv=None):
             fp16=args.fp16,
             compile=args.compile,
         )
-        t0 = time.time()
-        stream = codec.compress(arr)
         t_comp = time.time() - t0
         stats = {"outliers": 0}  # ponytail: codec doesn't surface outlier count
         t0 = time.time()

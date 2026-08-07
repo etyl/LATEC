@@ -148,15 +148,16 @@ def _run_point() -> None:
     shape = tuple(CHUNK * g for g in grid)
     x = np.random.RandomState(0).rand(*shape).astype(np.float32)
 
-    codec = GNNCompressorCodec(
-        CKPT, error_bound=EB, levels=LEVELS, chunk_size=CHUNK,
+    codec = GNNCompressorCodec(CKPT)
+    kw = dict(
+        error_bound=EB, levels=LEVELS, chunk_size=CHUNK,
         fp16=FP16, compile=compile_on, gate=False,
     )
     best = float("inf")
     meta = None
     for _ in range(REPS):
         t = time.time()
-        stream = codec.compress(x)
+        stream = codec.compress(x, **kw)
         best = min(best, time.time() - t)
         meta = _read_stream(stream)[0]
         gc.collect()

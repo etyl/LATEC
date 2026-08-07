@@ -439,9 +439,9 @@ def run_gnn(field):
     )
     codec = None
     try:
-        codec = GNNCompressorCodec(CKPT, gate=GATE, **kw)
+        codec = GNNCompressorCodec(CKPT)
         t0 = time.time()
-        stream = codec.compress(field)
+        stream = codec.compress(field, gate=GATE, **kw)
         return len(stream), time.time() - t0
     finally:
         del codec

@@ -10,6 +10,8 @@ reproduce the encoder's reconstruction bit for bit (raster order, shared
 column-split). Uses the random tiny checkpoint on CPU, in the fast suite. The
 gate composes with the schedule, so both are exercised."""
 
+from functools import partial
+
 import numpy as np
 import pytest
 
@@ -37,16 +39,17 @@ def tiny_checkpoint(tmp_path):
 
 
 def _codec(path, gate, eb=1e-3, chunk_size=8):
-    return GNNCompressorCodec(
-        path,
+    codec = GNNCompressorCodec(path, "cpu")
+    codec.compress = partial(
+        codec.compress,
         error_bound=eb,
         levels=2,  # anchor_stride 4; chunk_size 8 -> multi-chunk grid
         chunk_size=chunk_size,
         gate=gate,
         fp16=False,
         compile=False,
-        device="cpu",
     )
+    return codec
 
 
 def _maxerr(a, r):
@@ -83,6 +86,6 @@ def test_chunked_schedule_needs_no_coarse_table(tiny_checkpoint):
     cross-chunk context comes entirely from the decoded recon array."""
     field = np.linspace(0, 1, 24 * 24, dtype=np.float32).reshape(24, 24)
     codec = _codec(tiny_checkpoint, gate=False)
-    predictor = codec._chunked_predictor(codec.levels)
+    predictor = codec._chunked_predictor(2)
     predictor.begin(field.shape, (8, 8))
     assert not hasattr(predictor, "coarse")

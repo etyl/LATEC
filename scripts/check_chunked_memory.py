@@ -107,12 +107,12 @@ def main():
     # relative to (max - min); convert args.eb (absolute, used in the
     # OK/VIOLATED check below) back to that.
     span = max(float(x.max()) - float(x.min()), 1.0)
-    codec = GNNCompressorCodec(
-        ckpt, error_bound=args.eb / span, levels=args.levels, chunk_size=args.chunk_size
-    )
+    codec = GNNCompressorCodec(ckpt)
 
     t0 = time.time()
-    stream = codec.compress(x)
+    stream = codec.compress(
+        x, error_bound=args.eb / span, levels=args.levels, chunk_size=args.chunk_size
+    )
     t1 = time.time()
     y = codec.uncompress(stream).numpy()
     t2 = time.time()

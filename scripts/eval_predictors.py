@@ -121,21 +121,20 @@ def eval_gnn_chunked(img: np.ndarray, eb: float, args) -> dict:
     # relative to (max - min); convert eb (absolute, used in _quality() below,
     # matching the interp/sz3 arms) back to that.
     span = max(float(img.max()) - float(img.min()), 1.0)
-    codec = GNNCompressorCodec(
-        args.gnn_checkpoint,
+    codec = GNNCompressorCodec(args.gnn_checkpoint, args.device)
+    t0 = time.time()
+    stream = codec.compress(
+        img,
         error_bound=eb / span,
         levels=args.levels,
         radius=args.radius,
         zstd_level=args.zstd_level,
         eb_ratio=args.eb_ratio,
         tune=args.tune if args.tune in ("fast", "size") else "fast",
-        device=args.device,
         chunk_size=args.chunk_size,
         fp16=args.fp16,
         compile=args.compile,
     )
-    t0 = time.time()
-    stream = codec.compress(img)
     t_comp = time.time() - t0
     t0 = time.time()
     rec = codec.uncompress(stream).numpy()

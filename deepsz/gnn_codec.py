@@ -1372,111 +1372,28 @@ class GNNCompressorCodec:
     def __init__(
         self,
         checkpoint_path: str | Path,
-        error_bound: float = 1e-2,  # relative to the tensor's (max - min); see class docstring
-        *,
-        levels: int | str = "auto",
-        radius: int = 1 << 15,
         device: str | None = None,  # None -> cuda if available, else cpu
-        zstd_level: int = 9,
-        eb_ratio: float | None = None,  # coarsest-level factor; None=auto (fast/sweep)
-        tune: str = "fast",
-        strict_checkpoint: bool = True,
-        chunk_size: int | tuple[int, ...] | None = None,
-        fp16: bool = True,
-        compile: bool | str = "auto",
-        gate: bool = True,
-        gate_fine: bool = False,
+        *,
+        strict_checkpoint: bool = True,  # decode-side: reject foreign-checkpoint streams
     ):
         self.checkpoint_path = Path(checkpoint_path)
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(f"GNN checkpoint not found: {self.checkpoint_path}")
-        if error_bound <= 0:
-            raise ValueError("error_bound must be > 0")
-        if tune not in ("fast", "size"):
-            raise ValueError("tune must be 'fast' or 'size'")
-
-        self.error_bound = float(error_bound)
-        # levels: an explicit int fixes the dyadic schedule depth; "auto" (the
-        # default) picks it per input shape at compress time (see _auto_levels),
-        # since anchor_stride = 2**levels is capped by the smallest axis. In auto
-        # mode self.levels / self.anchor_stride stay None until compress resolves
-        # them; decode always reads the resolved levels back from the stream.
-        if isinstance(levels, str):
-            if levels != "auto":
-                raise ValueError("levels must be a positive int or 'auto'")
-            self.auto_levels = True
-            self.levels = None
-            self.anchor_stride = None
-        else:
-            self.auto_levels = False
-            self.levels = int(levels)
-            if self.levels < 1:
-                raise ValueError("levels must be >= 1")
-            # A level is one dyadic refinement, so inference always starts on the
-            # unique coarse grid that reaches unit stride after ``levels`` steps.
-            self.anchor_stride = 1 << self.levels
-        self.radius = int(radius)
         if device is None:
             import torch
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
-        self.zstd_level = int(zstd_level)
-        # coarsest-level error-bound factor (finest level always keeps full eb);
-        # None -> auto (fast: _GNN_EB_COARSE_FACTOR, size: sweep). Depth-normalised
-        # per resolved levels at compress time so it is rank-invariant.
-        self.eb_ratio = eb_ratio
-        self.tune = tune
         self.strict_checkpoint = bool(strict_checkpoint)
-        # chunk_size: None = auto (whole-tensor for small inputs, otherwise the
-        # largest near-isotropic chunk within _AUTO_CHUNK_THRESHOLD points);
-        # 0 = force whole-tensor; an int or per-axis tuple forces chunked with
-        # those edges (multiples of anchor_stride).
-        self.chunk_size = chunk_size
-        # fp16: run the message-pass matmuls in fp16 autocast (cuda only; the
-        # readout stays fp32). ~2x on the GNN forward, may cost a little ratio at
-        # small eb. Stored in meta so decode uses the same float path.
-        self.fp16 = bool(fp16)
-        # compile: torch.compile the message-pass embed. "auto" (default) decides
-        # per chunk count from a benchmark-backed crossover (_COMPILE_AUTO_CROSSOVER,
-        # currently None -> off: compile never beat eager here, see the constant).
-        # True forces it (still gated by _COMPILE_MIN_CHUNKS); False disables it.
-        # The resolved decision is stored in meta so decode replays the same float
-        # path. First encode pays a one-off compilation cost.
-        if isinstance(compile, str):
-            if compile != "auto":
-                raise ValueError("compile must be a bool or 'auto'")
-            self.auto_compile = True
-            self.compile = False
-        else:
-            self.auto_compile = False
-            self.compile = bool(compile)
-        # gate: scale-gated classical fallback. Applies to both the chunked and
-        # whole-tensor path -- the gate is device-only, so a gated whole-tensor
-        # encode is realised as a single chunk covering the shape (see compress).
-        # The encoder rate-selects GNN, cubic/averaged interpolation, or
-        # first/last-axis linear interpolation per chunk-stage and stores the
-        # winner in the header. It self-disables wherever no fallback pays.
-        self.gate = bool(gate)
-        # gate_fine (opt-in, default off): at the finest (stride-1) level store one
-        # adaptively-chosen gate descriptor per chunk instead of one swept word per
-        # finest sub-stage. The threshold is still data-chosen (picked from the
-        # chunk's first finest sub-stage and reused across its 2*ndim - 1 finest
-        # sub-stages), so it keeps per-chunk adaptivity while cutting the finest
-        # level's metadata accordingly. It reuses one descriptor across sub-stages, so
-        # its rate is >= the fully per-sub-stage gate (gate_fine=False); since
-        # packing already makes the per-sub-stage words cheap, that default is
-        # usually as good or better. gate_fine helps most when finest metadata,
-        # not payload, dominates. Only active when gate is on; the error bound
-        # holds regardless (quantization enforces it).
-        self.gate_fine = bool(gate_fine) and self.gate
         self.checkpoint_hash = self._checkpoint_hash()
 
+    @staticmethod
     def _chunk_edges(
-        self, shape: tuple[int, ...], anchor_stride: int
+        shape: tuple[int, ...],
+        anchor_stride: int,
+        cs: int | tuple[int, ...] | None,
     ) -> tuple[int, ...] | None:
         """Chunk edges for this shape, or None for the whole-tensor path."""
-        cs = self.chunk_size
         if cs == 0:
             return None
         if cs is None:
@@ -1495,8 +1412,81 @@ class GNNCompressorCodec:
                 )
         return edges
 
-    def compress(self, x: Any, error_bound: float | None = None) -> bytes:
-        """Compress a numpy array or torch tensor of any rank into bytes."""
+    def compress(
+        self,
+        x: Any,
+        error_bound: float = 1e-2,  # relative to the tensor's (max - min); see class docstring
+        *,
+        levels: int | str = "auto",
+        radius: int = 1 << 15,
+        zstd_level: int = 9,
+        eb_ratio: float | None = None,  # coarsest-level factor; None=auto (fast/sweep)
+        tune: str = "fast",
+        chunk_size: int | tuple[int, ...] | None = None,
+        fp16: bool = True,
+        compile: bool | str = "auto",
+        gate: bool = True,
+        gate_fine: bool = False,
+    ) -> bytes:
+        """Compress a numpy array or torch tensor of any rank into bytes.
+
+        ``levels``: an explicit int fixes the dyadic schedule depth; "auto" (the
+        default) picks it from the input shape (see _auto_levels), since
+        anchor_stride = 2**levels is capped by the smallest axis. Decode always
+        reads the resolved levels back from the stream.
+
+        ``eb_ratio``: coarsest-level error-bound factor (the finest level always
+        keeps full eb); None -> auto (``tune="fast"``: _GNN_EB_COARSE_FACTOR,
+        ``tune="size"``: sweep). Depth-normalised per resolved levels so it is
+        rank-invariant.
+
+        ``chunk_size``: None = auto (whole-tensor for small inputs, otherwise the
+        largest near-isotropic chunk within _AUTO_CHUNK_THRESHOLD points); 0 =
+        force whole-tensor; an int or per-axis tuple forces chunked with those
+        edges (multiples of anchor_stride).
+
+        ``fp16``: run the message-pass matmuls in fp16 (cuda only; the readout
+        stays fp32). ~2x on the GNN forward, may cost a little ratio at small eb.
+        Stored in meta so decode uses the same float path.
+
+        ``compile``: torch.compile the message-pass embed. "auto" (default)
+        decides per chunk count from a benchmark-backed crossover
+        (_COMPILE_AUTO_CROSSOVER, currently None -> off: compile never beat eager
+        here). True forces it (still gated by _COMPILE_MIN_CHUNKS); False
+        disables it. The resolved decision is stored in meta so decode replays
+        the same float path. First encode pays a one-off compilation cost.
+
+        ``gate``: scale-gated classical fallback. Applies to both the chunked and
+        whole-tensor path -- the gate is device-only, so a gated whole-tensor
+        encode is realised as a single chunk covering the shape (see below). The
+        encoder rate-selects GNN, cubic/averaged interpolation, or
+        first/last-axis linear interpolation per chunk-stage and stores the
+        winner in the header. It self-disables wherever no fallback pays.
+
+        ``gate_fine`` (opt-in, default off): at the finest (stride-1) level store
+        one adaptively-chosen gate descriptor per chunk instead of one swept word
+        per finest sub-stage. The threshold is still data-chosen (picked from the
+        chunk's first finest sub-stage and reused across its 2*ndim - 1 finest
+        sub-stages), so it keeps per-chunk adaptivity while cutting the finest
+        level's metadata accordingly. It reuses one descriptor across sub-stages,
+        so its rate is >= the fully per-sub-stage gate (gate_fine=False); since
+        packing already makes the per-sub-stage words cheap, that default is
+        usually as good or better. gate_fine helps most when finest metadata, not
+        payload, dominates. Only active when gate is on; the error bound holds
+        regardless (quantization enforces it).
+        """
+        if tune not in ("fast", "size"):
+            raise ValueError("tune must be 'fast' or 'size'")
+        if isinstance(levels, str) and levels != "auto":
+            raise ValueError("levels must be a positive int or 'auto'")
+        if isinstance(compile, str) and compile != "auto":
+            raise ValueError("compile must be a bool or 'auto'")
+        if not isinstance(levels, str) and int(levels) < 1:
+            raise ValueError("levels must be >= 1")
+        radius = int(radius)
+        gate = bool(gate)
+        gate_fine = bool(gate_fine) and gate
+
         arr = np.asarray(_as_numpy(x))
         if arr.size == 0:
             raise ValueError("cannot compress an empty tensor")
@@ -1520,7 +1510,7 @@ class GNNCompressorCodec:
         # the bound against that rounded value, not the normalized one -- see
         # quantize()'s round_output=(span, offset) contract.
         round_output = (vmax - vmin, vmin) if dtype.kind in "bi" else False
-        eb = self.error_bound if error_bound is None else float(error_bound)
+        eb = float(error_bound)
         if eb <= 0:
             raise ValueError("error_bound must be > 0")
 
@@ -1529,15 +1519,15 @@ class GNNCompressorCodec:
         # spread is the same across ranks. The set dedups the levels==1 case
         # where every factor collapses to a flat 1.0 (one encode, not four).
         coarse_candidates = (
-            [float(self.eb_ratio)]
-            if self.eb_ratio is not None
+            [float(eb_ratio)]
+            if eb_ratio is not None
             else (
                 list(_GNN_EB_COARSE_SWEEP)
-                if self.tune == "size"
+                if tune == "size"
                 else [_GNN_EB_COARSE_FACTOR]
             )
         )
-        if self.auto_levels:
+        if isinstance(levels, str):
             import torch
 
             agg_level = _gp._load_inference_model(
@@ -1545,13 +1535,13 @@ class GNNCompressorCodec:
             )[3]
             levels = _auto_levels(shape, agg_level)
         else:
-            levels = self.levels
+            levels = int(levels)
         anchor_stride = 1 << levels
         ratio_candidates = sorted(
             {_per_step_eb_ratio(c, levels) for c in coarse_candidates}
         )
-        edges = self._chunk_edges(shape, anchor_stride)
-        if edges is None and self.gate:
+        edges = self._chunk_edges(shape, anchor_stride, chunk_size)
+        if edges is None and gate:
             # The scale-gated interp fallback lives entirely in the device chunked
             # inner loop; the numpy whole-tensor path has no gate. So when the gate
             # is enabled, realise a "gated whole-tensor" encode as a single chunk
@@ -1568,13 +1558,13 @@ class GNNCompressorCodec:
             if edges is not None
             else 0
         )
-        if self.auto_compile:
+        if isinstance(compile, str):
             want_compile = (
                 _COMPILE_AUTO_CROSSOVER is not None
                 and nchunks >= _COMPILE_AUTO_CROSSOVER
             )
         else:
-            want_compile = self.compile and nchunks >= _COMPILE_MIN_CHUNKS
+            want_compile = bool(compile) and nchunks >= _COMPILE_MIN_CHUNKS
         use_compile = want_compile and edges is not None
         candidates: list[tuple[int, bytes]] = []
         for ratio in ratio_candidates:
@@ -1582,12 +1572,12 @@ class GNNCompressorCodec:
             fine_gates = None
             if edges is None:
                 payload = self._compress_payload(
-                    values, round_output, eb, ratio, levels, anchor_stride
+                    values, round_output, eb, ratio, levels, anchor_stride, radius
                 )
             else:
                 payload, gates, fine_gates = self._compress_chunked_payload(
                     values, round_output, eb, ratio, edges, use_compile,
-                    levels, anchor_stride,
+                    levels, anchor_stride, radius, fp16, gate, gate_fine,
                 )
                 if gates is not None and not any(gates):
                     gates = None  # gate never fired -> plain ungated stream
@@ -1598,7 +1588,7 @@ class GNNCompressorCodec:
                 "dtype": dtype.str,
                 "error_bound": eb,
                 "levels": levels,
-                "radius": self.radius,
+                "radius": radius,
                 "vmin": vmin,
                 "vmax": vmax,
                 "eb_ratio": ratio,
@@ -1607,7 +1597,7 @@ class GNNCompressorCodec:
             if edges is not None:
                 meta["chunks"] = list(edges)
                 meta["m_tile"] = int(_gp._M_TILE)  # replay the exact float path
-                meta["fp16"] = bool(self.fp16)
+                meta["fp16"] = bool(fp16)
                 meta["compiled"] = bool(use_compile)
             if gates is not None:
                 # Per-chunk-stage coarse gate words, zstd+base64 packed (the JSON
@@ -1617,7 +1607,7 @@ class GNNCompressorCodec:
                 # One adaptive finest-gate descriptor per chunk (gate_fine),
                 # packed the same way; decode reads one per chunk.
                 meta["fine_gates"] = _pack_gates(fine_gates)
-            stream = _write_stream(meta, payload, self.zstd_level)
+            stream = _write_stream(meta, payload, int(zstd_level))
             candidates.append((len(stream), stream))
         return min(candidates, key=lambda item: item[0])[1]
 
@@ -1706,6 +1696,7 @@ class GNNCompressorCodec:
         eb_ratio: float,
         levels: int,
         anchor_stride: int,
+        radius: int,
     ) -> bytes:
         predictor = self._predictor(levels)
         masks = stage_masks(values.shape, levels, anchor_stride, _ANCHOR_BLOCK)
@@ -1723,7 +1714,7 @@ class GNNCompressorCodec:
             masks,
             ebs,
             predictor,
-            self.radius,
+            radius,
             round_output,
             stats,
         )
@@ -1739,8 +1730,12 @@ class GNNCompressorCodec:
         use_compile: bool,
         levels: int,
         anchor_stride: int,
+        radius: int,
+        fp16: bool,
+        gate: bool,
+        gate_fine: bool,
     ) -> tuple[bytes, list[int] | None, list[int] | None]:
-        predictor = self._chunked_predictor(levels)
+        predictor = self._chunked_predictor(levels, fp16=fp16)
         predictor.compile = bool(use_compile)
         ebs = _chunk_stage_ebs(
             values.shape,
@@ -1753,12 +1748,12 @@ class GNNCompressorCodec:
         payload, gates, fine_gates = _compress_chunked(
             values[None, ...],
             ebs,
-            self.radius,
+            radius,
             round_output,
             predictor,
             edges,
-            gate=self.gate,
-            gate_fine=self.gate_fine,
+            gate=gate,
+            gate_fine=gate_fine,
         )
         return payload, gates, fine_gates
 
@@ -1766,6 +1761,8 @@ class GNNCompressorCodec:
         self,
         levels: int,
         meta: dict[str, Any] | None = None,
+        *,
+        fp16: bool = True,
     ) -> ChunkedGNNPredictor:
         # vmin/vmax are always 0.0/1.0: compress() normalizes the tensor to
         # [0, 1] up front, so the predictor never sees raw-scale values.
@@ -1779,9 +1776,10 @@ class GNNCompressorCodec:
             anchor_stride=anchor_stride,
             anchor_block=_ANCHOR_BLOCK,
         )
-        # encode: from the codec flag; decode: replay the stream's float path
-        predictor.fp16 = self.fp16 if meta is None else bool(meta["fp16"])
-        predictor.compile = self.compile if meta is None else bool(meta["compiled"])
+        # encode: from the compress() flag; decode: replay the stream's float path
+        predictor.fp16 = fp16 if meta is None else bool(meta["fp16"])
+        # encode overrides this right after (use_compile); decode replays the stream
+        predictor.compile = False if meta is None else bool(meta["compiled"])
         return predictor
 
     def _predictor(

@@ -292,15 +292,14 @@ def main(argv=None):
     # check below) back to that.
     span = max(float(x.max()) - float(x.min()), 1.0)
     for lvl in sorted(set(tested) | {ref_level}):
-        codec = GNNCompressorCodec(
-            ckpt_for_level(lvl),
+        codec = GNNCompressorCodec(ckpt_for_level(lvl), device)
+        stream = codec.compress(
+            x,
             error_bound=args.eb / span,
             levels=args.levels,
             radius=args.radius,
             chunk_size=0,
-            device=device,
         )
-        stream = codec.compress(x)
         rec = codec.uncompress(stream).numpy().reshape(x.shape)
         max_err = float(np.abs(x.astype(np.float64) - rec.astype(np.float64)).max())
         tag = f"level {lvl}"

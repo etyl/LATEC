@@ -7,6 +7,8 @@ coded). The error bound holds regardless of predictor quality — it is the
 quantizer's guarantee — so a tiny random checkpoint suffices.
 """
 
+from functools import partial
+
 import numpy as np
 import pytest
 
@@ -54,16 +56,22 @@ def current_ckpt(tmp_path):
     return path
 
 
-def _codec(path, *, eb=1e-2, chunk_size):
-    return GNNCompressorCodec(
-        path,
-        error_bound=eb,
-        levels=LEVELS,
-        chunk_size=chunk_size,
-        fp16=False,
-        compile=False,
-        gate=False,
+def _codec(path, *, eb=1e-2, chunk_size, **kw):
+    """Codec with the test's compression knobs bound onto compress()."""
+    codec = GNNCompressorCodec(path)
+    codec.compress = partial(
+        codec.compress,
+        **{
+            "error_bound": eb,
+            "levels": LEVELS,
+            "chunk_size": chunk_size,
+            "fp16": False,
+            "compile": False,
+            "gate": False,
+            **kw,
+        },
     )
+    return codec
 
 
 def _maxerr(y, x):
@@ -84,17 +92,10 @@ def test_gate_roundtrip_and_header(current_ckpt):
     )
     f = np.sin(gx) * np.cos(gy) + rng.rand(16, 16).astype(np.float32) * 0.01
     eb = 1e-6
-    on = GNNCompressorCodec(
-        current_ckpt,
-        error_bound=eb,
-        levels=LEVELS,
-        chunk_size=STRIDE,
-        fp16=False,
-        compile=False,
-        gate=True,
-        # isolate the per-chunk-stage coarse gate: the implicit finest gate would
-        # otherwise perturb the stream even when no coarse byte fires.
-        gate_fine=False,
+    # isolate the per-chunk-stage coarse gate: the implicit finest gate would
+    # otherwise perturb the stream even when no coarse byte fires.
+    on = _codec(
+        current_ckpt, eb=eb, chunk_size=STRIDE, gate=True, gate_fine=False
     )
     off = _codec(current_ckpt, eb=eb, chunk_size=STRIDE)
     s_on, s_off = on.compress(f), off.compress(f)
@@ -189,9 +190,8 @@ def test_gate_fine_adaptive_roundtrip_and_header(current_ckpt):
     )
     f = np.sin(gx) * np.cos(gy) + rng.rand(16, 16).astype(np.float32) * 0.005
     eb = 1e-5
-    codec = GNNCompressorCodec(
-        current_ckpt, error_bound=eb, levels=LEVELS, chunk_size=STRIDE,
-        fp16=False, compile=False, gate=True, gate_fine=True,
+    codec = _codec(
+        current_ckpt, eb=eb, chunk_size=STRIDE, gate=True, gate_fine=True
     )
     stream = codec.compress(f)
     meta = _read_stream(stream)[0]
@@ -247,10 +247,7 @@ def test_bound_holds_in_original_units_within_roundtrip_slack(current_ckpt):
     slack = roundtrip_slack(float(f.min()), float(f.max()))
 
     for eb in (1e-2, 1e-3, 1e-4):
-        codec = GNNCompressorCodec(
-            current_ckpt, error_bound=eb, levels=LEVELS, chunk_size=STRIDE,
-            fp16=False, compile=False, gate=True,
-        )
+        codec = _codec(current_ckpt, eb=eb, chunk_size=STRIDE, gate=True)
         rec = codec.uncompress(codec.compress(f)).numpy()
         abs_eb = eb * (float(f.max()) - float(f.min()))
         err = np.abs(f.astype(np.float64) - rec.astype(np.float64))
@@ -356,8 +353,8 @@ def test_chunked_matches_whole_bound(current_ckpt):
     yw = whole.uncompress(whole.compress(x))
     yc = chunk.uncompress(chunk.compress(x))
 
-    assert _maxerr(yw, x) <= whole.error_bound
-    assert _maxerr(yc, x) <= chunk.error_bound
+    assert _maxerr(yw, x) <= 1e-2  # _codec's default eb
+    assert _maxerr(yc, x) <= 1e-2
 
 
 def test_gate_applies_on_whole_tensor_path(current_ckpt):
@@ -370,36 +367,30 @@ def test_gate_applies_on_whole_tensor_path(current_ckpt):
     rng = np.random.RandomState(3)
     x = rng.rand(20, 24).astype(np.float32)
 
-    gated = GNNCompressorCodec(
-        current_ckpt, error_bound=1e-4, levels=LEVELS, chunk_size=0,
-        fp16=False, compile=False, gate=True,
-    )
-    plain = GNNCompressorCodec(
-        current_ckpt, error_bound=1e-4, levels=LEVELS, chunk_size=0,
-        fp16=False, compile=False, gate=False,
-    )
+    gated = _codec(current_ckpt, eb=1e-4, chunk_size=0, gate=True)
+    plain = _codec(current_ckpt, eb=1e-4, chunk_size=0, gate=False)
 
     sg = gated.compress(x)
     meta_g = _read_stream(sg)[0]
     # gate routes the whole-tensor case through a single chunk covering the shape
     assert meta_g["chunks"] == [20, 24]  # ceil(shape, anchor_stride=1<<LEVELS)
     assert "chunks" not in _read_stream(plain.compress(x))[0]  # numpy whole path
-    assert _maxerr(gated.uncompress(sg), x) <= gated.error_bound
+    assert _maxerr(gated.uncompress(sg), x) <= 1e-4
 
 
 def test_auto_chunk_selection(current_ckpt):
     """chunk_size=None: whole-tensor for small inputs, chunked past the
     threshold; forced int must be a multiple of anchor_stride."""
     codec = _codec(current_ckpt, chunk_size=None)
-    assert codec._chunk_edges((16, 16), STRIDE) is None  # small -> whole
+    assert codec._chunk_edges((16, 16), STRIDE, None) is None  # small -> whole
     big = (1 << 12, 1 << 12)  # 16.7M points -> chunked
-    edges = codec._chunk_edges(big, STRIDE)
+    edges = codec._chunk_edges(big, STRIDE, None)
     assert edges is not None
     assert all(e % STRIDE == 0 and e > 0 for e in edges)
     assert np.prod([min(e, n) for e, n in zip(edges, big)]) <= 1 << 21
     assert np.prod([min(e + STRIDE, n) for e, n in zip(edges, big)]) > 1 << 21
 
-    elongated = codec._chunk_edges((1 << 20, 16), STRIDE)
+    elongated = codec._chunk_edges((1 << 20, 16), STRIDE, None)
     assert elongated[1] >= 16
     assert elongated[0] > edges[0]  # short axis leaves room for a longer chunk
 
@@ -583,14 +574,7 @@ def test_fp16_flag_roundtrips_and_persists(current_ckpt):
 
     rng = np.random.RandomState(9)
     x = rng.rand(8, 8).astype(np.float32)
-    codec = GNNCompressorCodec(
-        current_ckpt,
-        error_bound=0.02,
-        levels=LEVELS,
-        chunk_size=STRIDE,
-        fp16=True,
-        compile=False,
-    )
+    codec = _codec(current_ckpt, eb=0.02, chunk_size=STRIDE, fp16=True)
 
     stream = codec.compress(x)
     meta, _ = _read_stream(bytes(stream))
@@ -607,14 +591,7 @@ def test_compile_flag_roundtrips_and_persists(current_ckpt, monkeypatch):
 
     rng = np.random.RandomState(11)
     x = rng.rand(8, 8).astype(np.float32)
-    codec = GNNCompressorCodec(
-        current_ckpt,
-        error_bound=0.02,
-        levels=LEVELS,
-        chunk_size=STRIDE,
-        fp16=False,
-        compile=True,
-    )
+    codec = _codec(current_ckpt, eb=0.02, chunk_size=STRIDE, compile=True)
 
     stream = codec.compress(x)
     meta, _ = _read_stream(bytes(stream))
@@ -636,11 +613,7 @@ def test_compile_auto_defers_to_crossover(current_ckpt, monkeypatch):
 
     rng = np.random.RandomState(12)
     x = rng.rand(8, 8).astype(np.float32)  # 4 chunks at chunk_size=STRIDE
-    codec = GNNCompressorCodec(
-        current_ckpt, error_bound=0.02, levels=LEVELS, chunk_size=STRIDE,
-        fp16=False, compile="auto",
-    )
-    assert codec.auto_compile is True and codec.compile is False
+    codec = _codec(current_ckpt, eb=0.02, chunk_size=STRIDE, compile="auto")
 
     # crossover None -> auto stays off even with the forced floor lowered
     monkeypatch.setattr(gc, "_COMPILE_MIN_CHUNKS", 1)
@@ -655,7 +628,9 @@ def test_compile_auto_defers_to_crossover(current_ckpt, monkeypatch):
 
 def test_bad_compile_string_rejected(current_ckpt):
     with pytest.raises(ValueError, match="bool or 'auto'"):
-        GNNCompressorCodec(current_ckpt, compile="yes")
+        GNNCompressorCodec(current_ckpt).compress(
+            np.zeros((8, 8), np.float32), compile="yes"
+        )
 
 
 # --- halo geometry: out-of-chunk neighbours go live only once coded ---------
