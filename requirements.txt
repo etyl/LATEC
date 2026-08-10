@@ -8,3 +8,10 @@ constriction~=0.4.2
 pillow
 pytest
 pysz   # SZ3 baseline for `eval` (imagecodecs needs glibc>=2.28; this box has 2.27)
+
+# scripts/ only (training, eval, plots)
+h5py
+tqdm
+matplotlib
+wandb
+the_well   # dataset URLs for scripts/finetune_well.py
