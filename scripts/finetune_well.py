@@ -90,7 +90,7 @@ from latec.gnn_predictor import (  # noqa: E402
 # (crop, anchor stride) per tensor rank: two anchor cells per axis, at the size
 # inference codes one chunk at. Ranks outside the table halve both per extra
 # axis, keeping the slab near the same point count.
-_CROP_STRIDE = {3: (32, 16), 4: (16, 8)}
+_CROP_STRIDE = {3: (64, 32), 4: (32, 16)}
 
 
 def _crop_stride(ndim: int) -> tuple[int, int]:
@@ -99,6 +99,48 @@ def _crop_stride(ndim: int) -> tuple[int, int]:
     crop, stride = _CROP_STRIDE[min(max(ndim, 3), 4)]
     shift = max(0, ndim - 4)
     return max(4, crop >> shift), max(2, stride >> shift)
+
+
+# Depths sampled below the deepest one, so the band is _LEVEL_SPAN + 1 wide.
+_LEVEL_SPAN = 2
+
+
+def _stride_choices(crop: int, stride: int) -> tuple[int, ...]:
+    """Anchor strides to sample from during finetuning: the deepest schedule the
+    crop can hold, and the ``_LEVEL_SPAN`` shallower ones.
+
+    The top of the band is ``log2(crop)`` -- the deepest schedule whose anchor
+    stride still fits a slab, one anchor cell across. That lands on the deployed
+    depth on its own, because ``_CROP_STRIDE`` sets the crop to twice the rank's
+    anchor stride: rank 4 crops at 32 and ``levels="auto"`` codes rank 4 at 5;
+    rank 3 crops at 64 and codes at 6 (aggregation level 2). Deeper deployments
+    follow the crop too, with no constant to edit -- ``--crop 128`` gives levels
+    4..7, which covers rank 3 at aggregation level 1.
+
+    Training at a single fixed depth specialises the model to that rollout
+    length and gives up most of the gain at every other one. Measured on
+    supernova (4-D, the benchmark tensor), a run tuned only at levels=4 scored
+    0.5609 bpv there but 0.6175 at levels=5 -- which is what ``levels="auto"``
+    resolves to for a rank-4 input -- against 0.6285/0.6273 for the pretrained
+    weights. So the finetune bought 11% at its own depth and 2% at the deployed
+    one, and the per-stage cost showed up as 2.7x larger quantization codes and
+    a 3.5x inflated predicted scale on the *finest* stages, whose geometry is
+    identical at both depths. The pretrained model is depth-flat because
+    ``train_gnn.py`` randomises the stride per step; this keeps that property.
+
+    Sampling is per optimizer step, not per slab in the batch: ``run_stages``
+    takes one geometry for the whole batch, so a per-slab depth would mean one
+    forward/backward per depth on a launch-bound path. ``train_gnn.py`` draws
+    its stride per step too, and that is what makes the pretrained weights
+    depth-flat, so per-step demonstrably suffices.
+
+    ``stride`` (the rank default) stands in for the crop under ``--crop 0``,
+    where a slab is a whole trajectory and there is no one side to measure. Both
+    ends are clamped to level 1: stride 1 is not a schedule.
+    """
+    hi = max(1, (crop or stride).bit_length() - 1)  # floor(log2), so 48 -> 32
+    lo = max(1, hi - _LEVEL_SPAN)
+    return tuple(1 << lv for lv in range(lo, hi + 1))
 
 
 class WellSlabs:
@@ -344,8 +386,16 @@ def run(args, train, test, device, rng):
 
     crop, stride = _crop_stride(train.ndim)
     train.crop = crop if args.crop is None else args.crop
+    # An explicit --stride/--levels pins one depth (the deterministic, comparable
+    # profile the flags advertise); otherwise sample per step (see _stride_choices).
+    pinned = args.levels is not None or args.stride is not None
     args.stride = stride if args.stride is None else args.stride
-    print(f"slabs: crop={train.crop} stride={args.stride}")
+    strides = (args.stride,) if pinned else _stride_choices(train.crop, args.stride)
+    levels_seen = sorted({args.levels or s.bit_length() - 1 for s in strides})
+    print(
+        f"slabs: crop={train.crop} stride={args.stride} "
+        f"sampled strides={strides} -> levels={levels_seen}"
+    )
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
     scaler = torch.amp.GradScaler("cuda", enabled=args.fp16 and device.type == "cuda")
@@ -366,15 +416,17 @@ def run(args, train, test, device, rng):
         eval_model.eval()
         return eval_model
 
-    levels = args.levels or args.stride.bit_length() - 1
     geom_cache = {}
 
-    def geoms_for(shape):
-        if shape not in geom_cache:
-            geom_cache[shape] = build_stage_geoms(
-                shape, levels, args.stride, 1, args.max_radius, torch, device, agg_level
+    def geoms_for(shape, levels, stride):
+        # Keyed on the schedule too: the stride varies per step now, and two
+        # depths on the same slab shape are different geometries.
+        key = (shape, levels, stride)
+        if key not in geom_cache:
+            geom_cache[key] = build_stage_geoms(
+                shape, levels, stride, 1, args.max_radius, torch, device, agg_level
             )[0]
-        return geom_cache[shape]
+        return geom_cache[key]
 
     # Held-out eval: the *whole* test-split trajectory (64^4 for this dataset),
     # roundtripped through the real chunked codec. A
@@ -398,10 +450,10 @@ def run(args, train, test, device, rng):
         if device.type == "cuda":
             torch.cuda.empty_cache()
         bpv = metrics["eval_tensor/bits_per_value"]
-        save(last_out, m, d, agg_level, levels, args.stride)
+        save(last_out, m, d, agg_level, levels_seen, list(strides))
         if bpv < best:
             best = bpv
-            save(out, m, d, agg_level, levels, args.stride)
+            save(out, m, d, agg_level, levels_seen, list(strides))
         return metrics
 
     # step 0: the un-finetuned baseline, so every later eval has a reference
@@ -413,10 +465,15 @@ def run(args, train, test, device, rng):
         vols = [train.slab(int(i), rng, args.log) for i in idx]
         x = torch.as_tensor(np.stack([v.reshape(-1) for v in vols])).to(device)
         eb = sample_noise(x.shape[0], args, device)
+        # One schedule depth per step, so the model stays usable at every depth
+        # inference may pick rather than only the one it was tuned at.
+        stride = strides[int(rng.integers(0, len(strides)))]
+        levels = args.levels or stride.bit_length() - 1
         opt.zero_grad()
         with training_autocast(args.fp16, device):
             nll, npix, _, _, aux = run_stages(
-                model, x, geoms_for(vols[0].shape), d, device, eb=eb, teacher_force=True
+                model, x, geoms_for(vols[0].shape, levels, stride), d, device,
+                eb=eb, teacher_force=True,
             )
         loss = nll / max(npix, 1)
         scaler.scale(loss).backward()
@@ -445,11 +502,18 @@ def run(args, train, test, device, rng):
 def save(path, model, d, agg_level, levels=None, stride=None):
     """Write the weights, plus the schedule geometry they were tuned at.
 
-    Finetuning specialises a model to its rollout depth: on supernova, tuning at
-    levels=4 gained 12% there and 2% at levels=5, which is what ``levels="auto"``
-    resolves to for a 4-D tensor. The pretrained model is depth-flat, so nothing
-    upstream records this -- but a finetuned checkpoint is only worth its
-    benchmark number at the depth it saw, so the depth travels with it.
+    Finetuning specialises a model to its rollout depth: tuning supernova only
+    at levels=4 gained 11% there and 2% at levels=5, which is what
+    ``levels="auto"`` resolves to for a 4-D tensor. The training loop now
+    samples the depth per step (see ``_stride_choices``) so a finetuned
+    checkpoint keeps the pretrained model's depth-flatness, and these fields
+    record the range it actually saw -- ``levels`` outside it is extrapolation.
+
+    Both are *lists* (sorted, one entry per sampled schedule), not the scalars
+    of the first revision of this field: with per-step sampling there is no
+    single depth to name. Nothing reads them at inference yet, so this is
+    metadata only and needs no CKPT_VERSION bump -- the model state and its
+    interpretation are unchanged.
     """
     torch.save(
         {
@@ -509,6 +573,23 @@ def self_check(args):
     # two anchor cells per axis at every rank, halving past 4-D
     assert _crop_stride(3) == (64, 32) and _crop_stride(4) == (32, 16)
     assert _crop_stride(5) == (16, 8)
+    # Depth is sampled from the deepest schedule the crop holds down _LEVEL_SPAN
+    # levels. The crop lands the top on the deployed depth by itself: rank 4
+    # crops at 32 -> levels 5, rank 3 at 64 -> levels 6.
+    assert [s.bit_length() - 1 for s in _stride_choices(32, 16)] == [3, 4, 5]
+    assert [s.bit_length() - 1 for s in _stride_choices(64, 32)] == [4, 5, 6]
+    assert _stride_choices(32, 16) == (8, 16, 32)
+    assert _stride_choices(64, 32) == (16, 32, 64)
+    # a bigger crop reaches deeper with no constant to edit (rank 3, agg level 1)
+    assert [s.bit_length() - 1 for s in _stride_choices(128, 64)] == [5, 6, 7]
+    # never an anchor stride the crop cannot hold, and floor(log2) off powers of 2
+    assert _stride_choices(16, 16) == (4, 8, 16)
+    assert _stride_choices(48, 16) == (8, 16, 32)
+    # --crop 0 (whole trajectory) has no side to measure: fall back to the stride
+    assert _stride_choices(0, 16) == (4, 8, 16)
+    # ... and never empty or below level 1, however small the crop
+    assert _stride_choices(4, 2) == (2, 4)
+    assert _stride_choices(1, 1) == (2,)
 
     crop = 8
     train = WellSlabs([path], "density", crop)
@@ -529,14 +610,33 @@ def self_check(args):
     else:
         raise AssertionError("--test-timesteps past the end must fail loudly")
 
+    # An explicit --stride pins one depth, the deterministic profile.
     args.steps, args.batch, args.crop, args.stride, args.warmup = 2, 1, crop, 4, 1
     args.wandb_mode, args.eval_every = "disabled", 2
     args.out = str(tmp / "ckpt.pt")
     run(args, train, test, torch.device(args.device), rng)
     (run_dir,) = (tmp / "runs").iterdir()  # fresh per-run dir, nothing clobbered
     for p in (run_dir / "ckpt.pt", run_dir / "ckpt-last.pt"):
-        assert torch.load(p, map_location="cpu", weights_only=True)["version"] == CKPT_VERSION
+        ckpt = torch.load(p, map_location="cpu", weights_only=True)
+        assert ckpt["version"] == CKPT_VERSION
+        assert ckpt["train_levels"] == [2] and ckpt["train_stride"] == [4]
     assert not (tmp / "ckpt.pt").exists()
+
+    # ...and with --stride/--levels left alone the depth is sampled per step, so
+    # the weights stay usable at whatever depth levels="auto" resolves to. Needs
+    # a grid wide enough to hold more than one anchor stride.
+    wide = _synthetic(tmp / "sim_wide.h5", ["x", "y", "z"], n_time=16, n=16)
+    train2 = WellSlabs([wide], "density", 16)
+    test2 = WellSlabs([wide], "density", 0)
+    test2.index = [i for i in test2.index if i[1] == 0]
+    args.crop, args.stride, args.levels = 16, None, None
+    args.out = str(tmp / "sampled.pt")
+    run(args, train2, test2, torch.device(args.device), rng)
+    sampled = sorted((tmp / "runs").iterdir())[-1] / "sampled-last.pt"
+    ckpt = torch.load(sampled, map_location="cpu", weights_only=True)
+    # crop 16 -> deepest schedule is levels 4, and _LEVEL_SPAN below it
+    assert ckpt["train_stride"] == [4, 8, 16], ckpt["train_stride"]
+    assert ckpt["train_levels"] == [2, 3, 4], ckpt["train_levels"]
     print("self-check OK")
 
 

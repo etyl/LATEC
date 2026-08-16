@@ -57,6 +57,13 @@ TEST_TIMESTEPS=${TEST_TIMESTEPS:-0}
 # Validation is --test-traj of the *test* split, whole -- T truncated per
 # TEST_TIMESTEPS -- run through the real chunked codec, so it takes minutes:
 # keep --eval-every large.
+# The schedule depth is sampled per optimizer step, from the deepest schedule
+# --crop can hold (levels = log2(crop)) down _LEVEL_SPAN levels: 4-D crops at 32
+# -> levels 3..5, 3-D at 64 -> 4..6. That top end is the depth levels="auto"
+# codes the rank at, so the weights are tuned where they are deployed, and a
+# deeper deployment just needs a bigger crop -- --crop 128 gives levels 5..7,
+# which covers a 3-D checkpoint at aggregation level 1. Pass --stride or
+# --levels to pin one depth instead, for a deterministic, comparable profile.
 # Add --log for fields spanning decades.
 python scripts/finetune_well.py \
     --init checkpoints/v7-d64-1agg.pt \
