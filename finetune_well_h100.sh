@@ -57,7 +57,9 @@ TEST_TIMESTEPS=${TEST_TIMESTEPS:-0}
 # crop**rank, so --crop 32 on a 4-D dataset is 16x the memory and wants --batch 1.
 # Validation is --test-traj of the *test* split, whole -- T truncated per
 # TEST_TIMESTEPS -- run through the real chunked codec, so it takes minutes:
-# keep --eval-every large.
+# keep --eval-every large. It codes at --eval-levels, default "auto", i.e. the
+# depth deployment resolves to (5 for a 4-D tensor) rather than the depth the
+# slabs train at -- that is what the best checkpoint is selected on.
 # The schedule depth is sampled per optimizer step, from the deepest schedule
 # --crop can hold (levels = log2(crop)) down _LEVEL_SPAN levels: 3-D crops at 64
 # -> levels 4..6, which is the depth levels="auto" codes the rank at, and a

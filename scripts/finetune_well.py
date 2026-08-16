@@ -279,6 +279,13 @@ def main():
         "--stride", type=int, default=None, help="default: the pretraining anchor stride"
     )
     ap.add_argument("--levels", type=int, default=None)
+    ap.add_argument(
+        "--eval-levels",
+        default="auto",
+        help="schedule depth the held-out roundtrip codes at, which is what the "
+        "best checkpoint is selected on: an int, or \"auto\" (default) for the "
+        "depth levels=\"auto\" resolves to at deployment — 5 for a rank-4 tensor",
+    )
     ap.add_argument("--max-radius", type=int, default=64)
     ap.add_argument("--ema-decay", type=float, default=0.999)
     ap.add_argument("--eval-eb", type=float, default=0.01)
@@ -401,6 +408,13 @@ def run(args, train, test, device, rng):
     args.stride = stride if args.stride is None else args.stride
     strides = (args.stride,) if pinned else _stride_choices(train.crop, args.stride)
     levels_seen = sorted({args.levels or s.bit_length() - 1 for s in strides})
+    # Selection depth. "auto" is what the benchmark codes at, which for a rank-4
+    # input is 5 -- above the band a rank-4 crop can train (levels 2..4), so the
+    # weights are chosen on an extrapolation. That is deliberate: a checkpoint is
+    # only worth keeping if it holds up at the depth it will be deployed at.
+    eval_levels = args.eval_levels
+    if eval_levels != "auto":
+        eval_levels = int(eval_levels)
     print(
         f"slabs: crop={train.crop} stride={args.stride} "
         f"sampled strides={strides} -> levels={levels_seen}"
@@ -452,7 +466,8 @@ def run(args, train, test, device, rng):
         m = eval_weights()
         with torch.no_grad():
             metrics = eval_tensor_codec(
-                m, d, args, eval_tensor, args.eval_eb, device, run_dir / "eval_tensor.pt"
+                m, d, args, eval_tensor, args.eval_eb, device,
+                run_dir / "eval_tensor.pt", levels=eval_levels,
             )
         if m is model:
             model.train()
