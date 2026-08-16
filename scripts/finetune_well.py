@@ -11,9 +11,9 @@ the first scalar field in the file.
 The tensor rank follows the dataset: a trajectory is (T, *spatial), so 2-D
 simulations train and eval as 3-D tensors and 3-D ones as 4-D. Training fields
 are hypercubes of --crop cells along time and each spatial axis (clamped to the
-axis length). --crop and --stride default per rank to the size inference codes
-one chunk at — 64/32 for 3-D tensors, 32/16 for 4-D — so a training slab is
-about the block the model will be asked to predict.
+axis length). --crop and --stride default per rank — 64/32 for 3-D tensors,
+16/8 for 4-D — so a training slab is about the block the model will be asked to
+predict, within what a batch of them fits in memory.
 
 Eval is a whole trajectory of the dataset's *test* split (--test-traj, T
 truncated to a power of two), pushed through the real codec, so the reported
@@ -87,10 +87,15 @@ from latec.gnn_predictor import (  # noqa: E402
     build_stage_geoms,
 )
 
-# (crop, anchor stride) per tensor rank: two anchor cells per axis, at the size
-# inference codes one chunk at. Ranks outside the table halve both per extra
-# axis, keeping the slab near the same point count.
-_CROP_STRIDE = {3: (64, 32), 4: (32, 16)}
+# (crop, anchor stride) per tensor rank: two anchor cells per axis. Ranks
+# outside the table halve both per extra axis, keeping the slab near the same
+# point count.
+#
+# Rank 4 crops at 16 rather than the 32 inference codes one chunk at, because a
+# 32^4 slab is 16x the points of a 16^4 one and OOMs a batch that fits at 16.
+# The cost is that the sampled band tops out one level short of the deployed
+# depth -- see _stride_choices.
+_CROP_STRIDE = {3: (64, 32), 4: (16, 8)}
 
 
 def _crop_stride(ndim: int) -> tuple[int, int]:
@@ -110,12 +115,16 @@ def _stride_choices(crop: int, stride: int) -> tuple[int, ...]:
     crop can hold, and the ``_LEVEL_SPAN`` shallower ones.
 
     The top of the band is ``log2(crop)`` -- the deepest schedule whose anchor
-    stride still fits a slab, one anchor cell across. That lands on the deployed
-    depth on its own, because ``_CROP_STRIDE`` sets the crop to twice the rank's
-    anchor stride: rank 4 crops at 32 and ``levels="auto"`` codes rank 4 at 5;
-    rank 3 crops at 64 and codes at 6 (aggregation level 2). Deeper deployments
-    follow the crop too, with no constant to edit -- ``--crop 128`` gives levels
-    4..7, which covers rank 3 at aggregation level 1.
+    stride still fits a slab, one anchor cell across -- so the band follows the
+    crop with no constant to edit. Rank 3 crops at 64, giving levels 4..6, and
+    ``levels="auto"`` codes rank 3 at 6 (aggregation level 2); ``--crop 128``
+    gives 5..7, which covers aggregation level 1.
+
+    Rank 4 is the exception: it crops at 16 to keep a batch in memory, so the
+    band is levels 2..4 while ``levels="auto"`` codes rank 4 at 5. Depth 5 is
+    then extrapolation rather than training data; if rank-4 numbers at the
+    deployed depth matter, raise ``--crop`` to 32 and drop ``--batch`` to 1 to
+    pay for it.
 
     Training at a single fixed depth specialises the model to that rollout
     length and gives up most of the gain at every other one. Measured on
@@ -571,12 +580,13 @@ def self_check(args):
     assert WellSlabs([flat], "density", 64).slab(0, rng).shape == (12, 8, 8)
     assert flat_slabs.trajectory(0).shape == (8, 8, 8)
     # two anchor cells per axis at every rank, halving past 4-D
-    assert _crop_stride(3) == (64, 32) and _crop_stride(4) == (32, 16)
-    assert _crop_stride(5) == (16, 8)
+    assert _crop_stride(3) == (64, 32) and _crop_stride(4) == (16, 8)
+    assert _crop_stride(5) == (8, 4)
     # Depth is sampled from the deepest schedule the crop holds down _LEVEL_SPAN
-    # levels. The crop lands the top on the deployed depth by itself: rank 4
-    # crops at 32 -> levels 5, rank 3 at 64 -> levels 6.
-    assert [s.bit_length() - 1 for s in _stride_choices(32, 16)] == [3, 4, 5]
+    # levels: rank 3 crops at 64 -> levels 4..6, the deployed depth at
+    # aggregation level 2. Rank 4 crops at 16 for memory, so its band stops at
+    # levels 4, one short of the 5 levels="auto" codes it at.
+    assert [s.bit_length() - 1 for s in _stride_choices(16, 8)] == [2, 3, 4]
     assert [s.bit_length() - 1 for s in _stride_choices(64, 32)] == [4, 5, 6]
     assert _stride_choices(32, 16) == (8, 16, 32)
     assert _stride_choices(64, 32) == (16, 32, 64)
