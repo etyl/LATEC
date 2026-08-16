@@ -1496,7 +1496,10 @@ class GNNCompressorCodec:
         dtype = np.dtype(arr.dtype)
         original_shape = tuple(int(n) for n in arr.shape)
         shape = original_shape if original_shape else (1,)
-        values = arr.reshape(shape).astype(np.float32, copy=False)
+        # copy=True (the default): we own the buffer, so the normalize below can
+        # run in place. astype(copy=False) + out-of-place arithmetic would peak
+        # at three full-size arrays on a large field.
+        values = arr.reshape(shape).astype(np.float32)
         vmin = float(values.min())
         vmax = float(values.max())
         if vmax <= vmin:
@@ -1504,7 +1507,8 @@ class GNNCompressorCodec:
         # Normalize to [0, 1]: the GNN always operates in that range, and it
         # makes error_bound naturally relative -- applied directly below, with
         # no separate rescale, it means a fraction of (vmax - vmin).
-        values = (values - vmin) / (vmax - vmin)
+        values -= vmin
+        values /= vmax - vmin
         # Integer sources: the final decompressed value is rounded to the
         # nearest raw integer (_restore_dtype), so the quantizer must verify
         # the bound against that rounded value, not the normalized one -- see
@@ -1658,7 +1662,10 @@ class GNNCompressorCodec:
                 )
             finally:
                 _gp._M_TILE = saved_tile
-            values = values * (vmax - vmin) + vmin  # undo compress()'s [0, 1] normalize
+            # In place: `values` is a fresh float32 buffer from the decode, and
+            # out-of-place would hold two full-size copies of the field.
+            values *= vmax - vmin  # undo compress()'s [0, 1] normalize
+            values += vmin
             out = _restore_dtype(values.reshape(original_shape), dtype)
             return torch.as_tensor(out)
 
@@ -1682,7 +1689,8 @@ class GNNCompressorCodec:
         values = _decompress_region(
             payload, shape, masks, ebs, int(meta["radius"]), predictor, True
         )
-        values = values * (vmax - vmin) + vmin  # undo compress()'s [0, 1] normalize
+        values *= vmax - vmin  # undo compress()'s [0, 1] normalize (in place)
+        values += vmin
         out = _restore_dtype(values.reshape(original_shape), dtype)
         return torch.as_tensor(out)
 
@@ -1800,9 +1808,9 @@ class GNNCompressorCodec:
         )
 
     def _checkpoint_hash(self) -> bytes:
-        import hashlib
-
-        return hashlib.sha256(self.checkpoint_path.read_bytes()).digest()[:16]
+        # Streamed: this runs on every codec construction, and read_bytes()
+        # would pull the whole checkpoint into RAM each time.
+        return _gp.file_sha256(self.checkpoint_path)[:16]
 
 
 GNNCodec = GNNCompressorCodec

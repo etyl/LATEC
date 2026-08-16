@@ -975,6 +975,15 @@ def build_model(d: int = 32, agg_level: int = 2):
     return GNN()
 
 
+def file_sha256(path) -> bytes:
+    """Streamed sha256 of a file; read_bytes() would hold it all in RAM."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.digest()
+
+
 def _load_inference_model(checkpoint_path, torch, device):
     """Load immutable inference weights once per checkpoint revision/device."""
     path = Path(checkpoint_path).resolve()
@@ -1006,8 +1015,9 @@ def _load_inference_model(checkpoint_path, torch, device):
     agg_level = int(ckpt["agg_level"])
     model = build_model(d, agg_level).eval()
     model.load_state_dict(ckpt["state_dict"])
+    del ckpt  # a second CPU copy of the weights, dead once loaded
     model.to(device)
-    checkpoint_hash = hashlib.sha256(path.read_bytes()).digest()[:16]
+    checkpoint_hash = file_sha256(path)[:16]
     out = (d, model, checkpoint_hash, agg_level)
     _MODEL_CACHE[key] = out
     return out
