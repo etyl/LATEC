@@ -52,11 +52,22 @@ TEST_TIMESTEPS=${TEST_TIMESTEPS:-0}
 
 # Finetune on hypercube crops (clamped to shorter axes) of the train split. The
 # rank follows the dataset: 2-D sims train as 3-D tensors, 3-D sims as 4-D, and
-# --crop/--stride default per rank to inference's block size (3-D 64/32, 4-D
-# 32/16). A 3-D slab is 256k points: raise --batch until the GPU is busy.
+# --crop/--stride default per rank (3-D 64/32, 4-D 16/8). A 3-D slab is 256k
+# points and a 4-D one 65k: raise --batch until the GPU is busy. Crop scales as
+# crop**rank, so --crop 32 on a 4-D dataset is 16x the memory and wants --batch 1.
 # Validation is --test-traj of the *test* split, whole -- T truncated per
 # TEST_TIMESTEPS -- run through the real chunked codec, so it takes minutes:
-# keep --eval-every large.
+# keep --eval-every large. It codes at --eval-levels, default "auto", i.e. the
+# depth deployment resolves to (5 for a 4-D tensor) rather than the depth the
+# slabs train at -- that is what the best checkpoint is selected on.
+# The schedule depth is sampled per optimizer step, from the deepest schedule
+# --crop can hold (levels = log2(crop)) down _LEVEL_SPAN levels: 3-D crops at 64
+# -> levels 4..6, which is the depth levels="auto" codes the rank at, and a
+# deeper deployment just needs a bigger crop -- --crop 128 gives levels 5..7,
+# which covers a 3-D checkpoint at aggregation level 1. 4-D crops at 16 -> levels
+# 2..4, one short of the 5 it deploys at, which is what the smaller crop costs;
+# --crop 32 --batch 1 trains the deployed depth instead. Pass --stride or
+# --levels to pin one depth instead, for a deterministic, comparable profile.
 # Add --log for fields spanning decades.
 python scripts/finetune_well.py \
     --init checkpoints/v7-d64-1agg.pt \

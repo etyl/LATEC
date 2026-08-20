@@ -277,7 +277,7 @@ class _PeakRSS:
         self.peak = max(self.peak, self._rss_mb())
 
 
-def eval_tensor_codec(model, d, args, tensor, eb, device, ckpt_path):
+def eval_tensor_codec(model, d, args, tensor, eb, device, ckpt_path, levels=None):
     """Roundtrip `tensor` (a small n-D array, e.g. 4-D) through the *real* codec
     at the current weights and return distortion / rate / peak-RAM / time metrics
     for wandb. Unlike the closed-loop image eval, this exercises the full
@@ -286,6 +286,11 @@ def eval_tensor_codec(model, d, args, tensor, eb, device, ckpt_path):
 
     The codec loads weights from disk, so the live model is frozen to `ckpt_path`
     first (overwritten each call; the model cache keys on mtime so this reloads).
+
+    ``levels`` is the schedule depth to code at: an int, "auto" to let the codec
+    resolve it from the tensor's rank the way deployment does, or None to keep
+    ``args.levels or 4``. It decides which depth the best-checkpoint selection
+    optimises, so it should be the depth the weights will be deployed at.
     """
     from latec.gnn_codec import GNNCompressorCodec
 
@@ -316,7 +321,7 @@ def eval_tensor_codec(model, d, args, tensor, eb, device, ckpt_path):
         stream = codec.compress(
             tensor,
             error_bound=eb,
-            levels=(args.levels or 4),
+            levels=(args.levels or 4) if levels is None else levels,
             fp16=args.fp16,
             compile=False,
         )
