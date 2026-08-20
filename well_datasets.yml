@@ -1,0 +1,57 @@
+# The Well datasets finetuned so far, with the flags that make finetune_well.py
+# read the same tensor the benchmark does (see its datasets/*.py file_token).
+# Used by finetune_well_h100.sh:  WELL=mhd sbatch finetune_well_h100.sh
+#
+# dataset/params/field  -> --dataset/--params/--field (params = filename substring)
+# test_params           -> --test-params, when the test split holds another file
+# test_timesteps        -> the benchmark's n_timesteps cap (0 = largest power of two)
+
+rti:
+  dataset: rayleigh_taylor_instability
+  params: rayleigh_taylor_instability_At_75
+  field: density
+  test_params: ""
+  test_timesteps: 0
+
+gravity:
+  dataset: turbulence_gravity_cooling
+  params: turbulence_gravity_cooling_rho0_4.45_Z_1_T0_100
+  field: density
+  test_params: ""
+  test_timesteps: 0
+
+mhd:
+  dataset: MHD_64
+  params: MHD_Ma_0.7_Ms_0.5
+  field: density
+  test_params: ""
+  test_timesteps: 0
+
+euler:
+  dataset: euler_multi_quadrants_openBC
+  params: euler_multi_quadrants_openBC_gamma_1.4_Dry_air_20
+  field: density
+  test_params: ""
+  test_timesteps: 64
+
+convective:
+  # Splits partition trajectories, so no token names a file in both.
+  dataset: convective_envelope_rsg
+  params: convective_envelope_rsg_trajectories_1
+  field: density
+  test_params: convective_envelope_rsg_trajectories_11
+  test_timesteps: 64
+
+gray_scott:
+  dataset: gray_scott_reaction_diffusion
+  params: gray_scott_reaction_diffusion_gliders_F_0.014_k_0.054
+  field: A
+  test_params: ""
+  test_timesteps: 256
+
+supernova:
+  dataset: supernova_explosion_128
+  params: supernova_explosion_Msun_0.1_dim128_file_00
+  field: density
+  test_params: ""
+  test_timesteps: 0

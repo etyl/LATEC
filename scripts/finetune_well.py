@@ -11,7 +11,7 @@ the first scalar field in the file.
 The tensor rank follows the dataset: a trajectory is (T, *spatial), so 2-D
 simulations train and eval as 3-D tensors and 3-D ones as 4-D. Training fields
 are hypercubes of --crop cells along time and each spatial axis (clamped to the
-axis length). --crop and --stride default per rank — 64/32 for 3-D tensors,
+axis length). --crop and --stride default per rank — 32/16 for 3-D tensors,
 16/8 for 4-D — so a training slab is about the block the model will be asked to
 predict, within what a batch of them fits in memory.
 
@@ -91,11 +91,12 @@ from latec.gnn_predictor import (  # noqa: E402
 # outside the table halve both per extra axis, keeping the slab near the same
 # point count.
 #
-# Rank 4 crops at 16 rather than the 32 inference codes one chunk at, because a
-# 32^4 slab is 16x the points of a 16^4 one and OOMs a batch that fits at 16.
-# The cost is that the sampled band tops out one level short of the deployed
-# depth -- see _stride_choices.
-_CROP_STRIDE = {3: (64, 32), 4: (16, 8)}
+# Both common ranks crop at the side inference codes one chunk at, or below it:
+# rank 3 at 32, rank 4 at 16 rather than 32, because a 32^4 slab is 16x the
+# points of a 16^4 one and OOMs a batch that fits at 16. The cost at both is
+# that the sampled band tops out short of the deployed depth (rank 3 levels
+# 3..5 against 6, rank 4 2..4 against 5) -- see _stride_choices.
+_CROP_STRIDE = {3: (32, 16), 4: (16, 8)}
 
 
 def _crop_stride(ndim: int) -> tuple[int, int]:
@@ -116,15 +117,14 @@ def _stride_choices(crop: int, stride: int) -> tuple[int, ...]:
 
     The top of the band is ``log2(crop)`` -- the deepest schedule whose anchor
     stride still fits a slab, one anchor cell across -- so the band follows the
-    crop with no constant to edit. Rank 3 crops at 64, giving levels 4..6, and
-    ``levels="auto"`` codes rank 3 at 6 (aggregation level 2); ``--crop 128``
-    gives 5..7, which covers aggregation level 1.
-
-    Rank 4 is the exception: it crops at 16 to keep a batch in memory, so the
-    band is levels 2..4 while ``levels="auto"`` codes rank 4 at 5. Depth 5 is
-    then extrapolation rather than training data; if rank-4 numbers at the
-    deployed depth matter, raise ``--crop`` to 32 and drop ``--batch`` to 1 to
-    pay for it.
+    crop with no constant to edit. Rank 3 crops at 32, giving levels 3..5, and
+    rank 4 at 16, giving 2..4; both stop one level below the depth
+    ``levels="auto"`` codes their rank at (6 for rank 3 at aggregation level 2,
+    5 for rank 4). The deployed depth is then extrapolation rather than training
+    data, which is what the smaller crop costs. Doubling ``--crop`` buys the
+    missing level back, with no constant to edit -- rank 3 at 64 gives 4..6 and
+    at 128 gives 5..7 (aggregation level 1's depth), rank 4 at 32 gives 3..5 --
+    and costs 2**rank the memory per slab, so drop ``--batch`` to match.
 
     Training at a single fixed depth specialises the model to that rollout
     length and gives up most of the gain at every other one. Measured on
@@ -160,7 +160,17 @@ class WellSlabs:
     slabs. Files stay open and only the crop is read off disk. `--crop` is the
     side along *every* axis, time included, clamped to each axis length; 0 keeps
     each axis whole.
+
+    A batch comes from one trajectory (see :meth:`batch`), which is held in RAM
+    while it is the current one, because a crop read costs whole HDF5 chunks:
+    on euler (512x512 planes, ~400 trajectories per file, too big to stay in
+    page cache) a 32-cube crop decompresses ~1 MB per timestep to keep 4 KB of
+    it, and 16 of those per step dominated the step time.
     """
+
+    # A trajectory above this stays on disk and crops are read per slab as
+    # before, so the buffer never blows up a 4-D dataset's host memory.
+    MAX_BUFFER_BYTES = 2 << 30
 
     def __init__(self, paths, field, crop):
         self.files = [h5py.File(p, "r") for p in paths]
@@ -175,6 +185,11 @@ class WellSlabs:
             self.index += [(fi, traj) for traj in range(dset.shape[0])]
         if not self.index:
             raise SystemExit("no training slabs found")
+        dset, _ = _field_dataset(self.files[0], field)
+        self.traj_bytes = int(dset.dtype.itemsize * np.prod(dset.shape[1:]))
+        self.buffered = self.traj_bytes <= self.MAX_BUFFER_BYTES
+        self._buffer_key = None
+        self._buffer = None
 
     def _axes(self, dset) -> tuple[int, ...]:
         return tuple(dset.shape[1 : 1 + self.ndim])
@@ -182,19 +197,41 @@ class WellSlabs:
     def __len__(self):
         return len(self.index)
 
+    def _window(self, axes, rng) -> tuple[slice, ...]:
+        sides = [min(self.crop, n) if self.crop else n for n in axes]
+        starts = [rng.integers(0, n - side + 1) for n, side in zip(axes, sides)]
+        return tuple(slice(s, s + side) for s, side in zip(starts, sides))
+
     def slab(self, i, rng, log=False) -> np.ndarray:
         """One normalized [0, 1] hypercube; optional log10 first, since density
         and pressure span decades."""
         fi, traj = self.index[i]
         dset, component = _field_dataset(self.files[fi], self.field)
-        axes = self._axes(dset)
-        sides = [min(self.crop, n) if self.crop else n for n in axes]
-        starts = [rng.integers(0, n - side + 1) for n, side in zip(axes, sides)]
-        sl = tuple(slice(s, s + side) for s, side in zip(starts, sides))
-        vol = np.asarray(dset[(traj,) + sl], dtype=np.float32)
+        vol = np.asarray(dset[(traj,) + self._window(self._axes(dset), rng)], dtype=np.float32)
         if component is not None:
             vol = vol[..., component]
         return self._prepare(vol, log)
+
+    def batch(self, n, rng, log=False) -> list[np.ndarray]:
+        """`n` crops of *one* random trajectory, read once and cut in RAM.
+
+        Cutting a batch out of a single trajectory trades some per-step
+        diversity for one sequential read instead of `n` random ones; over
+        thousands of steps the model still sees every trajectory. Trajectories
+        past `MAX_BUFFER_BYTES` fall back to per-crop reads.
+        """
+        i = int(rng.integers(0, len(self.index)))
+        if not self.buffered:
+            return [self.slab(i, rng, log) for _ in range(n)]
+        fi, traj = self.index[i]
+        dset, component = _field_dataset(self.files[fi], self.field)
+        if self._buffer_key != (fi, traj):
+            self._buffer = None  # freed before the next one is read, not after
+            vol = np.asarray(dset[traj], dtype=np.float32)
+            self._buffer = vol[..., component] if component is not None else vol
+            self._buffer_key = (fi, traj)
+        axes = self._axes(dset)
+        return [self._prepare(self._buffer[self._window(axes, rng)], log) for _ in range(n)]
 
     def trajectory(self, i, log=False, n_time=0) -> np.ndarray:
         """One whole trajectory (T, *spatial) — the tensor the benchmark hands
@@ -423,8 +460,9 @@ def run(args, train, test, device, rng):
     if eval_levels != "auto":
         eval_levels = int(eval_levels)
     print(
-        f"slabs: crop={train.crop} stride={args.stride} "
-        f"sampled strides={strides} -> levels={levels_seen}"
+        f"slabs: crop={train.crop} strides={strides} -> levels={levels_seen}, "
+        f"batch from one trajectory ({train.traj_bytes / 2**20:.0f} MiB, "
+        f"{'buffered in RAM' if train.buffered else 'read per crop'})"
     )
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
@@ -492,8 +530,7 @@ def run(args, train, test, device, rng):
 
     bar = tqdm(range(1, args.steps + 1), desc="finetune")
     for step in bar:
-        idx = rng.integers(0, len(train), args.batch)
-        vols = [train.slab(int(i), rng, args.log) for i in idx]
+        vols = train.batch(args.batch, rng, args.log)
         x = torch.as_tensor(np.stack([v.reshape(-1) for v in vols])).to(device)
         eb = sample_noise(x.shape[0], args, device)
         # One schedule depth per step, so the model stays usable at every depth
@@ -606,14 +643,28 @@ def self_check(args):
     assert flat_slabs.ndim == 3 and flat_slabs.slab(0, rng).shape == (4, 4, 4)
     assert WellSlabs([flat], "density", 64).slab(0, rng).shape == (12, 8, 8)
     assert flat_slabs.trajectory(0).shape == (8, 8, 8)
+    # A batch is n crops of one buffered trajectory, and the crops still differ.
+    vec_slabs = WellSlabs([path], "magnetic_field_z", 4)
+    vols = vec_slabs.batch(3, rng)
+    assert vec_slabs.buffered and len(vols) == 3 and all(v.shape == (4,) * 4 for v in vols)
+    # the buffer is the whole (untruncated) trajectory, component already picked
+    with h5py.File(path, "r") as f:
+        assert vec_slabs._buffer.shape == _field_dataset(f, "magnetic_field_z")[0].shape[1:-1]
+    assert any(not np.array_equal(vols[0], v) for v in vols[1:])
+    # ... and past the buffer budget the same batch comes off disk per crop
+    unbuffered = WellSlabs([path], "density", 4)
+    unbuffered.buffered = False
+    assert [v.shape for v in unbuffered.batch(3, rng)] == [(4,) * 4] * 3
+    assert unbuffered._buffer is None
     # two anchor cells per axis at every rank, halving past 4-D
-    assert _crop_stride(3) == (64, 32) and _crop_stride(4) == (16, 8)
+    assert _crop_stride(3) == (32, 16) and _crop_stride(4) == (16, 8)
     assert _crop_stride(5) == (8, 4)
     # Depth is sampled from the deepest schedule the crop holds down _LEVEL_SPAN
-    # levels: rank 3 crops at 64 -> levels 4..6, the deployed depth at
-    # aggregation level 2. Rank 4 crops at 16 for memory, so its band stops at
-    # levels 4, one short of the 5 levels="auto" codes it at.
+    # levels: rank 3 crops at 32 -> levels 3..5 and rank 4 at 16 -> 2..4, each
+    # one short of the depth levels="auto" codes that rank at (6 and 5).
     assert [s.bit_length() - 1 for s in _stride_choices(16, 8)] == [2, 3, 4]
+    assert [s.bit_length() - 1 for s in _stride_choices(32, 16)] == [3, 4, 5]
+    # doubling the crop buys the deployed depth back (rank 3 at 64 -> 4..6)
     assert [s.bit_length() - 1 for s in _stride_choices(64, 32)] == [4, 5, 6]
     assert _stride_choices(32, 16) == (8, 16, 32)
     assert _stride_choices(64, 32) == (16, 32, 64)
