@@ -296,6 +296,13 @@ def main():
         help="full-codec roundtrip of the held-out trajectory every N steps "
         "(minutes on a 64^4 tensor — keep it rare)",
     )
+    ap.add_argument(
+        "--mse-weight",
+        type=float,
+        default=0.0,
+        help="weight of the distortion (MSE) regularizer on the rate loss; "
+        "see bin_sq_err in train_gnn.py. 0 disables it",
+    )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--fp16", action="store_true")
@@ -500,13 +507,18 @@ def run(args, train, test, device, rng):
                 eb=eb, teacher_force=True,
             )
         loss = nll / max(npix, 1)
-        scaler.scale(loss).backward()
+        mse = aux["sq_err"] / max(npix, 1)  # squared prediction error, bin units
+        scaler.scale(loss + args.mse_weight * mse).backward()
         scaler.step(opt)
         scaler.update()
         sched.step()
         if ema is not None:
             ema.update(model, step)
-        log = {"train/bpp": loss.item(), "lr": sched.get_last_lr()[0]}
+        log = {
+            "train/bpp": loss.item(),
+            "train/mse": mse.item(),
+            "lr": sched.get_last_lr()[0],
+        }
 
         if step % args.eval_every == 0 or step == args.steps:
             metrics = evaluate()

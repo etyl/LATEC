@@ -230,6 +230,25 @@ def discretized_laplace_nll(mu, log_b, target, eb):
     return -logp * log2e
 
 
+def bin_sq_err(mu, target, eb):
+    """Summed squared prediction error, in units of the quantization bin.
+
+    A distortion (MSE) regularizer for the rate loss.  End-to-end distortion is
+    *not* a function of the predictor -- the codec reconstructs at
+    ``mu + 2*eb*round((x - mu)/(2*eb))``, so the decoded error lies in
+    ``[-eb, eb]`` however bad ``mu`` is -- hence this is a regularizer on the
+    mean head, not a rate/distortion Lagrangian.  It matters because the
+    discretized-Laplace NLL goes flat in ``mu`` once the residual sits well
+    inside the zero bin (p(bin 0) -> 1), and because the scale head can absorb a
+    blurry mean by widening ``b``; the squared term keeps a gradient on ``mu``
+    in both cases.  Normalizing by ``2*eb`` makes the term scale-free, which
+    matters here because ``eb`` is resampled per batch (--noise-range): in raw
+    units the same weight would be meaningless across a 1e-6..1e-2 sweep."""
+    eb = torch.as_tensor(eb, device=target.device, dtype=torch.float32).reshape(-1, 1)
+    r = (mu.float() - target.float()) / (2.0 * eb)
+    return (r * r).sum()
+
+
 def entropy_bits_from_codes(codes):
     """Order-0 entropy H(codes), in bits/symbol."""
     if not codes:
@@ -406,6 +425,7 @@ def run_stages(
 
     nll_sum = torch.zeros((), device=device)
     abs_err = torch.zeros((), device=device)
+    sq_err = torch.zeros((), device=device)
     npix = 0
     bins = []
     head_ctx = None
@@ -426,6 +446,7 @@ def run_stages(
         nll = discretized_laplace_nll(pred, log_b, tgt, eb)
         nll_sum = nll_sum + nll.sum()
         abs_err = abs_err + (pred.detach() - tgt).abs().sum()
+        sq_err = sq_err + bin_sq_err(pred, tgt, eb)
         npix += tgt.numel()
         if collect_bins:
             bins.append(torch.round((tgt - pred) / (2 * eb[:, None])).to(torch.int64))
@@ -437,7 +458,13 @@ def run_stages(
             known_vals[:, idx] = qz(pred, tgt, eb)
     # known_vals = full closed-loop recon; pred_only = same minus the quantised
     # residual added at each hole (residual = known_vals - pred_only).
-    return nll_sum, npix, known_vals, pred_only, {"bins": bins, "abs_err": abs_err}
+    return (
+        nll_sum,
+        npix,
+        known_vals,
+        pred_only,
+        {"bins": bins, "abs_err": abs_err, "sq_err": sq_err},
+    )
 
 
 _CG_CACHE: dict = {}  # chunk geometry reused across training steps
@@ -445,9 +472,10 @@ _CG_CACHE: dict = {}  # chunk geometry reused across training steps
 
 def _run_chunk(model, cg, geoms, E, known_vals, x, gidx, eb, device, reveal):
     """One chunk of the chunked-scene step: the codec's local stage chain with
-    teacher forcing. Returns (nll bits, n holes, abs err)."""
+    teacher forcing. Returns (nll bits, n holes, abs err, squared bin err)."""
     nll = torch.zeros((), device=device)
     abs_err = torch.zeros((), device=device)
+    sq_err = torch.zeros((), device=device)
     npix = 0
     ctx = None
     for j in range(1, len(cg.chain)):
@@ -460,9 +488,10 @@ def _run_chunk(model, cg, geoms, E, known_vals, x, gidx, eb, device, reveal):
         tgt = x[:, gidx[s]]
         nll = nll + discretized_laplace_nll(pred, log_b, tgt, eb).sum()
         abs_err = abs_err + (pred.detach() - tgt).abs().sum()
+        sq_err = sq_err + bin_sq_err(pred, tgt, eb)
         npix += tgt.numel()
         reveal(gidx[s])
-    return nll, npix, abs_err
+    return nll, npix, abs_err, sq_err
 
 
 def run_chunked_scene(
@@ -506,6 +535,7 @@ def run_chunked_scene(
     coded = np.zeros(2, bool)
     nll = torch.zeros((), device=device)
     abs_err = torch.zeros((), device=device)
+    sq_err = torch.zeros((), device=device)
     npix = 0
     for ci in order:
         frame = _CompactFrame(cg, origins[ci], shape, edges, grid, coded, torch, device)
@@ -522,12 +552,13 @@ def run_chunked_scene(
             None if off is None else torch.from_numpy(off + obase).to(device)
             for off in cg.stage_offsets(strides)
         ]
-        n1, np1, a1 = _run_chunk(
+        n1, np1, a1, s1 = _run_chunk(
             model, cg, frame.geoms, E, known_vals, x, gidx, eb, device, reveal
         )
         nll, npix, abs_err = nll + n1, npix + np1, abs_err + a1
+        sq_err = sq_err + s1
         coded[ci] = True
-    return nll, npix, {"abs_err": abs_err}
+    return nll, npix, {"abs_err": abs_err, "sq_err": sq_err}
 
 
 def main():
@@ -733,6 +764,16 @@ def main():
         default=500,
         help="run the --eval-tensor codec roundtrip every N steps "
         "(full compress+decompress; keep it a multiple of eval-every)",
+    )
+    ap.add_argument(
+        "--mse-weight",
+        type=float,
+        default=0.0,
+        help="weight of the distortion (MSE) regularizer added to the rate "
+        "loss: mean squared prediction error in quantization-bin units "
+        "(residual / 2eb). 0 disables it; try 1e-3..1e-2. It regularizes the "
+        "mean head where the discretized NLL is flat, but sub-bin accuracy "
+        "buys no bits, so a large weight trades rate away",
     )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
@@ -1058,11 +1099,15 @@ def main():
                     )
             field2d_loss = nll / max(npix, 1)
             field2d_mae = aux["abs_err"].detach() / max(npix, 1)
-            scaler.scale(field2d_weight * field2d_loss).backward()
+            field2d_mse = aux["sq_err"] / max(npix, 1)
+            scaler.scale(
+                field2d_weight * (field2d_loss + args.mse_weight * field2d_mse)
+            ).backward()
             metric_tensors.update(
                 {
                     "train/field2d_bpp": field2d_loss.detach(),
                     "train/field2d_mae": field2d_mae,
+                    "train/field2d_mse": field2d_mse.detach(),
                 }
             )
 
@@ -1097,11 +1142,15 @@ def main():
                 )
             synthetic_loss = nll / max(npix, 1)
             synthetic_mae = aux["abs_err"].detach() / max(npix, 1)
-            scaler.scale(synthetic_weight * synthetic_loss).backward()
+            synthetic_mse = aux["sq_err"] / max(npix, 1)
+            scaler.scale(
+                synthetic_weight * (synthetic_loss + args.mse_weight * synthetic_mse)
+            ).backward()
             metric_tensors.update(
                 {
                     "train/synthetic_bpp": synthetic_loss.detach(),
                     "train/synthetic_mae": synthetic_mae,
+                    "train/synthetic_mse": synthetic_mse.detach(),
                 }
             )
 
@@ -1126,7 +1175,21 @@ def main():
             )
             if weight
         )
-        metric_tensors.update({"train/bpp": combined_loss, "train/mae": combined_mae})
+        combined_mse = sum(
+            weight * metric_tensors[key]
+            for weight, key in (
+                (field2d_weight, "train/field2d_mse"),
+                (synthetic_weight, "train/synthetic_mse"),
+            )
+            if weight
+        )
+        metric_tensors.update(
+            {
+                "train/bpp": combined_loss,
+                "train/mae": combined_mae,
+                "train/mse": combined_mse,
+            }
+        )
         # Transfer all scalar metrics together.  Calling .item() for the 2-D
         # metrics before launching the 4-D pass introduced several host
         # synchronizations and exposed the field-generation latency.

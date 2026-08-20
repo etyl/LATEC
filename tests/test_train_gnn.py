@@ -6,6 +6,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from scripts.train_gnn import (
+    bin_sq_err,
     discretized_laplace_nll,
     sample_noise,
     normalize_tensor,
@@ -375,3 +376,58 @@ def test_chunk_finalization_casts_autocast_output_to_field_dtype():
     assert all(
         p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters()
     )
+
+
+def test_bin_sq_err_is_scale_free_in_the_error_bound():
+    """The MSE regularizer counts bins, not raw units, so the same weight means
+    the same thing across the sampled eb range (--noise-range)."""
+    mu = torch.tensor([[0.0, 0.0]])
+    tgt = torch.tensor([[0.02, -0.04]])
+
+    tight = bin_sq_err(mu, tgt, torch.tensor([0.01]))
+    loose = bin_sq_err(mu, tgt, torch.tensor([0.02]))
+
+    assert float(tight) == pytest.approx(1.0**2 + 2.0**2)
+    assert float(loose) == pytest.approx(float(tight) / 4)
+
+
+def test_mse_regularizer_gradient_survives_the_flat_nll_region():
+    """Once the scale head is confident that the residual sits in the zero bin
+    (b << eb), the whole cell holds ~all the mass and the NLL gradient on the
+    mean underflows to exactly zero; the squared term is what keeps pushing the
+    prediction toward truth."""
+    eb = torch.tensor([0.1])
+    tgt = torch.tensor([[0.004]])
+    mu = torch.zeros(1, 1, requires_grad=True)
+    log_b = torch.full((1, 1), -12.0)  # b ~ 2e-4, far inside the bin
+
+    (nll_grad,) = torch.autograd.grad(
+        discretized_laplace_nll(mu, log_b, tgt, eb).sum(), mu, retain_graph=True
+    )
+    (mse_grad,) = torch.autograd.grad(bin_sq_err(mu, tgt, eb), mu)
+
+    assert float(nll_grad) == 0.0
+    assert float(mse_grad) < 0  # pushes mu up, toward the target
+
+
+def test_chunked_scene_reports_squared_bin_error():
+    model = build_model(8)
+    x = torch.rand(1, 8 * 8)
+
+    nll, npix, aux = run_chunked_scene(
+        model,
+        x,
+        (8, 8),
+        axis=1,
+        order=(0, 1),
+        levels=2,
+        stride=4,
+        d=8,
+        device=torch.device("cpu"),
+        eb=0.01,
+        agg_level=2,
+    )
+    (aux["sq_err"] / npix).backward()
+
+    assert aux["sq_err"].requires_grad  # unlike abs_err, it trains the mean head
+    assert any(p.grad is not None for p in model.parameters())
