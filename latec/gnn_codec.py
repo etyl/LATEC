@@ -869,6 +869,7 @@ def _compress_chunked(
     geom_bar.close()
     # hand recon to the GPU for the wave loop; it never returns to host on encode
     recon_t = torch.from_numpy(recon).to(dev)
+    del recon  # host copy is dead once uploaded; keeping it costs a full field
     recon_flat = recon_t.reshape(c, -1)
     waves = [list(range(predictor.n_chunks))]  # raster order (see docstring)
     _log(
@@ -1209,6 +1210,7 @@ def _decompress_chunked(
     torch = predictor._torch
     dev = predictor.device
     recon_t = torch.from_numpy(recon).to(dev)  # device-resident, same as encode
+    del recon  # host copy is dead once uploaded; keeping it costs a full field
     gates_t = (
         None if gates is None else torch.tensor(gates, dtype=torch.int64, device=dev)
     )
