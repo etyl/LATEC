@@ -20,8 +20,17 @@ import latec.gnn_predictor as gp
 from latec.gnn_codec import (
     _GATE_END_MODE,
     _chunk_device_plan,
+    _auto_chunk_edges,
     _end_plan,
+    _gate_interps,
+    _gate_quantized_scales,
+    _gate_scale_thresholds,
     _interp_axis_at_t,
+    _interp_axis_pair_t,
+    _quantize_t,
+    _scale_level_thresholds,
+    _scale_to_level_t,
+    _stored_gate_interp,
     roundtrip_slack,
 )
 from latec.predictor import END_EXTRAP, END_MODE_MAX, END_QUAD, _interp_axis_at
@@ -34,9 +43,42 @@ from latec.gnn_predictor import (
     chunk_halo_info,
 )
 from latec.levels import stage_masks, stage_plan
+from latec.rans import scale_to_level
+from latec.rans import SCALE_HI_MULT, SCALE_LO_DIV
+from latec.quantizer import dequantize, quantize
 
 STRIDE = 4
 LEVELS = 2
+
+
+@pytest.mark.parametrize("round_output", [False, True, (37.0, -11.0)])
+def test_device_quantize_reuses_candidate_reconstruction_exactly(round_output):
+    rng = np.random.RandomState(31)
+    x = rng.uniform(-4, 4, 257).astype(np.float32)
+    pred = rng.uniform(-4, 4, 257).astype(np.float32)
+    # Force both radius outliers and regular values near float32 bound edges.
+    x[:3] = np.array((100.0, -100.0, np.nextafter(1.0, 2.0)), np.float32)
+    eb = 0.013
+    radius = 17
+
+    expected_codes, expected_outliers = quantize(
+        x, pred, eb, radius, round_output=round_output
+    )
+    expected_recon = dequantize(
+        pred, expected_codes, expected_outliers, eb, radius
+    )
+    codes, recon, outliers = _quantize_t(
+        torch,
+        torch.from_numpy(x),
+        torch.from_numpy(pred),
+        eb,
+        radius,
+        round_output,
+    )
+
+    np.testing.assert_array_equal(codes.numpy().astype(np.uint32), expected_codes)
+    np.testing.assert_array_equal(outliers.numpy(), expected_outliers)
+    np.testing.assert_array_equal(recon.numpy(), expected_recon)
 
 
 @pytest.fixture()
@@ -394,6 +436,10 @@ def test_auto_chunk_selection(current_ckpt):
     assert elongated[1] >= 16
     assert elongated[0] > edges[0]  # short axis leaves room for a longer chunk
 
+    # Per-axis flooring must spend the otherwise-unused half of the 2 Mi-point
+    # budget: this is the full 64^4 performance target's 8-wave operating point.
+    assert _auto_chunk_edges((64, 64, 64, 64), 32) == (64, 32, 32, 32)
+
     bad = _codec(current_ckpt, chunk_size=STRIDE + 1)  # not a multiple
     with pytest.raises(ValueError):
         bad.compress(np.zeros((8, 8), np.float32))
@@ -454,7 +500,89 @@ def test_device_gate_interp_matches_numpy_interp(end_mode, cubic):
             end_mode,
             _end_plan(torch, "cpu", coords, axis, 1, shape),
         )
+        pair = _interp_axis_pair_t(
+            torch,
+            torch.from_numpy(W),
+            tuple(torch.from_numpy(c) for c in coords),
+            axis,
+            1,
+            shape,
+            end_mode,
+            _end_plan(torch, "cpu", coords, axis, 1, shape),
+        )
+        assert torch.equal(pair[0 if cubic else 1], got)
         np.testing.assert_allclose(got.numpy(), exp, rtol=0, atol=1e-12)
+
+
+def test_stored_gate_computes_only_the_selected_candidate():
+    shape = (8, 8)
+    plan = _chunk_device_plan(
+        torch, torch.device("cpu"), shape, shape, LEVELS, STRIDE, 1, ()
+    )
+    interp_dev, center, end_mode = plan[4], plan[6], plan[7]
+    recon = torch.from_numpy(
+        np.random.RandomState(9).rand(1, *shape).astype(np.float32)
+    )
+    sls = tuple(slice(0, n) for n in shape)
+    stage = next(s for s in range(1, len(interp_dev)) if interp_dev[s] is not None)
+    candidates = _gate_interps(
+        torch, recon, sls, interp_dev, stage, center, end_mode
+    )
+
+    for kind, expected in enumerate(candidates, start=1):
+        got = _stored_gate_interp(
+            torch, recon, sls, interp_dev, stage, center, end_mode, kind
+        )
+        assert torch.equal(got, expected)
+
+
+@pytest.mark.parametrize("eb", [1e-6, 1e-3, 0.25])
+def test_device_scale_levels_match_numpy_exactly(eb):
+    thresholds = _scale_level_thresholds(eb)
+    around = np.concatenate(
+        [
+            np.nextafter(thresholds, np.float32(-np.inf)),
+            thresholds,
+            np.nextafter(thresholds, np.float32(np.inf)),
+        ]
+    )
+    rng = np.random.default_rng(12)
+    random_values = np.exp(
+        rng.uniform(np.log(eb / 32), np.log(eb * 8192), 10_000)
+    ).astype(np.float32)
+    values = np.concatenate([around, random_values])
+
+    expected = scale_to_level(values, eb)
+    got = _scale_to_level_t(torch, torch.from_numpy(values), eb).numpy()
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_gate_scale_bucketization_matches_log_round_exp_exactly():
+    eb = 1e-3
+    thresholds, _, _ = _gate_scale_thresholds(eb)
+    rng = np.random.default_rng(13)
+    values = np.concatenate(
+        [
+            np.nextafter(thresholds, np.float32(-np.inf)),
+            thresholds,
+            np.nextafter(thresholds, np.float32(np.inf)),
+            np.exp(
+                rng.uniform(np.log(eb / 32), np.log(eb * 8192), 10_000)
+            ).astype(np.float32),
+        ]
+    )
+    scale = torch.from_numpy(values)
+    lo = eb / SCALE_LO_DIV
+    hi = eb * SCALE_HI_MULT
+    level = torch.round(
+        (torch.log(scale.double().clamp(lo, hi)) - np.log(lo))
+        / ((np.log(hi) - np.log(lo)) / 63.0)
+    )
+    expected = torch.exp(
+        np.log(lo) + level * ((np.log(hi) - np.log(lo)) / 63.0)
+    )
+    got = _gate_quantized_scales(torch, scale, eb)
+    assert torch.equal(got, expected)
 
 
 def test_end_plan_compacts_to_the_line_ends():
