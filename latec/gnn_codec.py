@@ -356,42 +356,12 @@ def _auto_chunk_edges(shape: tuple[int, ...], stride: int) -> tuple[int, ...]:
             break
     if remaining:
         free_edge = (target / fixed) ** (1.0 / remaining)
-    edges = [
+    return tuple(
         max(stride, -(-n // stride) * stride)
         if axis in full_axes
         else max(stride, int(free_edge) // stride * stride)
         for axis, n in enumerate(shape)
-    ]
-
-    # Flooring every free axis independently can leave almost half the point
-    # budget unused at coarse strides.  The important 64^4/stride-32 case used
-    # to land at 32^4 (1 Mi points) despite the 2 Mi-point budget. Spend that
-    # slack where one stride increment actually removes chunk boundaries. This
-    # deliberately permits a mildly anisotropic chunk (64x32^3 here): measured
-    # on V100 it halves the number of waves without the occupancy/memory
-    # regression of a 4 Mi-point 64^2x32^2 chunk.
-    while True:
-        current_points = int(np.prod([min(e, n) for e, n in zip(edges, shape)]))
-        best = None
-        for axis, (edge, n) in enumerate(zip(edges, shape)):
-            if edge >= n:
-                continue
-            grown = edge + stride
-            grown_points = current_points // min(edge, n) * min(grown, n)
-            if grown_points > target:
-                continue
-            old_chunks = -(-n // edge)
-            new_chunks = -(-n // grown)
-            reduction = old_chunks - new_chunks
-            if reduction <= 0:
-                continue
-            candidate = (reduction, old_chunks, -axis, axis, grown)
-            if best is None or candidate > best:
-                best = candidate
-        if best is None:
-            break
-        edges[best[3]] = best[4]
-    return tuple(edges)
+    )
 
 
 def _code_anchor_stage(values, recon, axes, eb0, radius, round_output):
@@ -1301,6 +1271,7 @@ def _compress_chunked(
             if fine_gates_t
             else []
         )
+    predictor.clear_runtime_cache()
     return b"".join(parts), gates, fine_gates
 
 
@@ -1383,48 +1354,33 @@ def _chunk_device_plan(
 #
 # The budget is in *bytes*, not entries, because a plan is chunk-sized: a fixed
 # entry count would be far too much memory for large chunks and needless eviction
-# for small ones (at 64^4 there are only 16 chunks, so any cap below 16 pays
-# rebuilds for reuse it was going to get anyway). Raster order varies the last axis
-# fastest, so the live working set is the 3 ** 2 = 9 combinations of the two
-# fastest axes, and a budget that holds ~17 of the 58.5 MiB rank-4 plans keeps
-# essentially all the reuse while bounding the cache an order of magnitude below
-# the unbounded 81.
-_PLAN_CACHE_MIB = float(os.environ.get("LATEC_PLAN_CACHE_MIB", 1024))
-
-
-def _plan_device_bytes(obj, seen=None):
-    """Device bytes held by one cached plan (tensors nested in its lists/dicts)."""
-    seen = set() if seen is None else seen
-    if id(obj) in seen:
-        return 0
-    seen.add(id(obj))
-    if hasattr(obj, "element_size") and hasattr(obj, "nelement"):
-        return obj.element_size() * obj.nelement() if obj.is_cuda else 0
-    if isinstance(obj, dict):
-        return sum(_plan_device_bytes(v, seen) for v in obj.values())
-    if isinstance(obj, (list, tuple)):
-        return sum(_plan_device_bytes(v, seen) for v in obj)
-    return 0
+# for small ones. Raster order varies the last axis fastest, so even a modest
+# budget retains the immediately reusable shapes. Large one-off plans are not
+# cached: keeping one alive while constructing its successor raises the peak
+# without buying a cache hit.
+_PLAN_CACHE_MIB = float(os.environ.get("LATEC_PLAN_CACHE_MIB", 256))
 
 
 def _cached_chunk_plan(cache, torch, dev, cshape, shape, levels, stride, block, low_ax):
     """``_chunk_device_plan`` behind a byte-budgeted LRU, shared by encode/decode.
 
     Eviction is safe against the in-flight plan: the entry just used is moved to
-    the most-recent end before anything is dropped, so the victim is never the one
-    the caller is about to read. One entry is always kept, whatever the budget."""
+    the most-recent end before anything is dropped. Oversized plans are returned
+    to the caller but not retained after the current wave."""
     key = (cshape, low_ax)
     hit = cache.get(key)
     if hit is not None:
         cache.move_to_end(key)
         return hit[0]
     plan = _chunk_device_plan(torch, dev, cshape, shape, levels, stride, block, low_ax)
-    cache[key] = (plan, _plan_device_bytes(plan))
+    nbytes = _gp._storage_bytes(plan)
     budget = _PLAN_CACHE_MIB * 2**20
     total = sum(nbytes for _, nbytes in cache.values())
-    while len(cache) > 1 and total > budget:
+    while cache and total + nbytes > budget:
         _, (_, dropped) = cache.popitem(last=False)
         total -= dropped
+    if nbytes <= budget:
+        cache[key] = (plan, nbytes)
     return plan
 
 
@@ -1611,7 +1567,9 @@ def _decompress_chunked(
         raise ValueError("trailing bytes in LATEC GNN payload")
     if gates is not None and gi != len(gates):
         raise ValueError("gate list length does not match the stream")
-    return recon_t[0].cpu().numpy()
+    out = recon_t[0].cpu().numpy()
+    predictor.clear_runtime_cache()
+    return out
 
 
 class GNNCompressorCodec:
@@ -1646,12 +1604,12 @@ class GNNCompressorCodec:
         self.device = device
         self.strict_checkpoint = bool(strict_checkpoint)
         self.checkpoint_hash = self._checkpoint_hash()
-        # Chunk geometry is expensive to construct (especially for rank-4
-        # fields) but depends only on the checkpoint, device and schedule, not
-        # on the values being coded.  Keep predictor instances on the codec so
-        # an encode/decode pair and subsequent tensors with the same schedule
-        # can reuse their device geometry.
-        self._chunked_predictors: dict[tuple[int, bool, bool], ChunkedGNNPredictor] = {}
+        # Keep the loaded model, but not tensor-shaped runtime geometry, on the
+        # codec. Runtime caches are released after each encode/decode so memory
+        # does not scale with the shapes and modes previously processed.
+        self._chunked_predictors: OrderedDict[
+            tuple[int, bool, bool], ChunkedGNNPredictor
+        ] = OrderedDict()
 
     @staticmethod
     def _chunk_edges(
@@ -2060,6 +2018,13 @@ class GNNCompressorCodec:
             predictor.fp16 = use_fp16
             predictor.compile = use_compile
             self._chunked_predictors[key] = predictor
+            # Runtime geometry dwarfs the model weights. A different schedule or
+            # precision mode is unlikely to be reused before the current one, so
+            # do not let several complete geometry caches accumulate on a codec.
+            while len(self._chunked_predictors) > 1:
+                self._chunked_predictors.popitem(last=False)
+        else:
+            self._chunked_predictors.move_to_end(key)
         return predictor
 
     def _predictor(

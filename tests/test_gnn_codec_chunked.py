@@ -7,6 +7,7 @@ coded). The error bound holds regardless of predictor quality — it is the
 quantizer's guarantee — so a tiny random checkpoint suffices.
 """
 
+from collections import OrderedDict
 from functools import partial
 
 import numpy as np
@@ -16,6 +17,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("constriction")  # rANS backend; skip if unavailable
 
 from latec import GNNCompressorCodec
+import latec.gnn_codec as gc
 import latec.gnn_predictor as gp
 from latec.gnn_codec import (
     _GATE_END_MODE,
@@ -436,9 +438,9 @@ def test_auto_chunk_selection(current_ckpt):
     assert elongated[1] >= 16
     assert elongated[0] > edges[0]  # short axis leaves room for a longer chunk
 
-    # Per-axis flooring must spend the otherwise-unused half of the 2 Mi-point
-    # budget: this is the full 64^4 performance target's 8-wave operating point.
-    assert _auto_chunk_edges((64, 64, 64, 64), 32) == (64, 32, 32, 32)
+    # Coarse stride rounding stays conservative: filling the nominal slack here
+    # doubles the embedding field and caused the automatic mode's RAM regression.
+    assert _auto_chunk_edges((64, 64, 64, 64), 32) == (32, 32, 32, 32)
 
     bad = _codec(current_ckpt, chunk_size=STRIDE + 1)  # not a multiple
     with pytest.raises(ValueError):
@@ -694,6 +696,41 @@ def test_cuda_budget_includes_reusable_allocator_cache():
     assert gp._cuda_working_budget(FakeTorch(), "cuda") == 4_800
 
 
+def test_cache_storage_accounting_includes_host_arrays_and_tensors():
+    arr = np.zeros(17, np.int64)
+    ten = torch.zeros(23, dtype=torch.int16)
+
+    assert gp._storage_bytes((arr, ten)) == arr.nbytes + ten.nelement() * 2
+
+
+def test_oversized_chunk_plan_is_used_without_being_cached(monkeypatch):
+    plan = (torch.zeros(8, dtype=torch.int64),)
+    monkeypatch.setattr(gc, "_PLAN_CACHE_MIB", 0)
+    monkeypatch.setattr(gc, "_chunk_device_plan", lambda *args: plan)
+    cache = OrderedDict()
+
+    got = gc._cached_chunk_plan(
+        cache, torch, "cpu", (4, 4), (8, 8), LEVELS, STRIDE, 1, ()
+    )
+
+    assert got is plan
+    assert not cache
+
+
+def test_codec_releases_tensor_shaped_runtime_caches(current_ckpt):
+    codec = _codec(current_ckpt, eb=0.02, chunk_size=STRIDE)
+    x = np.random.RandomState(31).rand(8, 8).astype(np.float32)
+
+    stream = codec.compress(x)
+    predictor = next(iter(codec._chunked_predictors.values()))
+    assert not predictor._geom_cache
+    assert not predictor._frame_cache
+
+    assert _maxerr(codec.uncompress(stream), x) <= 0.02
+    assert not predictor._geom_cache
+    assert not predictor._frame_cache
+
+
 def test_fp16_flag_roundtrips_and_persists(current_ckpt):
     """fp16=True round-trips within the bound and the flag rides in the stream so
     decode replays the same float path. (autocast only bites on cuda; on cpu this
@@ -762,6 +799,40 @@ def test_bad_compile_string_rejected(current_ckpt):
 
 
 # --- halo geometry: out-of-chunk neighbours go live only once coded ---------
+
+
+def test_host_halo_collection_matches_full_unique(monkeypatch):
+    """The large-chunk shortcut must retain exactly the referenced halo band."""
+    args = ((9, 8, 8), 2, 4, 1, torch, None, 2)
+    monkeypatch.setattr(gp, "_HOST_HALO_MIN_POINTS", 1 << 60)
+    full = gp._ChunkGeoms(*args)
+    monkeypatch.setattr(gp, "_HOST_HALO_MIN_POINTS", 0)
+    host = gp._ChunkGeoms(*args)
+    np.testing.assert_array_equal(host.ref_halo_flat, full.ref_halo_flat)
+    np.testing.assert_array_equal(host.ref_halo_coords, full.ref_halo_coords)
+
+
+@pytest.mark.parametrize(
+    "shape,levels,stride",
+    [((9, 8), 2, 4), ((9, 8, 8), 2, 4), ((5, 5, 4, 4), 2, 4)],
+)
+def test_implicit_axial_geometry_matches_nearest_search(
+    monkeypatch, shape, levels, stride
+):
+    """The agg-level-1 arithmetic path must reproduce every stored line."""
+    args = (shape, levels, stride, 1, torch, None, 1)
+    monkeypatch.setattr(gp, "_AXIAL_IMPLICIT_GEOMETRY", False)
+    searched = gp._ChunkGeoms(*args)
+    monkeypatch.setattr(gp, "_AXIAL_IMPLICIT_GEOMETRY", True)
+    implicit = gp._ChunkGeoms(*args)
+    for expected, actual in zip(searched.geoms, implicit.geoms):
+        if expected is None:
+            assert actual is None
+            continue
+        for name in ("sp", "sn", "vp", "vn", "off", "query_idx"):
+            torch.testing.assert_close(getattr(actual, name), getattr(expected, name))
+    np.testing.assert_array_equal(implicit.ref_halo_flat, searched.ref_halo_flat)
+    np.testing.assert_array_equal(implicit.ref_halo_coords, searched.ref_halo_coords)
 
 
 def test_halo_links_activate_when_neighbour_coded():
