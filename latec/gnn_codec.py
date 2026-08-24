@@ -1271,7 +1271,6 @@ def _compress_chunked(
             if fine_gates_t
             else []
         )
-    predictor.clear_runtime_cache()
     return b"".join(parts), gates, fine_gates
 
 
@@ -1604,9 +1603,9 @@ class GNNCompressorCodec:
         self.device = device
         self.strict_checkpoint = bool(strict_checkpoint)
         self.checkpoint_hash = self._checkpoint_hash()
-        # Keep the loaded model, but not tensor-shaped runtime geometry, on the
-        # codec. Runtime caches are released after each encode/decode so memory
-        # does not scale with the shapes and modes previously processed.
+        # Keep the loaded model and base geometry across an encode/decode pair,
+        # then release tensor-shaped runtime geometry after decode. Compact
+        # frames are not retained by default because they dwarf the base data.
         self._chunked_predictors: OrderedDict[
             tuple[int, bool, bool], ChunkedGNNPredictor
         ] = OrderedDict()

@@ -717,13 +717,13 @@ def test_oversized_chunk_plan_is_used_without_being_cached(monkeypatch):
     assert not cache
 
 
-def test_codec_releases_tensor_shaped_runtime_caches(current_ckpt):
+def test_codec_releases_runtime_caches_after_roundtrip(current_ckpt):
     codec = _codec(current_ckpt, eb=0.02, chunk_size=STRIDE)
     x = np.random.RandomState(31).rand(8, 8).astype(np.float32)
 
     stream = codec.compress(x)
     predictor = next(iter(codec._chunked_predictors.values()))
-    assert not predictor._geom_cache
+    assert predictor._geom_cache  # reused by the matching decoder
     assert not predictor._frame_cache
 
     assert _maxerr(codec.uncompress(stream), x) <= 0.02
