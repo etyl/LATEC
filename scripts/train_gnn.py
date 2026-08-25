@@ -230,22 +230,14 @@ def discretized_laplace_nll(mu, log_b, target, eb):
     return -logp * log2e
 
 
-def bin_sq_err(mu, target, eb):
-    """Summed squared prediction error, in units of the quantization bin.
+def prediction_sq_err(mu, target):
+    """Summed prediction squared error in normalized data units.
 
-    A distortion (MSE) regularizer for the rate loss.  End-to-end distortion is
-    *not* a function of the predictor -- the codec reconstructs at
-    ``mu + 2*eb*round((x - mu)/(2*eb))``, so the decoded error lies in
-    ``[-eb, eb]`` however bad ``mu`` is -- hence this is a regularizer on the
-    mean head, not a rate/distortion Lagrangian.  It matters because the
-    discretized-Laplace NLL goes flat in ``mu`` once the residual sits well
-    inside the zero bin (p(bin 0) -> 1), and because the scale head can absorb a
-    blurry mean by widening ``b``; the squared term keeps a gradient on ``mu``
-    in both cases.  Normalizing by ``2*eb`` makes the term scale-free, which
-    matters here because ``eb`` is resampled per batch (--noise-range): in raw
-    units the same weight would be meaningless across a 1e-6..1e-2 sweep."""
-    eb = torch.as_tensor(eb, device=target.device, dtype=torch.float32).reshape(-1, 1)
-    r = (mu.float() - target.float()) / (2.0 * eb)
+    Both the sigmoid prediction and target lie in [0, 1], so the mean squared
+    error is bounded by one. This keeps a gradient on the mean head where the
+    rate loss is flat without weighting samples by 1 / error_bound**2.
+    """
+    r = mu.float() - target.float()
     return (r * r).sum()
 
 
@@ -446,7 +438,7 @@ def run_stages(
         nll = discretized_laplace_nll(pred, log_b, tgt, eb)
         nll_sum = nll_sum + nll.sum()
         abs_err = abs_err + (pred.detach() - tgt).abs().sum()
-        sq_err = sq_err + bin_sq_err(pred, tgt, eb)
+        sq_err = sq_err + prediction_sq_err(pred, tgt)
         npix += tgt.numel()
         if collect_bins:
             bins.append(torch.round((tgt - pred) / (2 * eb[:, None])).to(torch.int64))
@@ -472,7 +464,7 @@ _CG_CACHE: dict = {}  # chunk geometry reused across training steps
 
 def _run_chunk(model, cg, geoms, E, known_vals, x, gidx, eb, device, reveal):
     """One chunk of the chunked-scene step: the codec's local stage chain with
-    teacher forcing. Returns (nll bits, n holes, abs err, squared bin err)."""
+    teacher forcing. Returns (nll bits, n holes, abs err, normalized sq err)."""
     nll = torch.zeros((), device=device)
     abs_err = torch.zeros((), device=device)
     sq_err = torch.zeros((), device=device)
@@ -488,7 +480,7 @@ def _run_chunk(model, cg, geoms, E, known_vals, x, gidx, eb, device, reveal):
         tgt = x[:, gidx[s]]
         nll = nll + discretized_laplace_nll(pred, log_b, tgt, eb).sum()
         abs_err = abs_err + (pred.detach() - tgt).abs().sum()
-        sq_err = sq_err + bin_sq_err(pred, tgt, eb)
+        sq_err = sq_err + prediction_sq_err(pred, tgt)
         npix += tgt.numel()
         reveal(gidx[s])
     return nll, npix, abs_err, sq_err
@@ -770,10 +762,10 @@ def main():
         type=float,
         default=0.0,
         help="weight of the distortion (MSE) regularizer added to the rate "
-        "loss: mean squared prediction error in quantization-bin units "
-        "(residual / 2eb). 0 disables it; try 1e-3..1e-2. It regularizes the "
-        "mean head where the discretized NLL is flat, but sub-bin accuracy "
-        "buys no bits, so a large weight trades rate away",
+        "loss: mean squared prediction error in normalized [0,1] data units. "
+        "0 disables it. It regularizes the mean head where the discretized NLL "
+        "is flat, but excess accuracy buys no bits, so a large weight trades "
+        "rate away",
     )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
@@ -1183,11 +1175,21 @@ def main():
             )
             if weight
         )
+        weighted_mse_loss = args.mse_weight * combined_mse
+        total_loss = combined_loss + weighted_mse_loss
         metric_tensors.update(
             {
                 "train/bpp": combined_loss,
                 "train/mae": combined_mae,
                 "train/mse": combined_mse,
+                # Explicit objective components make W&B plots unambiguous:
+                # rate is in bits/value, MSE is in normalized data units, and
+                # total_loss is the scalar objective used for backpropagation.
+                "train/rate": combined_loss,
+                "train/rate_loss": combined_loss,
+                "train/mse_loss": combined_mse,
+                "train/weighted_mse_loss": weighted_mse_loss,
+                "train/total_loss": total_loss,
             }
         )
         # Transfer all scalar metrics together.  Calling .item() for the 2-D

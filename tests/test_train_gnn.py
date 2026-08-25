@@ -6,8 +6,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from scripts.train_gnn import (
-    bin_sq_err,
     discretized_laplace_nll,
+    prediction_sq_err,
     sample_noise,
     normalize_tensor,
     training_autocast,
@@ -378,17 +378,13 @@ def test_chunk_finalization_casts_autocast_output_to_field_dtype():
     )
 
 
-def test_bin_sq_err_is_scale_free_in_the_error_bound():
-    """The MSE regularizer counts bins, not raw units, so the same weight means
-    the same thing across the sampled eb range (--noise-range)."""
+def test_prediction_sq_err_uses_normalized_data_units():
     mu = torch.tensor([[0.0, 0.0]])
     tgt = torch.tensor([[0.02, -0.04]])
 
-    tight = bin_sq_err(mu, tgt, torch.tensor([0.01]))
-    loose = bin_sq_err(mu, tgt, torch.tensor([0.02]))
+    sq_err = prediction_sq_err(mu, tgt)
 
-    assert float(tight) == pytest.approx(1.0**2 + 2.0**2)
-    assert float(loose) == pytest.approx(float(tight) / 4)
+    assert float(sq_err) == pytest.approx(0.02**2 + 0.04**2)
 
 
 def test_mse_regularizer_gradient_survives_the_flat_nll_region():
@@ -404,13 +400,13 @@ def test_mse_regularizer_gradient_survives_the_flat_nll_region():
     (nll_grad,) = torch.autograd.grad(
         discretized_laplace_nll(mu, log_b, tgt, eb).sum(), mu, retain_graph=True
     )
-    (mse_grad,) = torch.autograd.grad(bin_sq_err(mu, tgt, eb), mu)
+    (mse_grad,) = torch.autograd.grad(prediction_sq_err(mu, tgt), mu)
 
     assert float(nll_grad) == 0.0
     assert float(mse_grad) < 0  # pushes mu up, toward the target
 
 
-def test_chunked_scene_reports_squared_bin_error():
+def test_chunked_scene_reports_normalized_squared_error():
     model = build_model(8)
     x = torch.rand(1, 8 * 8)
 

@@ -338,7 +338,7 @@ def main():
         type=float,
         default=0.0,
         help="weight of the distortion (MSE) regularizer on the rate loss; "
-        "see bin_sq_err in train_gnn.py. 0 disables it",
+        "the MSE is measured in normalized [0,1] data units. 0 disables it",
     )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -544,16 +544,36 @@ def run(args, train, test, device, rng):
                 eb=eb, teacher_force=True,
             )
         loss = nll / max(npix, 1)
-        mse = aux["sq_err"] / max(npix, 1)  # squared prediction error, bin units
+        mse = aux["sq_err"] / max(npix, 1)  # normalized-data prediction MSE
         scaler.scale(loss + args.mse_weight * mse).backward()
         scaler.step(opt)
         scaler.update()
         sched.step()
         if ema is not None:
             ema.update(model, step)
+        weighted_mse_loss = args.mse_weight * mse
+        total_loss = loss + weighted_mse_loss
+        rate_value, mse_value, weighted_mse_value, total_loss_value = (
+            torch.stack(
+                (
+                    loss.detach(),
+                    mse.detach(),
+                    weighted_mse_loss.detach(),
+                    total_loss.detach(),
+                )
+            )
+            .float()
+            .cpu()
+            .tolist()
+        )
         log = {
-            "train/bpp": loss.item(),
-            "train/mse": mse.item(),
+            "train/bpp": rate_value,
+            "train/mse": mse_value,
+            "train/rate": rate_value,
+            "train/rate_loss": rate_value,
+            "train/mse_loss": mse_value,
+            "train/weighted_mse_loss": weighted_mse_value,
+            "train/total_loss": total_loss_value,
             "lr": sched.get_last_lr()[0],
         }
 

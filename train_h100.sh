@@ -61,6 +61,7 @@ python scripts/train_gnn.py \
     --agg-level 1 \
     --d 64 \
     --lr 0.0005 \
+    --mse-weight 100.0 \
     --noise-range 0.000001 0.01 \
     --eval-shape 256 256 \
     --eval-eb 0.001 \
