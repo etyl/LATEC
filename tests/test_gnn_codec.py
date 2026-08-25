@@ -35,7 +35,7 @@ def _codec(path, eb=1e-3):
         codec.compress,
         error_bound=eb,
         levels=2,
-        chunk_size=0,
+        chunk_size=None,
         fp16=False,
         compile=False,
     )

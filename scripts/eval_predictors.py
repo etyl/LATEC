@@ -24,11 +24,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from latec.baselines import sz3_roundtrip
-from latec.bitstream import FLAG_COMPILED, FLAG_CUBIC, FLAG_FP16, FLAG_GNN, Header
+from latec.bitstream import FLAG_CUBIC, Header
 from latec.codec import compress, decompress
 from latec.predictor import InterpPredictor
 
-METHODS = ("gnn-rans", "gnn", "interp", "interp-linear", "sz3")
+METHODS = ("gnn", "interp", "interp-linear", "sz3")
 
 
 def default_error_bounds() -> list[float]:
@@ -46,44 +46,12 @@ def load_image(path: Path) -> np.ndarray:
 
 def make_predictor(method: str, img: np.ndarray, args):
     """Encoder-side predictor for a LATEC closed-loop method."""
-    if method in ("gnn", "gnn-rans"):
-        from latec.gnn_predictor import GNNPredictor
-
-        p = GNNPredictor(
-            args.gnn_checkpoint,
-            float(img.min()),
-            float(img.max()),
-            max_radius=args.max_radius,
-            device=args.device,
-            levels=args.levels,
-            anchor_stride=args.anchor_stride,
-            anchor_block=args.anchor_block,
-        )
-        p.fp16 = args.fp16
-        p.compile = args.compile
-        return p
     order = "linear" if method == "interp-linear" else "cubic"
     return InterpPredictor(order, args.levels, args.anchor_stride, args.anchor_block)
 
 
 def build_predictor_for_decompress(method: str, hdr: Header, args):
     """Decoder-side predictor; params come from the stream header."""
-    if hdr.flags & FLAG_GNN:
-        from latec.gnn_predictor import GNNPredictor
-
-        p = GNNPredictor(
-            args.gnn_checkpoint,
-            hdr.vmin,
-            hdr.vmax,
-            max_radius=hdr.max_radius,
-            device=args.device,
-            levels=hdr.levels,
-            anchor_stride=hdr.anchor_stride,
-            anchor_block=hdr.anchor_block,
-        )
-        p.fp16 = bool(hdr.flags & FLAG_FP16)
-        p.compile = bool(hdr.flags & FLAG_COMPILED)
-        return p
     return InterpPredictor(
         "cubic" if hdr.flags & FLAG_CUBIC else "linear",
         hdr.levels,
@@ -111,10 +79,8 @@ def _quality(img: np.ndarray, rec: np.ndarray, n_bytes: int, eb: float) -> dict:
 
 
 def eval_gnn_chunked(img: np.ndarray, eb: float, args) -> dict:
-    """gnn via the chunked codec (GNNCompressorCodec), so Kodak can exercise
-    the coarse-halo path that big tensors are forced onto. tune=rd is not
-    supported there; it degrades to fast (run both arms with --tune fast for
-    a fair chunked-vs-unchunked comparison)."""
+    """gnn via the chunked codec (GNNCompressorCodec). tune=rd is not supported
+    there; it degrades to fast."""
     from latec.gnn_codec import GNNCompressorCodec
 
     # GNNCompressorCodec normalizes internally and treats error_bound as
@@ -154,7 +120,7 @@ def eval_gnn_chunked(img: np.ndarray, eb: float, args) -> dict:
 
 
 def eval_latec(img: np.ndarray, eb: float, method: str, args) -> dict:
-    if method in ("gnn", "gnn-rans") and args.chunk_size is not None:
+    if method == "gnn":
         return eval_gnn_chunked(img, eb, args)
     t0 = time.time()
     pred = make_predictor(method, img, args)
@@ -363,7 +329,7 @@ def main():
     ap.add_argument(
         "--methods",
         nargs="+",
-        default=["gnn-rans", "interp", "sz3"],
+        default=["gnn", "interp", "sz3"],
         choices=METHODS,
         help="predictors to evaluate",
     )
@@ -405,12 +371,7 @@ def main():
         "--chunk-size",
         type=int,
         default=None,
-        help="gnn: route through the chunked codec with this chunk "
-        "edge (multiple of anchor-stride; 0 = whole-tensor via "
-        "the chunked codec). Omit = original unchunked path",
-    )
-    ap.add_argument(
-        "--max-radius", type=int, default=64, help="GNN neighbour search radius"
+        help="gnn: chunk edge (multiple of anchor-stride); omit for auto",
     )
     ap.add_argument("--device", default="cpu", help="torch device for the GNN")
     ap.add_argument(
@@ -468,7 +429,7 @@ def main():
     if not images:
         sys.exit(f"No images found in {data_dir}")
 
-    uses_gnn = any(m in ("gnn", "gnn-rans") for m in args.methods)
+    uses_gnn = "gnn" in args.methods
     if uses_gnn and not Path(args.gnn_checkpoint).exists():
         sys.exit(f"GNN checkpoint not found: {args.gnn_checkpoint}")
 
@@ -523,7 +484,7 @@ def main():
                     f"bpp={r['bpp']:.3f} PSNR={r['psnr']:.2f}dB "
                     f"maxErr={r['max_err']:.1f} [{ok}] {r['t_comp']:.2f}s"
                 )
-                if method in ("gnn", "gnn-rans"):
+                if method == "gnn":
                     tqdm.write(
                         f"    GNN search: {r['tune_candidates']} candidate(s), "
                         f"setup={r['t_encode_setup']:.2f}s, "
@@ -533,10 +494,9 @@ def main():
                         f"decode={r['t_dec']:.2f}s "
                         f"(setup={r['t_decode_setup']:.2f}s)"
                     )
-                # GNN runs untiled (whole image = one region), so its embedding
-                # field is O(image size) instead of O(tile size); release it
-                # and any cached CUDA blocks before the next image/eb.
-                if method in ("gnn", "gnn-rans") and args.device.startswith("cuda"):
+                # Release the chunked predictor's geometry and any cached CUDA
+                # blocks before the next image/eb.
+                if method == "gnn" and args.device.startswith("cuda"):
                     import gc
                     import torch
 

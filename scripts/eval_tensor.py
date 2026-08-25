@@ -94,13 +94,24 @@ def main(argv=None):
     )
     ap.add_argument("input", help="tensor file (.npy or .pt/.pth)")
     add_common(ap)
+    # add_common only knows the torch-free interp predictors; the GNN arrives
+    # through GNNCompressorCodec (chunked), not through latec.codec.
+    ap._option_string_actions["--predictor"].choices = (
+        "gnn",
+        "interp",
+        "interp-linear",
+    )
+    ap.add_argument(
+        "--gnn-checkpoint",
+        default=str(Path(__file__).resolve().parent.parent / "data" / "gnn_predictor.pt"),
+        help="GNN checkpoint (.pt) for --predictor gnn",
+    )
     ap.add_argument(
         "--chunk-size",
         type=int,
         default=None,
         help="gnn only: force chunk edge (multiple of 2 ** levels); "
-        "0 = whole-tensor, omit = maximize chunk size within "
-        "the automatic point budget",
+        "omit = maximize chunk size within the automatic point budget",
     )
     ap.add_argument(
         "--fp16",
@@ -146,8 +157,6 @@ def main(argv=None):
         eb = args.eb * max(float(arr.max()) - float(arr.min()), 1e-12)
 
     if args.predictor == "gnn":
-        # GNNCompressorCodec auto-chunks large tensors; the codec.compress path
-        # allocates a dense embedding field over the whole tensor and OOMs.
         os.environ.setdefault("LATEC_PROGRESS", "1")  # per-chunk progress to stderr
         from latec.gnn_codec import GNNCompressorCodec
 

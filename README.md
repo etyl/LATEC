@@ -36,10 +36,10 @@ only specify `levels`, so the dyadic schedule always reaches unit stride.
 The stream records the tensor shape, dtype, codec parameters, numerical mode,
 and checkpoint hash. Decoding checks the checkpoint hash by default. Large
 tensors are automatically divided into the largest dependency-safe chunks that
-fit the codec's point budget and processed one at a time; set `chunk_size=0` to
-force the whole-tensor path.
+fit the codec's point budget and processed one at a time; small tensors code as
+a single chunk covering the shape. Pass `chunk_size` to force a chunk edge.
 
-The lower-level API supports both predictors and returns codec diagnostics:
+The lower-level interpolation API returns codec diagnostics:
 
 ```python
 from latec import compress, decompress
@@ -58,7 +58,6 @@ latec decompress output.msz reconstructed.png
 latec eval input.png --eb 2 --predictor interp
 ```
 
-Use `--predictor gnn --gnn-checkpoint PATH` for checkpoint-backed prediction.
 `--rel` interprets the bound relative to the input range, while `--tune size`
 tests several coarse-stage error schedules and retains the smallest stream.
 
@@ -100,9 +99,9 @@ that cannot be represented safely are stored as exact outliers. Interpolation
 streams use canonical Huffman coding. GNN streams additionally predict a local
 Laplacian scale and use scale-conditioned rANS coding.
 
-Both supported predictors operate on the complete field without padding or
-prediction seams. The dedicated GNN tensor codec adds chunking for bounded GPU
-memory while preserving the dependency order between chunks.
+The interpolation predictor operates on the complete field without padding or
+prediction seams. The GNN tensor codec always codes chunk by chunk, for bounded
+GPU memory, preserving the dependency order between chunks.
 
 ## Repository Layout
 

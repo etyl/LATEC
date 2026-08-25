@@ -384,49 +384,43 @@ def test_chunked_encoder_deterministic(current_ckpt, shape):
 # --- chunked vs whole -------------------------------------------------------
 
 
-def test_chunked_matches_whole_bound(current_ckpt):
-    """Same tensor both ways: each path honours the bound; a small tensor codes
-    identically small under either (sanity that the pipeline, not luck, is wired).
-    """
+def test_single_chunk_matches_multi_chunk_bound(current_ckpt):
+    """Same tensor as one chunk and as a grid of chunks: both honour the bound."""
     rng = np.random.RandomState(11)
     x = rng.rand(8, 12).astype(np.float32)
 
-    whole = _codec(current_ckpt, chunk_size=0)  # force whole-tensor
-    chunk = _codec(current_ckpt, chunk_size=STRIDE)  # force chunked
+    one = _codec(current_ckpt, chunk_size=None)  # small -> single chunk
+    many = _codec(current_ckpt, chunk_size=STRIDE)  # forced grid
 
-    yw = whole.uncompress(whole.compress(x))
-    yc = chunk.uncompress(chunk.compress(x))
+    y1 = one.uncompress(one.compress(x))
+    ym = many.uncompress(many.compress(x))
 
-    assert _maxerr(yw, x) <= 1e-2  # _codec's default eb
-    assert _maxerr(yc, x) <= 1e-2
+    assert _maxerr(y1, x) <= 1e-2  # _codec's default eb
+    assert _maxerr(ym, x) <= 1e-2
 
 
-def test_gate_applies_on_whole_tensor_path(current_ckpt):
-    """gate=True with chunk_size=0 (whole-tensor): the gate is device-only, so a
-    gated whole-tensor encode is realised as a single chunk covering the shape
-    (grid 1 per axis). The stream then carries chunk metadata and honours the
-    bound; the ungated whole-tensor encode stays on the plain numpy path."""
+def test_gate_applies_on_single_chunk_path(current_ckpt):
+    """A small tensor codes as one chunk covering the shape (grid 1 per axis),
+    and the gate applies there like on any other chunk."""
     from latec.gnn_codec import _read_stream
 
     rng = np.random.RandomState(3)
     x = rng.rand(20, 24).astype(np.float32)
 
-    gated = _codec(current_ckpt, eb=1e-4, chunk_size=0, gate=True)
-    plain = _codec(current_ckpt, eb=1e-4, chunk_size=0, gate=False)
+    gated = _codec(current_ckpt, eb=1e-4, chunk_size=None, gate=True)
 
     sg = gated.compress(x)
     meta_g = _read_stream(sg)[0]
-    # gate routes the whole-tensor case through a single chunk covering the shape
     assert meta_g["chunks"] == [20, 24]  # ceil(shape, anchor_stride=1<<LEVELS)
-    assert "chunks" not in _read_stream(plain.compress(x))[0]  # numpy whole path
     assert _maxerr(gated.uncompress(sg), x) <= 1e-4
 
 
 def test_auto_chunk_selection(current_ckpt):
-    """chunk_size=None: whole-tensor for small inputs, chunked past the
+    """chunk_size=None: one chunk covering small inputs, a grid past the
     threshold; forced int must be a multiple of anchor_stride."""
     codec = _codec(current_ckpt, chunk_size=None)
-    assert codec._chunk_edges((16, 16), STRIDE, None) is None  # small -> whole
+    # small -> a single chunk covering the shape
+    assert codec._chunk_edges((16, 16), STRIDE, None) == (16, 16)
     big = (1 << 12, 1 << 12)  # 16.7M points -> chunked
     edges = codec._chunk_edges(big, STRIDE, None)
     assert edges is not None

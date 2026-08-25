@@ -1,5 +1,4 @@
-"""Verify the chunked GNN codec's memory bound on tensors far beyond what the
-whole-tensor path can handle.
+"""Verify the chunked GNN codec's memory bound on large tensors.
 
     /usr/bin/time -v python scripts/check_chunked_memory.py --shape 256 256 256
 

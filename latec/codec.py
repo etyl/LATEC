@@ -16,9 +16,7 @@ from .bitstream import (
     DTYPE_CODES,
     DTYPE_IDS,
     END_MODE_SHIFT,
-    FLAG_COMPILED,
     FLAG_CUBIC,
-    FLAG_FP16,
     FLAG_INTERP,
     FLAG_RANS,
     Header,
@@ -114,8 +112,6 @@ def compress(
     flags = getattr(predictor, "stream_flag", 0)
     use_rans = getattr(predictor, "provides_scale", False)
     flags |= FLAG_RANS if use_rans else 0
-    flags |= FLAG_FP16 if getattr(predictor, "fp16", False) else 0
-    flags |= FLAG_COMPILED if getattr(predictor, "compile", False) else 0
     round_output = np.issubdtype(np.dtype(img.dtype), np.integer)
 
     def new_stats():
@@ -288,8 +284,7 @@ def compress(
 
 def decompress(stream: bytes, predictor_factory=None) -> np.ndarray:
     """Decompress a LATEC stream. ``predictor_factory(header) -> predictor``;
-    defaults to InterpPredictor for interpolation streams. GNN streams need a
-    factory that builds a GNNPredictor from the checkpoint."""
+    defaults to InterpPredictor for interpolation streams."""
     header, payload = read_stream(stream)
     if predictor_factory is None:
         if header.flags & FLAG_INTERP:
@@ -300,7 +295,7 @@ def decompress(stream: bytes, predictor_factory=None) -> np.ndarray:
                 hdr.anchor_block,
             )
         else:
-            raise ValueError("stream needs a predictor_factory (GNN checkpoint)")
+            raise ValueError("stream needs a predictor_factory")
     predictor = predictor_factory(header)
     if hasattr(predictor, "center"):
         predictor.center = header.interp_center

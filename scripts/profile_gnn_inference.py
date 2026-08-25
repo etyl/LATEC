@@ -1,11 +1,10 @@
-"""Benchmark and profile GNN inference on the real closed-loop codec path.
+"""Benchmark and profile the chunked GNN codec roundtrip.
 
 Examples:
     python scripts/profile_gnn_inference.py --checkpoint data/gnn_predictor.pt
-    python scripts/profile_gnn_inference.py --checkpoint model.pt --input image.png --eb 2
+    python scripts/profile_gnn_inference.py --checkpoint model.pt --input field.npy --eb 1e-3
     python scripts/profile_gnn_inference.py --checkpoint model.pt --profile \
-        --trace inference_trace.json
-    python scripts/profile_gnn_inference.py --checkpoint model.pt --mode codec
+        --trace /tmp/codec_trace.json
 """
 
 from __future__ import annotations
@@ -21,10 +20,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from latec.codec import compress, decompress
-from latec.gnn_predictor import GNNPredictor
-from latec.levels import stage_ebs, stage_masks
-from latec.quantizer import dequantize, quantize
+from latec.gnn_codec import GNNCompressorCodec
 
 
 def parse_args(argv=None):
@@ -41,26 +37,21 @@ def parse_args(argv=None):
         help="synthetic spatial shape when --input is omitted",
     )
     ap.add_argument(
-        "--eb", type=float, default=0.01, help="absolute error bound in input units"
+        "--eb",
+        type=float,
+        default=1e-2,
+        help="error bound, relative to the input's (max - min)",
     )
+    ap.add_argument("--levels", default="auto", help="schedule depth, or 'auto'")
+    ap.add_argument(
+        "--chunk-size", type=int, default=None, help="chunk edge (default: auto)"
+    )
+    ap.add_argument("--no-fp16", action="store_true", help="run the message pass fp32")
     ap.add_argument(
         "--device", help="cpu, cuda, or cuda:N (default: CUDA if available)"
     )
-    ap.add_argument(
-        "--mode",
-        choices=("predictor", "codec"),
-        default="predictor",
-        help="profile staged prediction or the complete image codec",
-    )
-    ap.add_argument("--warmup", type=int, default=2)
-    ap.add_argument("--repeats", type=int, default=5)
-    ap.add_argument("--levels", type=int, default=4)
-    ap.add_argument("--anchor-stride", type=int, default=16)
-    ap.add_argument("--anchor-block", type=int, default=1)
-    ap.add_argument(
-        "--max-radius", type=int, default=64, help="maximum GNN neighbour radius"
-    )
-    ap.add_argument("--radius", type=int, default=1 << 15, help="quantizer radius")
+    ap.add_argument("--warmup", type=int, default=1)
+    ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--threads", type=int, help="PyTorch CPU thread count")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
@@ -91,70 +82,11 @@ def load_input(args) -> np.ndarray:
     return arr
 
 
-def predictor_values(arr: np.ndarray) -> tuple[np.ndarray, tuple[int, ...]]:
-    """Return channel-first values and the spatial shape."""
-    if arr.ndim == 2:
-        values = arr[None, ...]
-    elif arr.ndim == 3 and arr.shape[-1] in (1, 3):
-        values = np.moveaxis(arr, -1, 0)
-    else:
-        values = arr.reshape((1, *arr.shape))
-    return values.astype(np.float32, copy=False), values.shape[1:]
-
-
-def make_predictor(args, vmin: float, vmax: float) -> GNNPredictor:
-    return GNNPredictor(
-        args.checkpoint,
-        vmin,
-        vmax,
-        max_radius=args.max_radius,
-        device=args.device,
-        levels=args.levels,
-        anchor_stride=args.anchor_stride,
-        anchor_block=args.anchor_block,
-    )
-
-
 def synchronize(device: str) -> None:
     import torch
 
     if torch.device(device).type == "cuda":
         torch.cuda.synchronize(device)
-
-
-def predictor_pass(
-    values, predictor, masks, ebs, args, round_output=False, collect_stages=True
-):
-    """Run the encoder's prediction/quantization feedback loop without coding."""
-    import torch
-
-    recon = np.zeros_like(values)
-    known = np.zeros(values.shape[1:], dtype=bool)
-    stage_ms = []
-    t_total = time.perf_counter()
-    for stage_idx, (pos, eb) in enumerate(zip(masks, ebs)):
-        n = int(pos.sum())
-        if not n:
-            continue
-        if stage_idx == 0:
-            pred = np.zeros((values.shape[0], n), np.float32)
-        else:
-            synchronize(args.device)
-            t0 = time.perf_counter()
-            with torch.profiler.record_function(f"gnn_predict_stage_{stage_idx}"):
-                pred, _scale = predictor.predict(recon, known, pos, eb=eb)
-            synchronize(args.device)
-            if collect_stages:
-                stage_ms.append((stage_idx, n, (time.perf_counter() - t0) * 1e3))
-        codes, outliers = quantize(
-            values[:, pos], pred, eb, args.radius, round_output=round_output
-        )
-        recon[:, pos] = dequantize(pred, codes, outliers, eb, args.radius).reshape(
-            values.shape[0], n
-        )
-        known |= pos
-    synchronize(args.device)
-    return (time.perf_counter() - t_total) * 1e3, stage_ms
 
 
 def summarize(name: str, samples: list[float]) -> None:
@@ -167,58 +99,39 @@ def summarize(name: str, samples: list[float]) -> None:
     )
 
 
-def run_predictor(args, arr):
-    values, shape = predictor_values(arr)
-    vmin, vmax = float(values.min()), float(values.max())
-    if vmax <= vmin:
-        vmax = vmin + 1.0
-    predictor = make_predictor(args, vmin, vmax)
-    masks = stage_masks(shape, args.levels, args.anchor_stride, args.anchor_block)
-    ebs = stage_ebs(
-        shape, args.levels, args.anchor_stride, args.anchor_block, args.eb, 1.0
-    )
-    round_output = np.issubdtype(arr.dtype, np.integer)
+def make_roundtrip(args, arr):
+    codec = GNNCompressorCodec(args.checkpoint, args.device)
+    levels = args.levels if args.levels == "auto" else int(args.levels)
 
-    for _ in range(args.warmup):
-        predictor_pass(
-            values, predictor, masks, ebs, args, round_output, collect_stages=False
+    def roundtrip():
+        synchronize(args.device)
+        t0 = time.perf_counter()
+        stream = codec.compress(
+            arr,
+            error_bound=args.eb,
+            levels=levels,
+            chunk_size=args.chunk_size,
+            fp16=not args.no_fp16,
         )
+        synchronize(args.device)
+        t1 = time.perf_counter()
+        codec.uncompress(stream)
+        synchronize(args.device)
+        return (t1 - t0) * 1e3, (time.perf_counter() - t1) * 1e3, len(stream)
 
-    totals, per_stage = [], {}
-    for _ in range(args.repeats):
-        total, stages = predictor_pass(
-            values, predictor, masks, ebs, args, round_output
-        )
-        totals.append(total)
-        for stage_idx, n, elapsed in stages:
-            per_stage.setdefault((stage_idx, n), []).append(elapsed)
-
-    print("\nClosed-loop predictor benchmark")
-    summarize("total inference", totals)
-    print("\nPer-stage prediction (mean across repeats)")
-    print(f"{'stage':>7} {'values':>12} {'latency':>12}")
-    for (stage_idx, n), samples in per_stage.items():
-        print(
-            f"{stage_idx:>7} {n * values.shape[0]:>12,} "
-            f"{statistics.fmean(samples):>10.2f} ms"
-        )
-
-    if args.profile or args.trace:
-        profile_predictor(args, values, predictor, masks, ebs, round_output)
+    return roundtrip
 
 
-def profile_predictor(args, values, predictor, masks, ebs, round_output):
+def profile_once(args, roundtrip):
     import torch
 
     activities = [torch.profiler.ProfilerActivity.CPU]
     if torch.device(args.device).type == "cuda":
         activities.append(torch.profiler.ProfilerActivity.CUDA)
     with torch.profiler.profile(
-        activities=activities, record_shapes=True, profile_memory=True, with_stack=False
+        activities=activities, record_shapes=True, profile_memory=True
     ) as prof:
-        predictor_pass(
-            values, predictor, masks, ebs, args, round_output, collect_stages=False
-        )
+        roundtrip()
 
     sort_by = (
         "self_cuda_time_total"
@@ -231,75 +144,6 @@ def profile_predictor(args, values, predictor, masks, ebs, round_output):
         args.trace.parent.mkdir(parents=True, exist_ok=True)
         prof.export_chrome_trace(str(args.trace))
         print(f"Chrome trace: {args.trace.resolve()}")
-
-
-def run_codec(args, arr):
-    if arr.ndim not in (2, 3) or (arr.ndim == 3 and arr.shape[-1] not in (1, 3)):
-        raise ValueError("--mode codec requires an HxW or HxWx{1,3} input")
-    vmin, vmax = float(arr.min()), float(arr.max())
-    if vmax <= vmin:
-        vmax = vmin + 1.0
-    encoder = make_predictor(args, vmin, vmax)
-    decoder = make_predictor(args, vmin, vmax)
-
-    def roundtrip():
-        synchronize(args.device)
-        t0 = time.perf_counter()
-        stream, stats = compress(
-            arr,
-            args.eb,
-            encoder,
-            levels=args.levels,
-            anchor_stride=args.anchor_stride,
-            anchor_block=args.anchor_block,
-            radius=args.radius,
-            eb_ratio=1.0,
-            tune="fast",
-        )
-        synchronize(args.device)
-        t1 = time.perf_counter()
-        decompress(stream, lambda _header: decoder)
-        synchronize(args.device)
-        return (t1 - t0) * 1e3, (time.perf_counter() - t1) * 1e3, stats
-
-    for _ in range(args.warmup):
-        roundtrip()
-    enc, dec, predict, quantize_ms, entropy = [], [], [], [], []
-    for _ in range(args.repeats):
-        te, td, stats = roundtrip()
-        enc.append(te)
-        dec.append(td)
-        predict.append(stats["predict_s"] * 1e3)
-        quantize_ms.append(stats["quantize_s"] * 1e3)
-        entropy.append(stats["entropy_s"] * 1e3)
-
-    print("\nFull codec benchmark")
-    summarize("compress", enc)
-    summarize("decompress", dec)
-    summarize("encode prediction", predict)
-    summarize("encode quantize", quantize_ms)
-    summarize("encode entropy", entropy)
-    if args.profile or args.trace:
-        print("\nProfiling one additional codec roundtrip...")
-        import torch
-
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if torch.device(args.device).type == "cuda":
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
-        with torch.profiler.profile(
-            activities=activities, record_shapes=True, profile_memory=True
-        ) as prof:
-            roundtrip()
-        sort_by = (
-            "self_cuda_time_total"
-            if torch.device(args.device).type == "cuda"
-            else "self_cpu_time_total"
-        )
-        print(prof.key_averages().table(sort_by=sort_by, row_limit=args.profile_rows))
-        if args.trace:
-            args.trace.parent.mkdir(parents=True, exist_ok=True)
-            prof.export_chrome_trace(str(args.trace))
-            print(f"Chrome trace: {args.trace.resolve()}")
 
 
 def main(argv=None):
@@ -322,10 +166,23 @@ def main(argv=None):
         f"warmup={args.warmup} repeats={args.repeats}"
     )
 
-    if args.mode == "predictor":
-        run_predictor(args, arr)
-    else:
-        run_codec(args, arr)
+    roundtrip = make_roundtrip(args, arr)
+    for _ in range(args.warmup):
+        roundtrip()
+    enc, dec, sizes = [], [], []
+    for _ in range(args.repeats):
+        te, td, n = roundtrip()
+        enc.append(te)
+        dec.append(td)
+        sizes.append(n)
+
+    print("\nChunked codec benchmark")
+    summarize("compress", enc)
+    summarize("decompress", dec)
+    print(f"stream {sizes[0]} bytes | ratio {arr.nbytes / sizes[0]:.2f}")
+    if args.profile or args.trace:
+        print("\nProfiling one additional roundtrip...")
+        profile_once(args, roundtrip)
 
 
 if __name__ == "__main__":

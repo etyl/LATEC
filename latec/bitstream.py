@@ -27,13 +27,10 @@ VERSION = 3
 
 FLAG_MOCK = 1 << 0
 FLAG_GRAY = 1 << 1
-FLAG_GNN = 1 << 2
 FLAG_INTERP = 1 << 3  # SZ-style interpolation baseline (torch-free)
 FLAG_CUBIC = 1 << 4  # interp order: set = cubic, clear = linear
 FLAG_NOTILE = 1 << 5  # whole image is one tile (no padding, no seam)
 FLAG_RANS = 1 << 6  # per-symbol scale-conditioned coder for stage bins
-FLAG_FP16 = 1 << 7  # GNN message pass used fp16 autocast
-FLAG_COMPILED = 1 << 8  # GNN message pass used torch.compile
 # interp line-end handling, predictor.END_QUAD / END_EXTRAP shifted into flags
 FLAG_END_QUAD = 1 << 9
 FLAG_END_EXTRAP = 1 << 10

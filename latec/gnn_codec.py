@@ -15,10 +15,9 @@ from typing import Any
 import numpy as np
 import zstandard
 
-from .codec import _compress_region
 from . import gnn_predictor as _gp
-from .gnn_predictor import ChunkedGNNPredictor, GNNPredictor
-from .levels import stage_ebs, stage_masks, stage_plan, stage_strides
+from .gnn_predictor import ChunkedGNNPredictor
+from .levels import stage_ebs, stage_plan, stage_strides
 from .predictor import END_EXTRAP, END_QUAD, default_interp_center
 from .quantizer import dequantize, quantize
 from .bitstream import pack_stage, unpack_stage
@@ -31,8 +30,9 @@ _PREFIX = "<8sII"
 _PREFIX_SIZE = struct.calcsize(_PREFIX)
 _ANCHOR_BLOCK = 1
 
-# auto mode: whole-tensor below this many points, chunked above (whole-tensor
-# memory is ~30*L*K*d bytes/point in transients — ~2^21 points is a few GB)
+# auto mode: a single chunk covering the tensor below this many points, a grid
+# of chunks above (a chunk's transients are ~30*L*K*d bytes/point — ~2^21 points
+# is a few GB)
 _AUTO_CHUNK_THRESHOLD = 1 << 21
 # Minimum chunk count before an *explicit* compile=True is honored: below this,
 # dynamo warmup can't be amortized, so a forced compile is silently skipped.
@@ -262,56 +262,6 @@ def _empty_stats(n_stages: int) -> dict[str, Any]:
         "stage_recon_sse": [0.0] * n_stages,
         "stage_recon_max": [0.0] * n_stages,
     }
-
-
-def _decompress_region(
-    payload: bytes,
-    shape: tuple[int, ...],
-    masks: list[np.ndarray],
-    ebs: list[float],
-    radius: int,
-    predictor: GNNPredictor,
-    use_rans: bool,
-) -> np.ndarray:
-    recon = np.zeros((1, *shape), np.float32)
-    known = np.zeros(shape, bool)
-    off = 0
-    for stage_idx, pos in enumerate(masks):
-        n = int(pos.sum())
-        if n == 0:
-            if use_rans:
-                tables = build_laplace_tables(ebs[stage_idx], radius)
-                codes, outliers, off = unpack_stage(
-                    payload, off, rans_levels=np.zeros(0, np.uint8), rans_tables=tables
-                )
-            else:
-                codes, outliers, off = unpack_stage(payload, off)
-            continue
-        if stage_idx == 0:
-            pred = np.zeros((1, n), np.float32)
-            scale = np.full((1, n), ebs[stage_idx], np.float32)
-        else:
-            if use_rans:
-                pred, scale = predictor.predict(recon, known, pos, eb=ebs[stage_idx])
-            else:
-                got = predictor.predict(recon, known, pos, eb=ebs[stage_idx])
-                pred = got[0] if isinstance(got, tuple) else got
-                scale = None
-        if use_rans:
-            tables = build_laplace_tables(ebs[stage_idx], radius)
-            levels64 = scale_to_level(scale, ebs[stage_idx]).reshape(-1)
-            codes, outliers, off = unpack_stage(
-                payload, off, rans_levels=levels64, rans_tables=tables
-            )
-        else:
-            codes, outliers, off = unpack_stage(payload, off)
-        recon[:, pos] = dequantize(
-            pred, codes, outliers, ebs[stage_idx], radius
-        ).reshape(1, n)
-        known |= pos
-    if off != len(payload):
-        raise ValueError("trailing bytes in LATEC GNN payload")
-    return recon[0]
 
 
 def _chunk_stage_ebs(shape, levels, stride, block, eb, eb_ratio) -> list[float]:
@@ -544,7 +494,7 @@ def _interp_axis_at_t(torch, W, coords, axis, s, shape, cubic, end_mode, ends):
     the numpy ``_interp_axis_at`` branch for branch: here ``W`` is the *chunk-local*
     reconstruction, so a line end is hit at every chunk face rather than only at
     the domain face, and the legacy nearest-neighbour copy is correspondingly
-    more expensive than it is for the whole-tensor interp predictor.
+    more expensive than it is for the (unchunked) numpy interp predictor.
 
     Line ends are handled on the ``_end_plan`` subset rather than by masking
     full-length tensors, which is what keeps ``END_EXTRAP`` from costing the
@@ -1615,13 +1565,16 @@ class GNNCompressorCodec:
         shape: tuple[int, ...],
         anchor_stride: int,
         cs: int | tuple[int, ...] | None,
-    ) -> tuple[int, ...] | None:
-        """Chunk edges for this shape, or None for the whole-tensor path."""
-        if cs == 0:
-            return None
+    ) -> tuple[int, ...]:
+        """Chunk edges for this shape. ``None`` = auto: one chunk covering the
+        whole tensor when it is small, otherwise a grid of auto-sized chunks."""
         if cs is None:
             if int(np.prod(shape)) <= _AUTO_CHUNK_THRESHOLD:
-                return None
+                # Single chunk over the whole shape (edges rounded up to the
+                # anchor stride): one GPU pass, and the gate still applies.
+                return tuple(
+                    -(-n // anchor_stride) * anchor_stride for n in shape
+                )
             return _auto_chunk_edges(shape, anchor_stride)
         edges = (
             (int(cs),) * len(shape) if np.isscalar(cs) else tuple(int(e) for e in cs)
@@ -1663,9 +1616,9 @@ class GNNCompressorCodec:
         ``tune="size"``: sweep). Depth-normalised per resolved levels so it is
         rank-invariant.
 
-        ``chunk_size``: None = auto (whole-tensor for small inputs, otherwise the
-        largest near-isotropic chunk within _AUTO_CHUNK_THRESHOLD points); 0 =
-        force whole-tensor; an int or per-axis tuple forces chunked with those
+        ``chunk_size``: None = auto (a single chunk covering small inputs,
+        otherwise the largest near-isotropic chunk within
+        _AUTO_CHUNK_THRESHOLD points); an int or per-axis tuple forces those
         edges (multiples of anchor_stride).
 
         ``fp16``: run the message-pass matmuls in fp16 (cuda only; the readout
@@ -1679,10 +1632,7 @@ class GNNCompressorCodec:
         disables it. The resolved decision is stored in meta so decode replays
         the same float path. First encode pays a one-off compilation cost.
 
-        ``gate``: scale-gated classical fallback. Applies to both the chunked and
-        whole-tensor path -- the gate is device-only, so a gated whole-tensor
-        encode is realised as a single chunk covering the shape (see below). The
-        encoder rate-selects GNN, cubic/averaged interpolation, or
+        ``gate``: scale-gated classical fallback. The encoder rate-selects GNN, cubic/averaged interpolation, or
         first/last-axis linear interpolation per chunk-stage and stores the
         winner in the header. It self-disables wherever no fallback pays.
 
@@ -1768,23 +1718,11 @@ class GNNCompressorCodec:
             {_per_step_eb_ratio(c, levels) for c in coarse_candidates}
         )
         edges = self._chunk_edges(shape, anchor_stride, chunk_size)
-        if edges is None and gate:
-            # The scale-gated interp fallback lives entirely in the device chunked
-            # inner loop; the numpy whole-tensor path has no gate. So when the gate
-            # is enabled, realise a "gated whole-tensor" encode as a single chunk
-            # covering the whole shape (grid 1 per axis, edges rounded up to the
-            # anchor stride) -- one GPU pass, same memory footprint as whole-tensor,
-            # but the gate applies. gate=False keeps the plain numpy whole path.
-            edges = tuple(-(-n // anchor_stride) * anchor_stride for n in shape)
         # torch.compile costs seconds of dynamo warmup per process; only worth
         # it when there are enough chunk waves to amortize. "auto" defers to the
         # benchmark-backed crossover; explicit True is honored past a floor.
         # Frozen into the stream meta so decode replays the same float path.
-        nchunks = (
-            int(np.prod([-(-n // e) for n, e in zip(shape, edges)]))
-            if edges is not None
-            else 0
-        )
+        nchunks = int(np.prod([-(-n // e) for n, e in zip(shape, edges)]))
         if isinstance(compile, str):
             want_compile = (
                 _COMPILE_AUTO_CROSSOVER is not None
@@ -1792,24 +1730,17 @@ class GNNCompressorCodec:
             )
         else:
             want_compile = bool(compile) and nchunks >= _COMPILE_MIN_CHUNKS
-        use_compile = want_compile and edges is not None
+        use_compile = want_compile
         candidates: list[tuple[int, bytes]] = []
         for ratio in ratio_candidates:
-            gates = None
-            fine_gates = None
-            if edges is None:
-                payload = self._compress_payload(
-                    values, round_output, eb, ratio, levels, anchor_stride, radius
-                )
-            else:
-                payload, gates, fine_gates = self._compress_chunked_payload(
-                    values, round_output, eb, ratio, edges, use_compile,
-                    levels, anchor_stride, radius, fp16, gate, gate_fine,
-                )
-                if gates is not None and not any(gates):
-                    gates = None  # gate never fired -> plain ungated stream
-                if fine_gates is not None and not any(fine_gates):
-                    fine_gates = None  # finest gate never fired -> nothing to store
+            payload, gates, fine_gates = self._compress_chunked_payload(
+                values, round_output, eb, ratio, edges, use_compile,
+                levels, anchor_stride, radius, fp16, gate, gate_fine,
+            )
+            if gates is not None and not any(gates):
+                gates = None  # gate never fired -> plain ungated stream
+            if fine_gates is not None and not any(fine_gates):
+                fine_gates = None  # finest gate never fired -> nothing to store
             meta = {
                 "shape": list(original_shape),
                 "dtype": dtype.str,
@@ -1820,12 +1751,11 @@ class GNNCompressorCodec:
                 "vmax": vmax,
                 "eb_ratio": ratio,
                 "checkpoint_hash": self.checkpoint_hash.hex(),
+                "chunks": list(edges),
+                "m_tile": int(_gp._M_TILE),  # replay the exact float path
+                "fp16": bool(fp16),
+                "compiled": bool(use_compile),
             }
-            if edges is not None:
-                meta["chunks"] = list(edges)
-                meta["m_tile"] = int(_gp._M_TILE)  # replay the exact float path
-                meta["fp16"] = bool(fp16)
-                meta["compiled"] = bool(use_compile)
             if gates is not None:
                 # Per-chunk-stage coarse gate words, zstd+base64 packed (the JSON
                 # header is otherwise uncompressed; repeated/zero words collapse).
@@ -1855,53 +1785,11 @@ class GNNCompressorCodec:
         if vmax <= vmin:
             vmax = vmin + 1.0
 
-        if "chunks" in meta:
-            edges = tuple(int(e) for e in meta["chunks"])
-            levels = int(meta["levels"])
-            anchor_stride = 1 << levels
-            predictor = self._chunked_predictor(levels, meta)
-            ebs = _chunk_stage_ebs(
-                shape,
-                levels,
-                anchor_stride,
-                _ANCHOR_BLOCK,
-                float(meta["error_bound"]),
-                float(meta["eb_ratio"]),
-            )
-            saved_tile = _gp._M_TILE
-            _gp._M_TILE = int(meta["m_tile"])  # match encode path
-            try:
-                packed_gates = meta.get("gates")
-                packed_fine = meta.get("fine_gates")
-                values = _decompress_chunked(
-                    payload,
-                    shape,
-                    ebs,
-                    int(meta["radius"]),
-                    predictor,
-                    edges,
-                    gates=None if packed_gates is None else _unpack_gates(packed_gates),
-                    fine_gates=None if packed_fine is None else _unpack_gates(packed_fine),
-                )
-            finally:
-                _gp._M_TILE = saved_tile
-            # In place: `values` is a fresh float32 buffer from the decode, and
-            # out-of-place would hold two full-size copies of the field.
-            values *= vmax - vmin  # undo compress()'s [0, 1] normalize
-            values += vmin
-            out = _restore_dtype(values.reshape(original_shape), dtype)
-            return torch.as_tensor(out)
-
+        edges = tuple(int(e) for e in meta["chunks"])
         levels = int(meta["levels"])
         anchor_stride = 1 << levels
-        predictor = self._predictor(levels, meta)
-        masks = stage_masks(
-            shape,
-            levels,
-            anchor_stride,
-            _ANCHOR_BLOCK,
-        )
-        ebs = stage_ebs(
+        predictor = self._chunked_predictor(levels, meta)
+        ebs = _chunk_stage_ebs(
             shape,
             levels,
             anchor_stride,
@@ -1909,47 +1797,31 @@ class GNNCompressorCodec:
             float(meta["error_bound"]),
             float(meta["eb_ratio"]),
         )
-        values = _decompress_region(
-            payload, shape, masks, ebs, int(meta["radius"]), predictor, True
-        )
-        values *= vmax - vmin  # undo compress()'s [0, 1] normalize (in place)
+        saved_tile = _gp._M_TILE
+        _gp._M_TILE = int(meta["m_tile"])  # match encode path
+        try:
+            packed_gates = meta.get("gates")
+            packed_fine = meta.get("fine_gates")
+            values = _decompress_chunked(
+                payload,
+                shape,
+                ebs,
+                int(meta["radius"]),
+                predictor,
+                edges,
+                gates=None if packed_gates is None else _unpack_gates(packed_gates),
+                fine_gates=None if packed_fine is None else _unpack_gates(packed_fine),
+            )
+        finally:
+            _gp._M_TILE = saved_tile
+        # In place: `values` is a fresh float32 buffer from the decode, and
+        # out-of-place would hold two full-size copies of the field.
+        values *= vmax - vmin  # undo compress()'s [0, 1] normalize
         values += vmin
         out = _restore_dtype(values.reshape(original_shape), dtype)
         return torch.as_tensor(out)
 
     decompress = uncompress
-
-    def _compress_payload(
-        self,
-        values: np.ndarray,
-        round_output: bool | tuple[float, float],
-        eb: float,
-        eb_ratio: float,
-        levels: int,
-        anchor_stride: int,
-        radius: int,
-    ) -> bytes:
-        predictor = self._predictor(levels)
-        masks = stage_masks(values.shape, levels, anchor_stride, _ANCHOR_BLOCK)
-        ebs = stage_ebs(
-            values.shape,
-            levels,
-            anchor_stride,
-            _ANCHOR_BLOCK,
-            eb,
-            eb_ratio,
-        )
-        stats = _empty_stats(len(masks))
-        payload, _ = _compress_region(
-            values[None, ...],
-            masks,
-            ebs,
-            predictor,
-            radius,
-            round_output,
-            stats,
-        )
-        return payload
 
     def _compress_chunked_payload(
         self,
@@ -2025,23 +1897,6 @@ class GNNCompressorCodec:
         else:
             self._chunked_predictors.move_to_end(key)
         return predictor
-
-    def _predictor(
-        self,
-        levels: int,
-        meta: dict[str, Any] | None = None,
-    ) -> GNNPredictor:
-        anchor_stride = 1 << levels
-        return GNNPredictor(
-            self.checkpoint_path,
-            0.0,
-            1.0,
-            max_radius=anchor_stride,
-            device=self.device,
-            levels=levels,
-            anchor_stride=anchor_stride,
-            anchor_block=_ANCHOR_BLOCK,
-        )
 
     def _checkpoint_hash(self) -> bytes:
         # Streamed: this runs on every codec construction, and read_bytes()

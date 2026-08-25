@@ -77,5 +77,5 @@ def test_float_input():
 def test_unidentified_predictor_stream_requires_factory():
     img = smooth_image(64, 64, 3)
     stream, _ = compress(img, 2.0, NearestPredictor())
-    with pytest.raises(ValueError, match="checkpoint"):
+    with pytest.raises(ValueError, match="predictor_factory"):
         decompress(stream)

@@ -15,18 +15,9 @@ from pathlib import Path
 
 import numpy as np
 
-from .bitstream import (
-    FLAG_COMPILED,
-    FLAG_CUBIC,
-    FLAG_FP16,
-    FLAG_GNN,
-    FLAG_INTERP,
-    Header,
-)
+from .bitstream import FLAG_CUBIC, FLAG_INTERP, Header
 from .codec import compress, decompress
 from .predictor import InterpPredictor
-
-DEFAULT_GNN = Path(__file__).resolve().parent.parent / "data" / "gnn_predictor.pt"
 
 
 def load_image(path: str) -> np.ndarray:
@@ -52,35 +43,14 @@ def save_image(path: str, arr: np.ndarray) -> None:
 
 def build_predictor(args, header: Header):
     """Decompress-side predictor; all parameters come from the stream header."""
-    if header.flags & FLAG_INTERP:
-        return InterpPredictor(
-            "cubic" if header.flags & FLAG_CUBIC else "linear",
-            header.levels,
-            header.anchor_stride,
-            header.anchor_block,
-        )
-    if not header.flags & FLAG_GNN:
+    if not header.flags & FLAG_INTERP:
         raise ValueError("stream needs a predictor factory the CLI can't build")
-    from .gnn_predictor import GNNPredictor
-
-    pred = GNNPredictor(
-        args.gnn_checkpoint,
-        header.vmin,
-        header.vmax,
-        max_radius=header.max_radius,
-        levels=header.levels,
-        anchor_stride=header.anchor_stride,
-        anchor_block=header.anchor_block,
+    return InterpPredictor(
+        "cubic" if header.flags & FLAG_CUBIC else "linear",
+        header.levels,
+        header.anchor_stride,
+        header.anchor_block,
     )
-    pred.fp16 = bool(header.flags & FLAG_FP16)
-    pred.compile = bool(header.flags & FLAG_COMPILED)
-    if pred.checkpoint_hash != header.ckpt_hash:
-        print(
-            "warning: checkpoint hash differs from the one used to compress; "
-            "decoded output may violate the error bound",
-            file=sys.stderr,
-        )
-    return pred
 
 
 def add_common(ap):
@@ -121,12 +91,11 @@ def add_common(ap):
     )
     ap.add_argument(
         "--predictor",
-        choices=("gnn", "interp", "interp-linear"),
+        choices=("interp", "interp-linear"),
         default="interp",
         help="interp = SZ-style cubic interpolation (default); "
-        "interp-linear = its linear variant; gnn = trained GNN",
+        "interp-linear = its linear variant",
     )
-    ap.add_argument("--gnn-checkpoint", default=str(DEFAULT_GNN))
     ap.add_argument("-v", "--verbose", action="store_true")
 
 
@@ -135,23 +104,10 @@ def run_compress(img: np.ndarray, args) -> tuple[bytes, dict]:
     if args.rel:
         span = float(img.max()) - float(img.min())
         eb = args.eb * (span if span > 0 else 1.0)
-    kind = args.predictor
-    if kind in ("interp", "interp-linear"):
-        order = "linear" if kind == "interp-linear" else "cubic"
-        predictor = InterpPredictor(
-            order, args.levels, args.anchor_stride, args.anchor_block
-        )
-    else:  # gnn
-        from .gnn_predictor import GNNPredictor
-
-        predictor = GNNPredictor(
-            args.gnn_checkpoint,
-            float(img.min()),
-            float(img.max()),
-            levels=args.levels,
-            anchor_stride=args.anchor_stride,
-            anchor_block=args.anchor_block,
-        )
+    order = "linear" if args.predictor == "interp-linear" else "cubic"
+    predictor = InterpPredictor(
+        order, args.levels, args.anchor_stride, args.anchor_block
+    )
     return compress(
         img,
         eb,
@@ -276,7 +232,6 @@ def main(argv=None):
     p = sub.add_parser("decompress", help="decompress a .msz stream to an image")
     p.add_argument("input")
     p.add_argument("output")
-    p.add_argument("--gnn-checkpoint", default=str(DEFAULT_GNN))
     p.set_defaults(fn=cmd_decompress)
 
     p = sub.add_parser("eval", help="in-memory roundtrip with metrics")
