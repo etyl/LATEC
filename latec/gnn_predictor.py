@@ -44,11 +44,12 @@ import hashlib
 import itertools
 import os
 import warnings
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
 
-from .levels import point_levels, stage_masks
+from .levels import point_levels, stage_masks, stage_strides
 
 # torch is imported lazily inside the class / model so that importing this
 # module (e.g. for FLAG constants) stays cheap.
@@ -76,6 +77,16 @@ CKPT_VERSION = 7
 # the pre-fusion schedule had. Well clear of the small-tile cliff that would
 # shred the whole-tensor 2-D path, where a big stage is only a few blocks.
 _M_TILE = int(os.environ.get("LATEC_M_TILE", 1 << 16))
+# Compact frames duplicate most per-point neighbour indices and message-block
+# selections. They are cheap enough to rebuild after the agg-level-1 arithmetic
+# geometry optimization, so retaining them is opt-in; even one rank-4 frame can
+# occupy hundreds of MiB. The base geometry remains cached separately.
+_FRAME_CACHE_MIB = float(os.environ.get("LATEC_FRAME_CACHE_MIB", 0))
+# Above this size, collecting only out-of-chunk neighbour references while the
+# host geometry is already resident beats sorting/uniquing every reference on
+# the GPU. The 64x33^3 target chunk is above it; a 32^4 single chunk is below.
+_HOST_HALO_MIN_POINTS = 1 << 21
+_AXIAL_IMPLICIT_GEOMETRY = True
 
 
 def _cuda_working_budget(torch, device, fraction: float = 0.8) -> int:
@@ -309,6 +320,7 @@ class _StageGeom:
         "idx_np",
         "M",
         "ndim",
+        "ref_halo_np",
         "message_blocks",
     )
 
@@ -323,10 +335,13 @@ class _StageGeom:
         agg_level=None,
         query_only=False,
         precompute_messages=True,
+        ref_bounds=None,
+        axial_stride=None,
+        period=None,
     ):
         ndim = len(shape)
         self.ndim = ndim
-        P = pat.shape[0]
+        P = int(period) if period is not None else pat.shape[0]
         shp = np.asarray(shape)
         limit = min(max_radius, int(shp.max()))
         Q = query_coords  # (M, ndim)
@@ -346,7 +361,11 @@ class _StageGeom:
         # (much slower) remainder, as in `_nearest_steps`. Query coords are
         # non-negative, so the two agree exactly.
         mod = (lambda x: x & (P - 1)) if P & (P - 1) == 0 else (lambda x: x % P)
-        res = tuple(mod(Q[:, k]) for k in range(ndim)) if self.M else None
+        res = (
+            tuple(mod(Q[:, k]) for k in range(ndim))
+            if self.M and axial_stride is None
+            else None
+        )
         # Row-major strides of `shape`, so a neighbour's flat index is one dot
         # product. Out-of-bounds rows produce garbage here, but `valid` masks
         # them to 0 below -- which is why this can skip the clip that
@@ -357,16 +376,29 @@ class _StageGeom:
         sdt = np.int16 if limit < 2**15 else np.int32
         line_data = {k: [] for k in ("sp", "sn", "vp", "vn")}
         offs, cos, lognnz = [], [], []
+        ref_halo = []
+        if ref_bounds is not None:
+            ref_lo = np.asarray(ref_bounds[0], np.int64)
+            ref_hi = np.asarray(ref_bounds[1], np.int64)
         for d in half_directions(ndim, agg_level):
             ln = {}
             for side, sd in (("p", np.asarray(d)), ("n", -np.asarray(d))):
                 if not self.M:
-                    ln["s" + side] = t(np.zeros(0, sdt))
-                    ln["v" + side] = t(np.zeros(0, bool))
+                    ln["s" + side] = np.zeros(0, sdt)
+                    ln["v" + side] = np.zeros(0, bool)
                     continue
-                step = _nearest_steps_at(
-                    pat, sd, P, res, query_only=query_only
-                )  # (M,) at query residues
+                if axial_stride is None:
+                    step = _nearest_steps_at(
+                        pat, sd, P, res, query_only=query_only
+                    )  # (M,) at query residues
+                elif axial_stride == 0:  # anchors: nothing is known yet
+                    step = np.zeros(self.M, np.int64)
+                else:
+                    # At an axial dyadic stage, only odd-stride axes have
+                    # previously revealed neighbours, exactly one stride away.
+                    axis = int(np.flatnonzero(sd)[0])
+                    odd = ((Q[:, axis] // axial_stride) & 1).astype(bool)
+                    step = np.where(odd, axial_stride, 0)
                 nb = Q + step[:, None] * sd  # neighbour coords
                 valid = (step >= 1) & (step <= limit)  # legacy: <=limit
                 for k in range(ndim):  # ... & in-bounds, axis by axis so the
@@ -374,24 +406,39 @@ class _StageGeom:
                         valid &= nb[:, k] < shp[k]
                     elif sd[k] < 0:
                         valid &= nb[:, k] >= 0
+                if ref_bounds is not None:
+                    outside = np.zeros(self.M, bool)
+                    for k in range(ndim):
+                        outside |= (nb[:, k] < ref_lo[k]) | (nb[:, k] >= ref_hi[k])
+                    use = valid & outside
+                    if use.any():
+                        ref_halo.append((nb[use] @ nstrides).astype(np.int64))
                 # Only the step survives; `lines` rebuilds the index and the
                 # distance from it, including the legacy where-invalid defaults.
-                ln["s" + side] = t(np.where(valid, step, 0).astype(sdt))
-                ln["v" + side] = t(valid)
+                ln["s" + side] = np.where(valid, step, 0).astype(sdt)
+                ln["v" + side] = valid
             line_data["sp"].append(ln["sp"])
             line_data["sn"].append(ln["sn"])
             line_data["vp"].append(ln["vp"])
             line_data["vn"].append(ln["vn"])
             # Flat-index displacement of one step along +d; the -d side is -off.
             offs.append(int(np.asarray(d) @ nstrides))
-            c, ld = _line_static(d, torch, device)
+            # Build all line constants on the host and transfer each stacked
+            # attribute once below.  Moving every line-side separately issued
+            # hundreds of tiny HtoD copies while constructing a rank-4 schedule.
+            c, ld = _line_static(d, torch, None)
             cos.append(c)
             lognnz.append(ld)
         for name, values in line_data.items():
-            setattr(self, name, torch.stack(values, dim=0))
+            setattr(self, name, t(np.stack(values, axis=0)))
         self.off = t(np.asarray(offs, np.int64))
-        self.cos = torch.stack(cos, dim=0)
-        self.lognnz = torch.stack(lognnz, dim=0).unsqueeze(1)
+        cos_t = torch.stack(cos, dim=0)
+        self.cos = cos_t.to(device) if device is not None else cos_t
+        lognnz_t = torch.stack(lognnz, dim=0).unsqueeze(1)
+        self.lognnz = lognnz_t.to(device) if device is not None else lognnz_t
+        self.ref_halo_np = (
+            np.concatenate(ref_halo) if ref_halo else np.zeros(0, np.int64)
+        )
         self.message_blocks = (
             _build_message_blocks(self, torch) if precompute_messages else None
         )
@@ -1229,7 +1276,7 @@ class GNNPredictor:
             )
         ).to(self.device)
         finalize_ctx = self._ctx if cont else None
-        with torch.no_grad(), self._amp():
+        with torch.inference_mode(), self._amp():
             (values, log_b), self._E, self._ctx = stage_forward(
                 self.model,
                 self._E,
@@ -1288,29 +1335,54 @@ class _ChunkGeoms:
         self.n_padded = int(np.prod(self.padded_shape))
 
         masks = stage_masks(self.chunk_shape, levels, stride, block)
-        pats = _period_prefixes(self.chunk_shape, levels, stride, block)
+        schedule_strides = stage_strides(ndim, levels, stride)
+        use_axial = (
+            _AXIAL_IMPLICIT_GEOMETRY and agg_level == 1 and block == 1
+        )
+        pats = (
+            [None] * len(masks)
+            if use_axial
+            else _period_prefixes(self.chunk_shape, levels, stride, block)
+        )
         self.geoms = []  # per stage; None for empty stages
         self._offsets: dict = {}  # tensor strides -> per-stage flat offsets
-        for s, mask in enumerate(masks):
+        host_halo = int(np.prod(self.chunk_shape)) >= _HOST_HALO_MIN_POINTS
+        seen_halo = []
+        for s, (mask, stage_stride) in enumerate(zip(masks, schedule_strides)):
             Q = np.stack(np.nonzero(mask), axis=1)  # chunk-frame coords
             if not len(Q):
                 self.geoms.append(None)
                 if progress is not None:
                     progress(1)
                 continue
-            self.geoms.append(
-                _StageGeom(
-                    pats[s],
-                    Q + stride,
-                    self.padded_shape,
-                    stride,
-                    torch,
-                    device,
-                    agg_level,
-                    query_only=True,
-                    precompute_messages=False,
-                )
+            geom = _StageGeom(
+                pats[s],
+                Q + stride,
+                self.padded_shape,
+                stride,
+                torch,
+                device,
+                agg_level,
+                query_only=True,
+                precompute_messages=False,
+                ref_bounds=(
+                    (
+                        (stride,) * ndim,
+                        tuple(stride + n for n in self.chunk_shape),
+                    )
+                    if host_halo
+                    else None
+                ),
+                axial_stride=(
+                    (0 if s == 0 else stage_stride)
+                    if use_axial
+                    else None
+                ),
+                period=stride if use_axial else None,
             )
+            self.geoms.append(geom)
+            if len(geom.ref_halo_np):
+                seen_halo.append(geom.ref_halo_np)
             if progress is not None:
                 progress(1)
         # prediction chain: stage 0 is always the base (anchors, possibly empty
@@ -1332,18 +1404,25 @@ class _ChunkGeoms:
         # stage geometries (O(interior)), so the dead rest of the shell is never
         # materialised. Its chunk-frame coords let the per-chunk halo pass test
         # usability without an O(shell) mask.
-        seen = []
-        for g in self.geoms:
-            if g is None:
-                continue
-            ip, in_, _, _, vp, vn = g.lines(0, g.M)
-            seen.append(ip[vp])
-            seen.append(in_[vn])
-        ref = (
-            torch.unique(torch.cat(seen)).cpu().numpy()
-            if seen
-            else np.zeros(0, np.int64)
-        )
+        if host_halo:
+            ref = (
+                np.unique(np.concatenate(seen_halo))
+                if seen_halo
+                else np.zeros(0, np.int64)
+            )
+        else:
+            seen = []
+            for g in self.geoms:
+                if g is None:
+                    continue
+                ip, in_, _, _, vp, vn = g.lines(0, g.M)
+                seen.append(ip[vp])
+                seen.append(in_[vn])
+            ref = (
+                torch.unique(torch.cat(seen)).cpu().numpy()
+                if seen
+                else np.zeros(0, np.int64)
+            )
         # "Not interior" is a box test on padded coords, not a set membership
         # test: interior_flat holds every cell of the chunk, so `isin` against it
         # sorts ~1M indices per shape and cost more than the rest of this
@@ -1401,8 +1480,8 @@ def build_chunk_geoms(
 ):
     """`_ChunkGeoms` for one chunk shape, memoised in the caller's ``cache``
     dict (``None`` builds a fresh one) under (chunk shape, schedule, agg_level,
-    device). The cache is the caller's so its device tensors die with the
-    caller: `ChunkedGNNPredictor` owns one, so they live for one compress.
+    device). The cache is the caller's: `ChunkedGNNPredictor` owns one and the
+    codec may retain that predictor to reuse geometry across calls.
     Interior chunks all share one entry; ragged edge chunks add at most a few
     shape variants.
 
@@ -1505,6 +1584,7 @@ class _CompactFrame:
         "n_compact",
         "halo_rows",
         "h_gflat",
+        "h_offsets",
     )
 
     def __init__(self, cg, origin, shape, edges, grid, coded, torch, device):
@@ -1520,6 +1600,36 @@ class _CompactFrame:
         # contiguous slice — no remap needed to fill them.
         self.halo_rows = slice(self.n_interior + 1, self.n_compact)
         self.h_gflat = h_gflat
+        strides = np.cumprod((1,) + tuple(shape)[:0:-1])[::-1].astype(np.int64)
+        origin_base = int(np.asarray(origin, np.int64) @ strides)
+        self.h_offsets = torch.from_numpy(
+            np.ascontiguousarray(h_gflat.astype(np.int64) - origin_base)
+        ).to(device)
+
+
+def _storage_bytes(obj, seen=None):
+    """Array/tensor storage retained by a nested cache value.
+
+    Count host tensors and NumPy arrays as well as CUDA tensors. The former
+    device-only accounting made every CPU cache entry appear free and ignored
+    the host half of mixed geometry objects.
+    """
+    seen = set() if seen is None else seen
+    if obj is None or id(obj) in seen:
+        return 0
+    seen.add(id(obj))
+    if hasattr(obj, "element_size") and hasattr(obj, "nelement"):
+        return obj.element_size() * obj.nelement()
+    if isinstance(obj, np.ndarray):
+        return obj.nbytes
+    if isinstance(obj, dict):
+        return sum(_storage_bytes(v, seen) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(_storage_bytes(v, seen) for v in obj)
+    slots = getattr(type(obj), "__slots__", ())
+    total = sum(_storage_bytes(getattr(obj, name, None), seen) for name in slots)
+    attrs = getattr(obj, "__dict__", None)
+    return total + (_storage_bytes(attrs, seen) if attrs is not None else 0)
 
 
 def chunk_halo_info(cg, origin, shape, edges, grid, coded):
@@ -1615,9 +1725,15 @@ class ChunkedGNNPredictor:
         self.levels = int(levels)
         self.anchor_stride = int(anchor_stride)
         self.anchor_block = int(anchor_block)
-        # Chunk geometry (device tensors, GBs) is reused across this tensor's
-        # chunks and dropped with the predictor, not held for the process.
+        # Chunk geometry is reused across chunks and across begin() calls. The
+        # owning codec caches this predictor because rebuilding rank-4 geometry
+        # can cost more than the model pass itself.
         self._geom_cache: dict = {}
+        # Compact remaps repeat across encode/decode and across interior chunks
+        # with the same low-face topology. Keep a byte-bounded LRU: these device
+        # tensors are expensive to rebuild but can be large at rank 4.
+        self._frame_cache: OrderedDict = OrderedDict()
+        self._cache_signature = None
         # Neighbourhood aggregation level (see GNNPredictor / half_directions),
         # frozen into the checkpoint at training time.
         self.d, self.model, self.checkpoint_hash, self.agg_level = (
@@ -1638,8 +1754,12 @@ class ChunkedGNNPredictor:
         self.grid = tuple(-(-n // e) for n, e in zip(self.shape, self.edges))
         self.n_chunks = int(np.prod(self.grid))
         self.C = int(channels)
+        signature = (self.shape, self.edges)
+        if signature != self._cache_signature:
+            self._geom_cache.clear()
+            self._frame_cache.clear()
+            self._cache_signature = signature
         ndim = len(self.shape)
-        self._geom_cache.clear()
         self._check_field_budget(ndim, channels, geometry_progress)
         self.coded = np.zeros(self.n_chunks, bool)
         self._cg = None
@@ -1688,6 +1808,25 @@ class ChunkedGNNPredictor:
                 RuntimeWarning,
                 stacklevel=2,
             )
+
+    def geometry_cached(self, shape, chunk_edges) -> bool:
+        """Whether begin()'s representative chunk geometry is already resident."""
+        cshape = tuple(min(int(e), int(n)) for e, n in zip(chunk_edges, shape))
+        key = (
+            cshape,
+            self.levels,
+            self.anchor_stride,
+            self.anchor_block,
+            self.agg_level,
+            str(self.device),
+        )
+        return key in self._geom_cache
+
+    def clear_runtime_cache(self):
+        """Release tensor-shaped geometry while retaining the loaded model."""
+        self._geom_cache.clear()
+        self._frame_cache.clear()
+        self._cache_signature = None
 
     def chunk_slices(self, ci: int):
         """Extended-block partition: each chunk's block is grown by one cell on
@@ -1753,16 +1892,43 @@ class ChunkedGNNPredictor:
             self.agg_level,
             cache=self._geom_cache,
         )
-        frame = _CompactFrame(
-            cg,
-            origins[0],
+        frame_key = (
             self.shape,
             self.edges,
-            self.grid,
-            self.coded,
-            torch,
-            self.device,
+            cshape,
+            self.low_axes(chunk_ids[0]),
+            _M_TILE,
         )
+        cached = self._frame_cache.get(frame_key)
+        if cached is None:
+            frame = _CompactFrame(
+                cg,
+                origins[0],
+                self.shape,
+                self.edges,
+                self.grid,
+                self.coded,
+                torch,
+                self.device,
+            )
+            nbytes = _storage_bytes(frame)
+            budget = _FRAME_CACHE_MIB * 2**20
+            total = sum(nbytes for _, nbytes in self._frame_cache.values())
+            while self._frame_cache and total + nbytes > budget:
+                _, (_, dropped) = self._frame_cache.popitem(last=False)
+                total -= dropped
+            # The current wave holds ``frame.geoms`` independently. If one frame
+            # exceeds the entire cache budget, use it once without pinning it.
+            if nbytes <= budget:
+                self._frame_cache[frame_key] = (frame, nbytes)
+        else:
+            frame = cached[0]
+            self._frame_cache.move_to_end(frame_key)
+            # The compact remap is origin-independent, but halo reconstruction
+            # indices are global and shift with the current chunk.
+            _, frame.h_gflat = chunk_halo_info(
+                cg, origins[0], self.shape, self.edges, self.grid, self.coded
+            )
         E = torch.zeros(B, frame.n_compact, ndim, self.d, device=self.device)
         self._wave_fill_halo(E, frame, origins, recon)
         # per-chunk global flat indices per stage, for finalize reads from recon.
@@ -1789,19 +1955,20 @@ class ChunkedGNNPredictor:
         ndim = len(self.shape)
         if frame.halo_rows.stop <= frame.halo_rows.start:
             return
-        # band chunk-frame coords are shared across the wave (rep uses origins[0]);
-        # per chunk only the global positions shift.
-        rep_gc = np.stack(np.unravel_index(frame.h_gflat, self.shape), 1)
-        band = rep_gc - origins[0]  # (H, ndim)
+        # The cached compact frame already stores halo offsets from its chunk
+        # origin.  Only the global flat origin changes between chunks, so one
+        # batched gather replaces per-wave unravel/ravel work and many tiny H2D
+        # index transfers.
+        strides = np.cumprod((1,) + self.shape[:0:-1])[::-1].astype(np.int64)
+        origin_bases = origins @ strides
+        bases_t = torch.from_numpy(
+            np.ascontiguousarray(origin_bases[:, None])
+        ).to(self.device)
+        gflat = bases_t + frame.h_offsets[None, :]
         flat = recon.reshape(-1)  # C == 1, device
-        vals_all = []
-        for o in origins:
-            gc = band + o
-            gflat = np.ravel_multi_index([gc[:, k] for k in range(ndim)], self.shape)
-            gflat_t = torch.from_numpy(gflat).to(self.device)
-            vals_all.append(self._norm_t(flat[gflat_t])[None, :])  # (1, H)
-        with torch.no_grad(), self._amp():
-            emb = value_halo_embed(self.model, torch.cat(vals_all, 0), ndim)
+        vals_all = self._norm_t(flat[gflat])  # (B, H)
+        with torch.inference_mode(), self._amp():
+            emb = value_halo_embed(self.model, vals_all, ndim)
             E[:, frame.halo_rows] = emb.to(E.dtype)
 
     def predict_wave_stage(self, s: int, recon, eb: float):
@@ -1825,7 +1992,7 @@ class ChunkedGNNPredictor:
             if gp is None
             else self._norm_t(recon.reshape(-1)[self._wave_gidx[prev]])
         )  # (B, M)
-        with torch.no_grad(), self._amp():
+        with torch.inference_mode(), self._amp():
             (values, log_b), self._E, self._ctx = stage_forward(
                 self.model,
                 self._E,
@@ -1853,3 +2020,7 @@ class ChunkedGNNPredictor:
         # it coded and drop the dense field.
         self.coded[np.array(self._wave_ids)] = True
         self._E = self._ctx = self._cg = None
+        # Compact geometries and global stage indices are wave-specific.  A
+        # cached predictor must release them here before the next begin() builds
+        # the decoder's frame, otherwise both complete frames overlap in memory.
+        self._geoms = self._wave_gidx = self._wave_ids = None

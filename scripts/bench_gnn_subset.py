@@ -64,6 +64,22 @@ def centred_subset(arr: np.ndarray, edge: int, stride: int) -> np.ndarray:
     return np.ascontiguousarray(arr[sl])
 
 
+def parse_chunk_size(value: str) -> int | tuple[int, ...] | None:
+    """Parse a scalar edge or comma-separated per-axis chunk edges."""
+    if value == "auto":
+        return None
+    parts = value.split(",")
+    try:
+        edges = tuple(int(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "chunk size must be an integer or comma-separated integers"
+        ) from exc
+    if any(edge < 0 for edge in edges):
+        raise argparse.ArgumentTypeError("chunk sizes must be non-negative")
+    return edges[0] if len(edges) == 1 else edges
+
+
 class GpuSampler:
     """Poll GPU SM utilisation and used memory on a background thread.
 
@@ -291,13 +307,28 @@ def main(argv=None):
     )
     # Codec knobs (defaults = the realistic 4-D level-5 case).
     ap.add_argument("--levels", type=int, default=5)
-    ap.add_argument("--chunk-size", type=int, default=32)
+    ap.add_argument(
+        "--chunk-size",
+        type=parse_chunk_size,
+        default=32,
+        help="scalar edge, comma-separated per-axis edges, or auto (default: 32)",
+    )
     ap.add_argument("--radius", type=int, default=1 << 15)
     ap.add_argument("--zstd-level", type=int, default=9)
     ap.add_argument("--eb-ratio", type=float, default=None)
     ap.add_argument("--tune", default="fast", choices=("fast", "size"))
     ap.add_argument("--fp16", action="store_true")
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument(
+        "--no-gate",
+        action="store_true",
+        help="disable the adaptive interpolation gate (diagnostic)",
+    )
+    ap.add_argument(
+        "--gate-fine",
+        action="store_true",
+        help="reuse one adaptive gate descriptor across the finest level",
+    )
     ap.add_argument("--device", default=None)
     ap.add_argument(
         "--poll-interval",
@@ -310,7 +341,9 @@ def main(argv=None):
     )
     args = ap.parse_args(argv)
 
-    os.environ.setdefault("LATEC_PROGRESS", "0")
+    # The codec checks for a non-empty value, so "0" would accidentally enable
+    # tqdm and perturb short benchmark timings.
+    os.environ.pop("LATEC_PROGRESS", None)
 
     import torch
 
@@ -320,7 +353,7 @@ def main(argv=None):
 
     def sync():
         if is_cuda:
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(torch_device)
 
     raw = load_tensor(args.input)
     anchor_stride = 1 << args.levels
@@ -352,6 +385,8 @@ def main(argv=None):
         chunk_size=args.chunk_size,
         fp16=args.fp16,
         compile=args.compile,
+        gate=not args.no_gate,
+        gate_fine=args.gate_fine,
     )
 
     if is_cuda:
@@ -387,6 +422,8 @@ def main(argv=None):
     a = sub.astype(np.float64)
     r = rec.astype(np.float64)
     max_err = float(np.abs(a - r).max())
+    error_slack = 4 * np.finfo(np.float32).eps * max(float(np.abs(sub).max()), 1.0)
+    error_ok = max_err <= eb + error_slack
     mse = float(np.mean((a - r) ** 2))
     peak = max(float(sub.max()) - float(sub.min()), 1e-12)
     psnr = 10 * np.log10(peak**2 / mse) if mse > 0 else float("inf")
@@ -431,12 +468,13 @@ def main(argv=None):
         f"{'levels/stride':<{w}} {args.levels}/{anchor_stride}"
         f"   chunk {args.chunk_size} "
         f"tune {args.tune} fp16 {args.fp16} compile {args.compile}"
+        f" gate {not args.no_gate} gate_fine {args.gate_fine}"
     )
     print("-" * 60)
     print(f"{'PSNR':<{w}} {psnr:8.3f} dB")
     print(
         f"{'max error':<{w}} {max_err:.4g}  "
-        f"({'PASS' if max_err <= eb else 'FAIL'} vs eb {eb:g})"
+        f"({'PASS' if error_ok else 'FAIL'} vs eb {eb:g})"
     )
     print(f"{'bits/value':<{w}} {bpv:8.4f} bpv   ratio {ratio:.2f}x  ({nbytes} B)")
     print(f"{'compress':<{w}} {t_comp:8.3f} s   ({mvox_s:.2f} Mvox/s)")
@@ -463,7 +501,7 @@ def main(argv=None):
     else:
         print(f"{'GPU util':<{w}} (no NVML / nvidia-smi samples)")
 
-    if max_err > eb:
+    if not error_ok:
         raise SystemExit(1)
 
 

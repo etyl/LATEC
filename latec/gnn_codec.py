@@ -7,7 +7,8 @@ import json
 import os
 import struct
 import sys
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -603,6 +604,58 @@ def _axis_preds_t(torch, W, coords_t, stride, axes, cubic, end_mode, ends):
     }
 
 
+def _interp_axis_pair_t(torch, W, coords, axis, s, shape, end_mode, ends):
+    """Return cubic and linear predictions while sharing their neighbour reads."""
+
+    def at(off):
+        idx = list(coords)
+        idx[axis] = (coords[axis] + off).clamp(0, shape[axis] - 1)
+        return W[(slice(None), *idx)]
+
+    Lm1, Lp1 = at(-s), at(+s)
+    linear = 0.5 * (Lm1 + Lp1)
+    ca = coords[axis]
+    vm3, vp3 = ca - 3 * s >= 0, ca + 3 * s < shape[axis]
+    Lm3, Lp3 = at(-3 * s), at(+3 * s)
+    cubic = (-Lm3 + 9 * Lm1 + 9 * Lp1 - Lp3) / 16.0
+    one_far = linear
+    if end_mode & END_QUAD:
+        one_far = torch.where(
+            (vp3 & ~vm3).unsqueeze(0),
+            (3 * Lm1 + 6 * Lp1 - Lp3) / 8.0,
+            torch.where(
+                (vm3 & ~vp3).unsqueeze(0),
+                (-Lm3 + 6 * Lm1 + 3 * Lp1) / 8.0,
+                linear,
+            ),
+        )
+    cubic = torch.where((vm3 & vp3).unsqueeze(0), cubic, one_far)
+    if ends is None:
+        return cubic, linear
+    eidx, only_left, far_idx, far_valid = ends
+    side = only_left.unsqueeze(0)
+    near = torch.where(side, Lm1.index_select(1, eidx), Lp1.index_select(1, eidx))
+    if end_mode & END_EXTRAP:
+        far = W[(slice(None), *far_idx)]
+        near = torch.where(far_valid.unsqueeze(0), 1.5 * near - 0.5 * far, near)
+    return cubic.index_copy_(1, eidx, near), linear.index_copy_(1, eidx, near)
+
+
+def _axis_pred_pairs_t(torch, W, coords_t, stride, axes, end_mode, ends):
+    """Cubic and linear per-axis predictions with shared gathers."""
+    shape = tuple(W.shape[1:])
+    pairs = {
+        a: _interp_axis_pair_t(
+            torch, W, coords_t, a, stride, shape, end_mode, ends[a]
+        )
+        for a in axes
+    }
+    return (
+        {a: pair[0] for a, pair in pairs.items()},
+        {a: pair[1] for a, pair in pairs.items()},
+    )
+
+
 def _combine_axis_preds(torch, preds, coords_t, stride, axes, center):
     """Reduce per-axis predictions to one per point, following ``center``.
 
@@ -642,13 +695,32 @@ def _gate_interps(torch, recon_t, sls, interp_dev, s, center, end_mode):
     for all three. Same arithmetic per candidate, a third fewer gathers."""
     coords_t, st_i, ax_i, ends_i = interp_dev[s]
     W = recon_t[(slice(None), *sls)].double()
-    cub = _axis_preds_t(torch, W, coords_t, st_i, ax_i, True, end_mode, ends_i)
-    lin = _axis_preds_t(torch, W, coords_t, st_i, ax_i, False, end_mode, ends_i)
+    cub, lin = _axis_pred_pairs_t(
+        torch, W, coords_t, st_i, ax_i, end_mode, ends_i
+    )
     return (
         _combine_axis_preds(torch, cub, coords_t, st_i, ax_i, center),
         _combine_axis_preds(torch, lin, coords_t, st_i, ax_i, 1),
         _combine_axis_preds(torch, lin, coords_t, st_i, ax_i, 2),
     )
+
+
+def _stored_gate_interp(torch, recon_t, sls, interp_dev, s, center, end_mode, kind):
+    """Compute only the interpolation selected by a stored decoder gate.
+
+    The encoder must evaluate all three candidates to choose a gate.  Decode
+    already knows that choice from the header, so evaluating the two discarded
+    candidates wastes gathers and arithmetic.  This follows the corresponding
+    branch of :func:`_gate_interps` exactly.
+    """
+    coords_t, st_i, ax_i, ends_i = interp_dev[s]
+    W = recon_t[(slice(None), *sls)].double()
+    cubic = kind == 1
+    preds = _axis_preds_t(
+        torch, W, coords_t, st_i, ax_i, cubic, end_mode, ends_i
+    )
+    combine = center if cubic else kind - 1
+    return _combine_axis_preds(torch, preds, coords_t, st_i, ax_i, combine)
 
 
 def _laplace_bits_t(torch, absr, b, eb, radius):
@@ -663,13 +735,7 @@ def _laplace_bits_t(torch, absr, b, eb, radius):
     and is NOT worth it (<1% either way): this is launch-bound, not ALU-bound,
     so the win comes from batching the candidates, not from cheaper arithmetic.
     """
-    lo = eb / SCALE_LO_DIV
-    hi = eb * SCALE_HI_MULT
-    b = b.double().clamp(lo, hi)
-    level = torch.round(
-        (torch.log(b) - np.log(lo)) / (np.log(hi) - np.log(lo)) * 63.0
-    )
-    b = torch.exp(np.log(lo) + level * ((np.log(hi) - np.log(lo)) / 63.0))
+    b = _gate_quantized_scales(torch, b, eb)
     k = torch.round(absr.double().abs() / (2 * eb))
     p = torch.where(
         k == 0,
@@ -681,6 +747,8 @@ def _laplace_bits_t(torch, absr, b, eb, radius):
 
 
 _GATE_CONST_CACHE: dict = {}
+_SCALE_THRESHOLD_CACHE: dict = {}
+_GATE_SCALE_CACHE: dict = {}
 
 
 def _gate_consts(torch, dev):
@@ -703,6 +771,99 @@ def _gate_consts(torch, dev):
         )
         _GATE_CONST_CACHE[dev] = c
     return c
+
+
+def _scale_level_thresholds(eb: float) -> np.ndarray:
+    """Float32 boundaries exactly equivalent to :func:`scale_to_level`.
+
+    Positive float32 bit patterns are ordered like their unsigned integers.
+    Binary-search the first pattern assigned to each level by the authoritative
+    NumPy implementation; device bucketization against those patterns then
+    reproduces all 64 levels using comparisons only (no backend-dependent log).
+    """
+    key = ("host", float(eb))
+    hit = _SCALE_THRESHOLD_CACHE.get(key)
+    if hit is not None:
+        return hit
+    targets = np.arange(1, 64, dtype=np.uint8)
+    lo = np.zeros(63, dtype=np.uint32)
+    hi_bits = np.asarray(np.float32(eb * SCALE_HI_MULT)).view(np.uint32)
+    hi = np.full(63, hi_bits, dtype=np.uint32)
+    while np.any(lo < hi):
+        mid = lo + (hi - lo) // 2
+        values = mid.view(np.float32)
+        upper = scale_to_level(values, eb) >= targets
+        hi = np.where(upper, mid, hi).astype(np.uint32)
+        lo = np.where(upper, lo, mid + 1).astype(np.uint32)
+    out = np.ascontiguousarray(lo.view(np.float32))
+    _SCALE_THRESHOLD_CACHE[key] = out
+    return out
+
+
+def _scale_to_level_t(torch, scale, eb: float):
+    """Device scale quantization bit-identical to NumPy ``scale_to_level``."""
+    dev_key = (str(scale.device), float(eb))
+    thresholds = _SCALE_THRESHOLD_CACHE.get(dev_key)
+    if thresholds is None:
+        thresholds = torch.from_numpy(_scale_level_thresholds(eb)).to(scale.device)
+        _SCALE_THRESHOLD_CACHE[dev_key] = thresholds
+    return torch.bucketize(scale.float(), thresholds, right=True).to(torch.uint8)
+
+
+def _gate_quantized_scales(torch, scale, eb: float):
+    """Gate scale snapping equivalent to its former double log/round/exp path."""
+    key = (str(scale.device), float(eb))
+    cached = _GATE_SCALE_CACHE.get(key)
+    if cached is None:
+        _prepare_gate_scale_tables(torch, scale.device, [eb])
+        cached = _GATE_SCALE_CACHE[key]
+    thresholds, grid = cached
+    level = torch.bucketize(scale.float(), thresholds, right=True)
+    return grid[level]
+
+
+def _gate_scale_thresholds(eb: float) -> tuple[np.ndarray, float, float]:
+    """Host boundaries for the gate's double log/round scale assignment."""
+    lo_f = float(eb) / SCALE_LO_DIV
+    hi_f = float(eb) * SCALE_HI_MULT
+    log_lo = np.log(lo_f)
+    log_step = (np.log(hi_f) - log_lo) / 63.0
+    targets = np.arange(1, 64)
+    lo_bits = np.zeros(63, dtype=np.uint32)
+    hi_bit = np.asarray(np.float32(hi_f)).view(np.uint32)
+    hi_bits = np.full(63, hi_bit, dtype=np.uint32)
+    while np.any(lo_bits < hi_bits):
+        mid = lo_bits + (hi_bits - lo_bits) // 2
+        values = mid.view(np.float32).astype(np.float64)
+        level = np.rint(
+            (np.log(np.clip(values, lo_f, hi_f)) - log_lo) / log_step
+        )
+        upper = level >= targets
+        hi_bits = np.where(upper, mid, hi_bits).astype(np.uint32)
+        lo_bits = np.where(upper, lo_bits, mid + 1).astype(np.uint32)
+    return np.ascontiguousarray(lo_bits.view(np.float32)), log_lo, log_step
+
+
+def _prepare_gate_scale_tables(torch, device, ebs) -> None:
+    """Batch all missing gate threshold/grid tables into one device upload."""
+    missing = []
+    seen = set()
+    for eb in ebs:
+        eb = float(eb)
+        key = (str(device), eb)
+        if key not in _GATE_SCALE_CACHE and eb not in seen:
+            missing.append(eb)
+            seen.add(eb)
+    if not missing:
+        return
+    host = [_gate_scale_thresholds(eb) for eb in missing]
+    thresholds = torch.from_numpy(np.stack([x[0] for x in host])).to(device)
+    log_lo = torch.tensor([x[1] for x in host], dtype=torch.float64, device=device)
+    log_step = torch.tensor([x[2] for x in host], dtype=torch.float64, device=device)
+    levels = torch.arange(64, dtype=torch.float64, device=device)
+    grids = torch.exp(log_lo[:, None] + log_step[:, None] * levels)
+    for i, eb in enumerate(missing):
+        _GATE_SCALE_CACHE[(str(device), eb)] = (thresholds[i], grids[i])
 
 
 def _gate_select_t(torch, r_g, r_is, b, eb, radius=1 << 15):
@@ -765,6 +926,14 @@ def _gate_apply_t(torch, pred_bi, scale_bi, ip, eb, gate_t, gate_sh, gate_dir):
     host-sync branch. ``gate_dir`` picks the side of the eb*2^T threshold on which
     the fallback fires (0 = low, b < thr; 1 = high, b >= thr). (pred, coded scale).
     """
+    if isinstance(gate_t, int):
+        if gate_t <= 0:
+            return pred_bi.unsqueeze(0).to(torch.float32), scale_bi.to(torch.float32)
+        below = scale_bi < eb * (2.0**gate_t)
+        m = ~below if gate_dir > 0 else below
+        p = torch.where(m.unsqueeze(0), ip, pred_bi.unsqueeze(0))
+        sc = torch.where(m, scale_bi * (2.0 ** -gate_sh), scale_bi)
+        return p.to(torch.float32), sc.to(torch.float32)
     active = gate_t > 0
     below = scale_bi < eb * torch.exp2(gate_t.double())
     m = active & torch.where(gate_dir > 0, ~below, below)
@@ -793,22 +962,25 @@ def _quantize_t(torch, x, pred, eb, radius, round_output):
     in_range = q.abs() < radius
     z = torch.zeros_like(q)
     codes = torch.where(in_range, q + radius, z)
-    recon = (pred.double() + w * (codes - radius).double()).to(torch.float32)
+    recon_candidate = (
+        pred.double() + w * (codes - radius).double()
+    ).to(torch.float32)
     if round_output is True:
-        recon_chk = torch.round(recon)
+        recon_chk = torch.round(recon_candidate)
     elif round_output:
         span, offset = round_output
         recon_chk = (
-            (torch.round(recon.double() * span + offset) - offset) / span
+            (torch.round(recon_candidate.double() * span + offset) - offset) / span
         ).to(torch.float32)
     else:
-        recon_chk = recon
+        recon_chk = recon_candidate
     ok = in_range & ((x - recon_chk).abs() <= float(np.float32(eb)))
     codes = torch.where(ok, codes, z)
     is_out = codes == 0
-    # reconstruct from the final codes (== dequantize), outliers exact
-    recon = (pred.double() + w * (codes - radius).double()).to(torch.float32)
-    recon = torch.where(is_out, x, recon)
+    # A surviving regular code is unchanged from the one used to construct
+    # recon_candidate; a rejected/out-of-range code reconstructs as its exact
+    # outlier value. Avoid repeating the full float64 dequantization here.
+    recon = torch.where(is_out, x, recon_candidate)
     return codes, recon, x[is_out]
 
 
@@ -859,13 +1031,34 @@ def _compress_chunked(
         f"coding anchors..."
     )
     anchor_bar = _progress_bar("encode anchors", 1, unit="stage")
-    parts = [_code_anchor_stage(values, recon, axes, ebs[0], radius, round_output)]
-    anchor_bar.update(1)
-    anchor_bar.close()
     geom_bar = _progress_bar(
         "encode geometry", _geometry_stages(len(shape), predictor.levels), unit="stage"
     )
-    predictor.begin(shape, edges, channels=c, geometry_progress=geom_bar.update)
+    if predictor.geometry_cached(shape, edges):
+        parts = [
+            _code_anchor_stage(values, recon, axes, ebs[0], radius, round_output)
+        ]
+        anchor_bar.update(1)
+        anchor_bar.close()
+        predictor.begin(shape, edges, channels=c, geometry_progress=geom_bar.update)
+    else:
+        # Anchor entropy coding and schedule construction are independent. The
+        # cold rank-4 path spends substantial time in both, mostly inside NumPy,
+        # constriction and device copies that release the GIL, so overlap them.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            geometry = pool.submit(
+                predictor.begin,
+                shape,
+                edges,
+                channels=c,
+                geometry_progress=geom_bar.update,
+            )
+            parts = [
+                _code_anchor_stage(values, recon, axes, ebs[0], radius, round_output)
+            ]
+            anchor_bar.update(1)
+            anchor_bar.close()
+            geometry.result()
     geom_bar.close()
     # hand recon to the GPU for the wave loop; it never returns to host on encode
     recon_t = torch.from_numpy(recon).to(dev)
@@ -877,6 +1070,8 @@ def _compress_chunked(
         f"{predictor.n_chunks} model passes"
     )
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
+    if gate:
+        _prepare_gate_scale_tables(torch, dev, ebs)
     index_cache: OrderedDict = OrderedDict()  # bounded; see _cached_chunk_plan
     full_strides = np.cumprod((1,) + shape[:0:-1])[::-1].astype(np.int64)
     gates_t: list = [] if gate else None  # per stage-chunk gate byte, device scalars
@@ -886,6 +1081,35 @@ def _compress_chunked(
     fine_gates_t: list = [] if (gate and gate_fine) else None  # one word per chunk
     is_finest = [st == 1 for st in stage_strides(len(shape), predictor.levels, stride)]
     bar = _progress_bar("encode", predictor.n_chunks)
+    pack_pool = (
+        ThreadPoolExecutor(max_workers=1) if predictor.n_chunks > 1 else None
+    )
+    pack_futures = deque()
+
+    def pack_wave(items):
+        packed = []
+        for item in items:
+            if len(item) == 2:  # empty stage
+                packed.append(
+                    pack_stage(
+                        np.zeros(0, np.uint32),
+                        np.zeros(0, np.float32),
+                        rans_levels=np.zeros(0, np.uint8),
+                        rans_tables=item[1],
+                    )
+                )
+                continue
+            codes_c, out_c, levels_c, tables = item
+            packed.append(
+                pack_stage(
+                    codes_c.numpy().astype(np.uint32),
+                    out_c.numpy().astype(np.float32),
+                    rans_levels=levels_c.numpy().reshape(-1),
+                    rans_tables=tables,
+                )
+            )
+        return packed
+
     for group in waves:
         for ci in group:
             ids = [ci]
@@ -1006,13 +1230,13 @@ def _compress_chunked(
                     )
                     gpos = recon_off_dev[s] + origin_bases[bi]
                     recon_flat.index_copy_(1, gpos, recon_stage.reshape(c, -1))
+                    levels = _scale_to_level_t(torch, sc, ebs[s])
                     wave_pending.append(
                         (
                             codes.to("cpu", non_blocking=True),
                             outliers.to("cpu", non_blocking=True),
-                            sc.to("cpu", non_blocking=True),
+                            levels.to("cpu", non_blocking=True),
                             tables,
-                            ebs[s],
                         )
                     )
             predictor.finish_wave(recon_t)
@@ -1020,31 +1244,22 @@ def _compress_chunked(
             # once, then pack in stream order (host-only, off the recon path).
             if dev.type == "cuda":
                 torch.cuda.synchronize(dev)
-            for item in wave_pending:
-                if len(item) == 2:  # empty stage
-                    parts.append(
-                        pack_stage(
-                            np.zeros(0, np.uint32),
-                            np.zeros(0, np.float32),
-                            rans_levels=np.zeros(0, np.uint8),
-                            rans_tables=item[1],
-                        )
-                    )
-                    continue
-                codes_c, out_c, sc_c, tables, eb_s = item
-                levels = scale_to_level(sc_c.numpy()[None, :], eb_s).reshape(-1)
-                parts.append(
-                    pack_stage(
-                        codes_c.numpy().astype(np.uint32),
-                        out_c.numpy().astype(np.float32),
-                        rans_levels=levels,
-                        rans_tables=tables,
-                    )
-                )
+            if pack_pool is None:
+                parts.extend(pack_wave(wave_pending))
+            else:
+                pack_futures.append(pack_pool.submit(pack_wave, wave_pending))
+                # Keep at most one CPU wave behind the GPU. This bounds the host
+                # buffers while letting wave N entropy-code during wave N+1.
+                if len(pack_futures) >= 2:
+                    parts.extend(pack_futures.popleft().result())
             peak = _cuda_peak(predictor)
             if peak:
                 bar.set_postfix_str(f"peak {peak / 1e9:.2f}GB")
             bar.update(1)
+    while pack_futures:
+        parts.extend(pack_futures.popleft().result())
+    if pack_pool is not None:
+        pack_pool.shutdown()
     bar.close()
     gates = None
     if gate:
@@ -1138,48 +1353,33 @@ def _chunk_device_plan(
 #
 # The budget is in *bytes*, not entries, because a plan is chunk-sized: a fixed
 # entry count would be far too much memory for large chunks and needless eviction
-# for small ones (at 64^4 there are only 16 chunks, so any cap below 16 pays
-# rebuilds for reuse it was going to get anyway). Raster order varies the last axis
-# fastest, so the live working set is the 3 ** 2 = 9 combinations of the two
-# fastest axes, and a budget that holds ~17 of the 58.5 MiB rank-4 plans keeps
-# essentially all the reuse while bounding the cache an order of magnitude below
-# the unbounded 81.
-_PLAN_CACHE_MIB = float(os.environ.get("LATEC_PLAN_CACHE_MIB", 1024))
-
-
-def _plan_device_bytes(obj, seen=None):
-    """Device bytes held by one cached plan (tensors nested in its lists/dicts)."""
-    seen = set() if seen is None else seen
-    if id(obj) in seen:
-        return 0
-    seen.add(id(obj))
-    if hasattr(obj, "element_size") and hasattr(obj, "nelement"):
-        return obj.element_size() * obj.nelement() if obj.is_cuda else 0
-    if isinstance(obj, dict):
-        return sum(_plan_device_bytes(v, seen) for v in obj.values())
-    if isinstance(obj, (list, tuple)):
-        return sum(_plan_device_bytes(v, seen) for v in obj)
-    return 0
+# for small ones. Raster order varies the last axis fastest, so even a modest
+# budget retains the immediately reusable shapes. Large one-off plans are not
+# cached: keeping one alive while constructing its successor raises the peak
+# without buying a cache hit.
+_PLAN_CACHE_MIB = float(os.environ.get("LATEC_PLAN_CACHE_MIB", 256))
 
 
 def _cached_chunk_plan(cache, torch, dev, cshape, shape, levels, stride, block, low_ax):
     """``_chunk_device_plan`` behind a byte-budgeted LRU, shared by encode/decode.
 
     Eviction is safe against the in-flight plan: the entry just used is moved to
-    the most-recent end before anything is dropped, so the victim is never the one
-    the caller is about to read. One entry is always kept, whatever the budget."""
+    the most-recent end before anything is dropped. Oversized plans are returned
+    to the caller but not retained after the current wave."""
     key = (cshape, low_ax)
     hit = cache.get(key)
     if hit is not None:
         cache.move_to_end(key)
         return hit[0]
     plan = _chunk_device_plan(torch, dev, cshape, shape, levels, stride, block, low_ax)
-    cache[key] = (plan, _plan_device_bytes(plan))
+    nbytes = _gp._storage_bytes(plan)
     budget = _PLAN_CACHE_MIB * 2**20
     total = sum(nbytes for _, nbytes in cache.values())
-    while len(cache) > 1 and total > budget:
+    while cache and total + nbytes > budget:
         _, (_, dropped) = cache.popitem(last=False)
         total -= dropped
+    if nbytes <= budget:
+        cache[key] = (plan, nbytes)
     return plan
 
 
@@ -1199,26 +1399,32 @@ def _decompress_chunked(
     axes = _anchor_axes(shape, stride, block)
     _log(f"decode: shape={shape} edges={edges} decoding anchors...")
     anchor_bar = _progress_bar("decode anchors", 1, unit="stage")
-    off = _decode_anchor_stage(payload, 0, recon, axes, ebs[0], radius)
-    anchor_bar.update(1)
-    anchor_bar.close()
     geom_bar = _progress_bar(
         "decode geometry", _geometry_stages(len(shape), predictor.levels), unit="stage"
     )
-    predictor.begin(shape, edges, channels=c, geometry_progress=geom_bar.update)
+    if predictor.geometry_cached(shape, edges):
+        off = _decode_anchor_stage(payload, 0, recon, axes, ebs[0], radius)
+        anchor_bar.update(1)
+        anchor_bar.close()
+        predictor.begin(shape, edges, channels=c, geometry_progress=geom_bar.update)
+    else:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            geometry = pool.submit(
+                predictor.begin,
+                shape,
+                edges,
+                channels=c,
+                geometry_progress=geom_bar.update,
+            )
+            off = _decode_anchor_stage(payload, 0, recon, axes, ebs[0], radius)
+            anchor_bar.update(1)
+            anchor_bar.close()
+            geometry.result()
     geom_bar.close()
     torch = predictor._torch
     dev = predictor.device
     recon_t = torch.from_numpy(recon).to(dev)  # device-resident, same as encode
     del recon  # host copy is dead once uploaded; keeping it costs a full field
-    gates_t = (
-        None if gates is None else torch.tensor(gates, dtype=torch.int64, device=dev)
-    )
-    fine_gates_t = (
-        None
-        if fine_gates is None
-        else torch.tensor(fine_gates, dtype=torch.int64, device=dev)
-    )
     waves = [list(range(predictor.n_chunks))]  # raster order, mirrors encode
     _log(f"decode: anchors done, {predictor.n_chunks} chunks/model passes")
     stage_tables = [build_laplace_tables(e, radius) for e in ebs]
@@ -1283,14 +1489,11 @@ def _decompress_chunked(
                     sls = predictor.chunk_slices(ids[bi])
                     p = pred[bi][None, :]
                     sc = scale[bi]
-                    if fine_gates_t is not None and is_finest[s]:
+                    if fine_gates is not None and is_finest[s]:
                         # Adaptive finest gate: read one descriptor per chunk at
                         # its first finest sub-stage, then reuse it.
-                        ip_cubic, ip_linear, ip_linear_last = _gate_interps(
-                            torch, recon_t, sls, interp_dev, s, center, end_mode
-                        )
                         if fine_desc is None:
-                            g = fine_gates_t[fgi]
+                            g = int(fine_gates[fgi])
                             fgi += 1
                             fine_desc = (
                                 (g >> 8) & 3,
@@ -1299,37 +1502,47 @@ def _decompress_chunked(
                                 (g >> _GATE_DIR_SHIFT) & 1,
                             )
                         gk, gt, gs, gd = fine_desc
-                        ip = torch.where(
-                            gk == 2,
-                            ip_linear,
-                            torch.where(gk == 3, ip_linear_last, ip_cubic),
-                        )
-                        p, sc = _gate_apply_t(torch, pred[bi], sc, ip, ebs[s], gt, gs, gd)
-                    elif gates_t is not None:
-                        g = gates_t[gi]
+                        if gt > 0:
+                            ip = _stored_gate_interp(
+                                torch,
+                                recon_t,
+                                sls,
+                                interp_dev,
+                                s,
+                                center,
+                                end_mode,
+                                gk,
+                            )
+                            p, sc = _gate_apply_t(
+                                torch, pred[bi], sc, ip, ebs[s], gt, gs, gd
+                            )
+                    elif gates is not None:
+                        g = int(gates[gi])
                         gi += 1
-                        ip_cubic, ip_linear, ip_linear_last = _gate_interps(
-                            torch, recon_t, sls, interp_dev, s, center, end_mode
-                        )
                         gk = (g >> 8) & 3
-                        ip = torch.where(
-                            gk == 2,
-                            ip_linear,
-                            torch.where(gk == 3, ip_linear_last, ip_cubic),
-                        )
-                        p, sc = _gate_apply_t(
-                            torch,
-                            pred[bi],
-                            sc,
-                            ip,
-                            ebs[s],
-                            (g >> 4) & 15,
-                            g & 15,
-                            (g >> _GATE_DIR_SHIFT) & 1,
-                        )
-                    levels64 = scale_to_level(
-                        sc.cpu().numpy()[None, :], ebs[s]
-                    ).reshape(-1)
+                        gt = (g >> 4) & 15
+                        if gt > 0:
+                            ip = _stored_gate_interp(
+                                torch,
+                                recon_t,
+                                sls,
+                                interp_dev,
+                                s,
+                                center,
+                                end_mode,
+                                gk,
+                            )
+                            p, sc = _gate_apply_t(
+                                torch,
+                                pred[bi],
+                                sc,
+                                ip,
+                                ebs[s],
+                                gt,
+                                g & 15,
+                                (g >> _GATE_DIR_SHIFT) & 1,
+                            )
+                    levels64 = _scale_to_level_t(torch, sc, ebs[s]).cpu().numpy()
                     codes, outliers, off = unpack_stage(
                         payload, off, rans_levels=levels64, rans_tables=tables
                     )
@@ -1353,7 +1566,9 @@ def _decompress_chunked(
         raise ValueError("trailing bytes in LATEC GNN payload")
     if gates is not None and gi != len(gates):
         raise ValueError("gate list length does not match the stream")
-    return recon_t[0].cpu().numpy()
+    out = recon_t[0].cpu().numpy()
+    predictor.clear_runtime_cache()
+    return out
 
 
 class GNNCompressorCodec:
@@ -1388,6 +1603,12 @@ class GNNCompressorCodec:
         self.device = device
         self.strict_checkpoint = bool(strict_checkpoint)
         self.checkpoint_hash = self._checkpoint_hash()
+        # Keep the loaded model and base geometry across an encode/decode pair,
+        # then release tensor-shaped runtime geometry after decode. Compact
+        # frames are not retained by default because they dwarf the base data.
+        self._chunked_predictors: OrderedDict[
+            tuple[int, bool, bool], ChunkedGNNPredictor
+        ] = OrderedDict()
 
     @staticmethod
     def _chunk_edges(
@@ -1745,8 +1966,9 @@ class GNNCompressorCodec:
         gate: bool,
         gate_fine: bool,
     ) -> tuple[bytes, list[int] | None, list[int] | None]:
-        predictor = self._chunked_predictor(levels, fp16=fp16)
-        predictor.compile = bool(use_compile)
+        predictor = self._chunked_predictor(
+            levels, fp16=fp16, compile=bool(use_compile)
+        )
         ebs = _chunk_stage_ebs(
             values.shape,
             levels,
@@ -1773,23 +1995,35 @@ class GNNCompressorCodec:
         meta: dict[str, Any] | None = None,
         *,
         fp16: bool = True,
+        compile: bool = False,
     ) -> ChunkedGNNPredictor:
         # vmin/vmax are always 0.0/1.0: compress() normalizes the tensor to
         # [0, 1] up front, so the predictor never sees raw-scale values.
         anchor_stride = 1 << levels
-        predictor = ChunkedGNNPredictor(
-            self.checkpoint_path,
-            0.0,
-            1.0,
-            device=self.device,
-            levels=levels,
-            anchor_stride=anchor_stride,
-            anchor_block=_ANCHOR_BLOCK,
-        )
-        # encode: from the compress() flag; decode: replay the stream's float path
-        predictor.fp16 = fp16 if meta is None else bool(meta["fp16"])
-        # encode overrides this right after (use_compile); decode replays the stream
-        predictor.compile = False if meta is None else bool(meta["compiled"])
+        use_fp16 = bool(fp16 if meta is None else meta["fp16"])
+        use_compile = bool(compile if meta is None else meta["compiled"])
+        key = (int(levels), use_fp16, use_compile)
+        predictor = self._chunked_predictors.get(key)
+        if predictor is None:
+            predictor = ChunkedGNNPredictor(
+                self.checkpoint_path,
+                0.0,
+                1.0,
+                device=self.device,
+                levels=levels,
+                anchor_stride=anchor_stride,
+                anchor_block=_ANCHOR_BLOCK,
+            )
+            predictor.fp16 = use_fp16
+            predictor.compile = use_compile
+            self._chunked_predictors[key] = predictor
+            # Runtime geometry dwarfs the model weights. A different schedule or
+            # precision mode is unlikely to be reused before the current one, so
+            # do not let several complete geometry caches accumulate on a codec.
+            while len(self._chunked_predictors) > 1:
+                self._chunked_predictors.popitem(last=False)
+        else:
+            self._chunked_predictors.move_to_end(key)
         return predictor
 
     def _predictor(

@@ -1,4 +1,20 @@
-from scripts.bench_gnn_subset import GpuSampler, HostMemorySampler
+import argparse
+
+import pytest
+
+from scripts.bench_gnn_subset import GpuSampler, HostMemorySampler, parse_chunk_size
+
+
+def test_parse_chunk_size_accepts_scalar_and_per_axis_edges():
+    assert parse_chunk_size("auto") is None
+    assert parse_chunk_size("32") == 32
+    assert parse_chunk_size("64,32,32,32") == (64, 32, 32, 32)
+
+
+@pytest.mark.parametrize("value", ["-1", "32,bad"])
+def test_parse_chunk_size_rejects_invalid_edges(value):
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_chunk_size(value)
 
 
 def test_host_memory_sampler_reports_scoped_peak_and_increase(monkeypatch):

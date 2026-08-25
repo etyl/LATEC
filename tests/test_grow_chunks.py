@@ -89,3 +89,14 @@ def test_chunked_schedule_needs_no_coarse_table(tiny_checkpoint):
     predictor = codec._chunked_predictor(2)
     predictor.begin(field.shape, (8, 8))
     assert not hasattr(predictor, "coarse")
+
+
+def test_codec_reuses_chunked_predictor_for_same_float_path(tiny_checkpoint):
+    codec = _codec(tiny_checkpoint, gate=False)
+
+    first = codec._chunked_predictor(2, fp16=False, compile=False)
+    again = codec._chunked_predictor(2, fp16=False, compile=False)
+    different_precision = codec._chunked_predictor(2, fp16=True, compile=False)
+
+    assert again is first
+    assert different_precision is not first
