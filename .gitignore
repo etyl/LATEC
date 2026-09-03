@@ -16,3 +16,4 @@ outputs/
 TODO.md
 *.png
 paper/
+*.egg-info/

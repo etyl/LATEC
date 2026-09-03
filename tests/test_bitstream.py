@@ -1,3 +1,5 @@
+import struct
+
 import numpy as np
 import pytest
 
@@ -71,3 +73,61 @@ def test_stage_roundtrip():
     assert np.array_equal(o2, outliers)
     c3, o3, off = unpack_stage(buf, off)
     assert len(c3) == 0 and len(o3) == 0 and off == len(buf)
+
+
+def test_stage_roundtrip_with_heavy_outliers():
+    """A stage whose codes are mostly outlier markers still frames and decodes
+    (and the fitted marker weight keeps it from blowing up)."""
+    rng = np.random.RandomState(3)
+    codes = rng.randint(1, 40, 5000).astype(np.uint32) + (1 << 15)
+    codes[rng.rand(len(codes)) < 0.4] = 0
+    outliers = rng.randn(int((codes == 0).sum())).astype(np.float32)
+    buf = pack_stage(codes, outliers)
+    got, out, off = unpack_stage(buf, 0)
+    assert np.array_equal(got, codes)
+    assert np.array_equal(out, outliers)
+    assert off == len(buf)
+
+
+def test_stage_frame_fields_are_range_checked():
+    from latec.bitstream import _HLEN_BITS, _pack_hlen
+
+    _pack_hlen(7, 15, 20, 63, 7)  # every field at its maximum
+    for bad in (
+        dict(hlen=1 << _HLEN_BITS),
+        dict(kexp=16),
+        dict(shape=32),
+        dict(level=64),
+        dict(owx=8),
+    ):
+        kw = dict(hlen=7, kexp=15, shape=20, level=63, owx=7)
+        kw.update(bad)
+        with pytest.raises(ValueError):
+            _pack_hlen(**kw)
+
+
+def test_correlated_stage_takes_the_literal_back_end():
+    """Codes with strong serial correlation must not be left to the memoryless
+    coder: a run-structured stage is where the deflated-literal back end pays,
+    and the frame has to carry the choice back."""
+    from latec.bitstream import _LIT_SHIFT, _pack_hlen
+
+    rng = np.random.RandomState(4)
+    runs = rng.randint(1, 400, 4000)
+    codes = np.repeat(
+        (rng.randint(-2, 3, len(runs)) + (1 << 15)).astype(np.uint32), runs
+    )
+    buf = pack_stage(codes, np.zeros(0, np.float32))
+    (framed,) = struct.unpack_from("<Q", buf, 4)
+    assert framed >> _LIT_SHIFT & 1  # literal chosen
+    got, out, off = unpack_stage(buf, 0)
+    assert np.array_equal(got, codes)
+    assert off == len(buf)
+
+    # and an independent stage keeps the rANS coder
+    iid = (rng.randint(-2, 3, len(codes)) + (1 << 15)).astype(np.uint32)
+    buf = pack_stage(iid, np.zeros(0, np.float32))
+    (framed,) = struct.unpack_from("<Q", buf, 4)
+    assert not (framed >> _LIT_SHIFT & 1)
+    assert np.array_equal(unpack_stage(buf, 0)[0], iid)
+    assert _pack_hlen(7, 15, 20, 63, 7, True) >> _LIT_SHIFT & 1

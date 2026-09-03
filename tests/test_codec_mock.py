@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from latec.codec import compress, decompress
+from latec.codec import _gather_stage, _scatter_stage, compress, decompress
 from tests.helpers import NearestPredictor
 
 
@@ -79,3 +79,23 @@ def test_unidentified_predictor_stream_requires_factory():
     stream, _ = compress(img, 2.0, NearestPredictor())
     with pytest.raises(ValueError, match="predictor_factory"):
         decompress(stream)
+
+
+@pytest.mark.parametrize("shape", [(16, 12), (7, 5, 9), (5, 4, 6, 3)])
+def test_stage_gather_scatter_match_boolean_indexing(shape):
+    """The codec walks a stage by flat index rather than with the boolean mask
+    (NumPy expands an n-D boolean index into one int64 array per axis, which at
+    rank 5 was the codec's host peak). Both directions must be identical."""
+    rng = np.random.RandomState(0)
+    pos = rng.rand(*shape) < 0.4
+    field = rng.rand(2, *shape).astype(np.float32)
+    n = int(pos.sum())
+
+    values = _gather_stage(field, pos, n)
+    np.testing.assert_array_equal(values, field[:, pos])
+
+    recon = np.zeros_like(field)
+    _scatter_stage(recon, pos, values)
+    expected = np.zeros_like(field)
+    expected[:, pos] = values
+    np.testing.assert_array_equal(recon, expected)

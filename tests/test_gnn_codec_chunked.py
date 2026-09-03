@@ -7,7 +7,6 @@ coded). The error bound holds regardless of predictor quality — it is the
 quantizer's guarantee — so a tiny random checkpoint suffices.
 """
 
-from collections import OrderedDict
 from functools import partial
 
 import numpy as np
@@ -17,25 +16,29 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("constriction")  # rANS backend; skip if unavailable
 
 from latec import GNNCompressorCodec
-import latec.gnn_codec as gc
 import latec.gnn_predictor as gp
 from latec.gnn_codec import (
     _GATE_END_MODE,
-    _chunk_device_plan,
+    _ChunkGeom,
     _auto_chunk_edges,
-    _end_plan,
     _gate_interps,
     _gate_quantized_scales,
     _gate_scale_thresholds,
-    _interp_axis_at_t,
-    _interp_axis_pair_t,
     _quantize_t,
+    _split_rows,
+    _stage_values,
+    _write_stage,
     _scale_level_thresholds,
     _scale_to_level_t,
     _stored_gate_interp,
     roundtrip_slack,
 )
-from latec.predictor import END_EXTRAP, END_MODE_MAX, END_QUAD, _interp_axis_at
+from latec.predictor import (
+    END_EXTRAP,
+    END_QUAD,
+    _flat_gatherer,
+    _interp_axis_at,
+)
 from latec.gnn_predictor import (
     CKPT_VERSION,
     ChunkedGNNPredictor,
@@ -441,94 +444,144 @@ def test_auto_chunk_selection(current_ckpt):
         bad.compress(np.zeros((8, 8), np.float32))
 
 
-def test_chunk_device_plan_uses_flat_integer_indices():
-    """Stage indices select the same points as the schedule masks, both within
-    a contiguous chunk block and within the flattened full reconstruction."""
-    cshape = (4, 3)
-    full_shape = (8, 7)
-    _full, counts, positions, recon_offsets, _, _, _, _ = _chunk_device_plan(
-        torch, "cpu", cshape, full_shape, LEVELS, STRIDE, 1
-    )
+@pytest.mark.parametrize("cshape", [(4, 3), (1, 3), (3, 5, 2), (2, 1, 3, 5)])
+def test_stage_layout_addresses_the_schedule_by_stride_alone(cshape):
+    """The strided class layouts must select the same points, in the same order,
+    as the schedule masks — in the chunk grid, in the compact stage array, and
+    (with ``low_axes``) after the grow-mode column split. Everything the inner
+    loop does is one of those three, so this is what stands in for the per-point
+    plan the codec used to build.
+
+    The shapes are deliberately cropped: a tensor is not a multiple of the chunk
+    edge in general, so the trailing chunk on every axis is a remainder, and a
+    remainder is not a multiple of the anchor stride (it can be shorter than the
+    stride, or 1). The class counts come from ``_slice_count`` per axis, so this
+    is exact for any extent — these shapes are what proves it."""
+    origin = cshape
+    full_shape = tuple(o + n for o, n in zip(origin, cshape))
+    sls = tuple(slice(o, o + n) for o, n in zip(origin, cshape))
     plan = stage_plan(cshape, LEVELS, STRIDE, 1)
-    origin = (4, 3)
-    origin_base = np.ravel_multi_index(origin, full_shape)
 
-    for count, pos, recon_off, (mask, _, _) in zip(
-        counts, positions, recon_offsets, plan
-    ):
-        expected_pos = np.flatnonzero(mask)
-        np.testing.assert_array_equal(pos.numpy(), expected_pos)
-        assert pos.dtype == torch.int64
-        assert count == expected_pos.size
+    for low in [(), (0,), (0, 1)]:
+        geom = _ChunkGeom(cshape, sls, LEVELS, STRIDE, low)
+        vals = torch.arange(np.prod(cshape), dtype=torch.float32).reshape(1, *cshape)
+        recon = torch.zeros((1, *full_shape))
+        expected_recon = np.zeros((1, *full_shape), np.float32)
 
-        coords = np.unravel_index(expected_pos, cshape)
-        expected_global = np.ravel_multi_index(
-            tuple(c + o for c, o in zip(coords, origin)), full_shape
-        )
-        np.testing.assert_array_equal(recon_off.numpy() + origin_base, expected_global)
+        for i, (mask, _, _) in enumerate(plan):
+            pos = np.flatnonzero(mask)
+            coords = np.unravel_index(pos, cshape)
+            keep = np.ones(pos.shape, bool)
+            for a in low:  # the inherited low face the up/left neighbour coded
+                keep &= coords[a] != 0
+            assert geom.full_counts[i] == pos.size
+            assert geom.counts[i] == int(keep.sum())
+            if i == 0:
+                continue
+            # compact stage array <- chunk grid, in flatnonzero order
+            got = _stage_values(torch, vals, geom, i)
+            np.testing.assert_array_equal(got.numpy()[0], pos[keep].astype(np.float32))
+            # the column split is a narrow of the full stage, not a gather
+            full_rows = torch.arange(pos.size, dtype=torch.float32)[None]
+            np.testing.assert_array_equal(
+                _split_rows(torch, geom, i, full_rows).numpy()[0],
+                np.flatnonzero(keep).astype(np.float32),
+            )
+            # compact stage array -> the full reconstruction, at the chunk origin
+            marks = torch.arange(1, int(keep.sum()) + 1, dtype=torch.float32)[None]
+            _write_stage(recon, geom, i, marks)
+            expected_recon[
+                (0,) + tuple(c[keep] + o for c, o in zip(coords, origin))
+            ] = np.arange(1, int(keep.sum()) + 1)
+        np.testing.assert_array_equal(recon.numpy(), expected_recon)
 
 
-@pytest.mark.parametrize("end_mode", range(END_MODE_MAX + 1))
-@pytest.mark.parametrize("cubic", [True, False])
-def test_device_gate_interp_matches_numpy_interp(end_mode, cubic):
-    """``_interp_axis_at_t`` must agree with the numpy ``_interp_axis_at`` branch
-    for branch, for every end mode. The gate's interp candidates are what the GNN
-    codec falls back to, so a divergence here would silently cost rate (and would
-    not be caught by a round trip, which only checks enc/dec agreement)."""
+@pytest.mark.parametrize(
+    "shape", [(9, 7), (17, 9, 11), (8, 6, 6, 8), (2, 2), (3, 5, 2), (2, 1, 3, 5)]
+)
+def test_device_gate_interp_matches_numpy_interp(shape):
+    """The view-based device interpolation must agree with the numpy
+    ``_interp_axis_at`` branch for branch, on every sub-stage of a chunk. The
+    gate's interp candidates are what the GNN codec falls back to, so a
+    divergence here would silently cost rate — and would not be caught by a
+    round trip, which only checks enc/dec agreement.
+
+    Odd extents are the point: they are what makes a line's last point lack its
+    ``+s`` neighbour, so the peeled end slabs are exercised rather than skipped.
+    """
     rng = np.random.RandomState(5)
-    shape = (9, 7)
-    W = rng.rand(1, *shape) * 10.0
-    # Every coordinate on one axis, so the far/near-neighbour validity pattern
-    # covers both ends of the line and the interior.
-    coords = tuple(c.ravel() for c in np.indices(shape))
-    for axis in range(2):
-        exp = _interp_axis_at(
-            W, coords, axis, 1, "cubic" if cubic else "linear", shape, end_mode
-        )
-        got = _interp_axis_at_t(
-            torch,
-            torch.from_numpy(W),
-            tuple(torch.from_numpy(c) for c in coords),
-            axis,
-            1,
-            shape,
-            cubic,
-            end_mode,
-            _end_plan(torch, "cpu", coords, axis, 1, shape),
-        )
-        pair = _interp_axis_pair_t(
-            torch,
-            torch.from_numpy(W),
-            tuple(torch.from_numpy(c) for c in coords),
-            axis,
-            1,
-            shape,
-            end_mode,
-            _end_plan(torch, "cpu", coords, axis, 1, shape),
-        )
-        assert torch.equal(pair[0 if cubic else 1], got)
-        np.testing.assert_allclose(got.numpy(), exp, rtol=0, atol=1e-12)
+    W = torch.from_numpy(rng.rand(1, *shape).astype(np.float32))
+    flatW = W.numpy().reshape(1, -1)
+    strides = np.cumprod((1,) + shape[:0:-1])[::-1].astype(np.int64)
+    sls = tuple(slice(0, n) for n in shape)
+    geom = _ChunkGeom(shape, sls, LEVELS, STRIDE, ())
+
+    def oracle(mask, s, axes, order, center):
+        flat = np.flatnonzero(mask)
+        coords = np.unravel_index(flat, shape)
+        preds = {
+            a: _interp_axis_at(
+                _flat_gatherer(flatW, flat, coords, shape, strides, a),
+                s,
+                order,
+                _GATE_END_MODE,
+            )
+            for a in axes
+        }
+        odd = {a: (coords[a] & s) != 0 for a in axes}  # this point's own odd axes
+        if center == 0 or len(axes) == 1:
+            total = sum(preds[a] * odd[a][None] for a in axes)
+            return (total / sum(odd[a][None] for a in axes)).astype(np.float32)
+        out = None
+        for a in reversed(axes) if center == 1 else axes:  # first-/last-wins
+            out = preds[a] if out is None else np.where(odd[a][None], preds[a], out)
+        return out.astype(np.float32)
+
+    for i, (mask, s, axes) in enumerate(stage_plan(shape, LEVELS, STRIDE, 1)):
+        if i == 0 or not mask.any():
+            continue
+        cubic, linear_first, linear_last = _gate_interps(torch, W, sls, geom, i)
+        for got, exp in (
+            (cubic, oracle(mask, s, axes, "cubic", geom.center)),
+            (linear_first, oracle(mask, s, axes, "linear", 1)),
+            (linear_last, oracle(mask, s, axes, "linear", 2)),
+        ):
+            np.testing.assert_allclose(got.numpy(), exp, rtol=0, atol=1e-6)
+
+
+def test_line_ends_are_peeled_not_masked():
+    """A sub-stage whose axis runs off the grid must take the one-sided rule on
+    exactly its last point, and the ordinary stencil everywhere else — that
+    peeled slab is what replaced the old end-index subset."""
+    shape = (6,)
+    W = torch.tensor([[0.0, 1.0, 4.0, 9.0, 16.0, 25.0]])
+    sls = (slice(0, 6),)
+    geom = _ChunkGeom(shape, sls, 1, 2, ())
+    # stride 1, odd axis 0: points 1, 3, 5. Only 5 runs off the end (no +1), so
+    # only 5 extrapolates (1.5*W[4] - 0.5*W[2]); 1 and 3 stay bracketed.
+    stage = next(i for i, lay in enumerate(geom.layouts) if lay.stride == 1)
+    linear = _gate_interps(torch, W, sls, geom, stage)[1].numpy()[0]
+    np.testing.assert_allclose(linear[:2], [(0 + 4) / 2, (4 + 16) / 2], atol=1e-6)
+    np.testing.assert_allclose(linear[2], 1.5 * 16.0 - 0.5 * 4.0, atol=1e-6)
+
+    """The GNN gate does not sweep its line ends (see ``_GATE_END_MODE``); pin the
+    measured choice so a future edit to the interp predictor's more conservative
+    default does not silently drag the gate along with it."""
+    assert _GATE_END_MODE == END_QUAD | END_EXTRAP
 
 
 def test_stored_gate_computes_only_the_selected_candidate():
     shape = (8, 8)
-    plan = _chunk_device_plan(
-        torch, torch.device("cpu"), shape, shape, LEVELS, STRIDE, 1, ()
-    )
-    interp_dev, center, end_mode = plan[4], plan[6], plan[7]
     recon = torch.from_numpy(
         np.random.RandomState(9).rand(1, *shape).astype(np.float32)
     )
     sls = tuple(slice(0, n) for n in shape)
-    stage = next(s for s in range(1, len(interp_dev)) if interp_dev[s] is not None)
-    candidates = _gate_interps(
-        torch, recon, sls, interp_dev, stage, center, end_mode
-    )
+    geom = _ChunkGeom(shape, sls, LEVELS, STRIDE, ())
+    stage = next(i for i, lay in enumerate(geom.layouts) if lay.weight and lay.size)
+    candidates = _gate_interps(torch, recon, sls, geom, stage)
 
     for kind, expected in enumerate(candidates, start=1):
-        got = _stored_gate_interp(
-            torch, recon, sls, interp_dev, stage, center, end_mode, kind
-        )
+        got = _stored_gate_interp(torch, recon, sls, geom, stage, kind)
         assert torch.equal(got, expected)
 
 
@@ -579,38 +632,6 @@ def test_gate_scale_bucketization_matches_log_round_exp_exactly():
     )
     got = _gate_quantized_scales(torch, scale, eb)
     assert torch.equal(got, expected)
-
-
-def test_end_plan_compacts_to_the_line_ends():
-    """``_end_plan`` is what keeps the end rules off the full-length tensors: it
-    must select only the unbracketed points, and nothing at all on an axis where
-    every point has both immediate neighbours."""
-    shape = (9, 7)
-    coords = tuple(c.ravel() for c in np.indices(shape))
-
-    idx, only_left, far_idx, far_valid = _end_plan(torch, "cpu", coords, 1, 2, shape)
-    # Axis 1 has length 7, so at stride 2 the unbracketed columns are 0 and 1 (no
-    # -2 neighbour) and 5 and 6 (no +2 one) -> 4 of 7 columns, every row.
-    cols = coords[1][idx.numpy()]
-    assert set(int(c) for c in cols) == {0, 1, 5, 6}
-    assert idx.numel() == 9 * 4
-    # 5 and 6 lean left (behind-sample at -6); 0 and 1 lean right (+6).
-    np.testing.assert_array_equal(only_left.numpy(), cols >= 5)
-    behind = np.where(cols >= 5, cols - 6, cols + 6)
-    np.testing.assert_array_equal(far_idx[1].numpy(), np.clip(behind, 0, 6))
-    # ...and only columns 6 and 0 have that behind-sample in bounds, so 1 and 5
-    # degrade to the plain copy even under END_EXTRAP.
-    np.testing.assert_array_equal(far_valid.numpy(), behind == np.clip(behind, 0, 6))
-    np.testing.assert_array_equal(far_idx[0].numpy(), coords[0][idx.numpy()])
-
-    # stride 1 on the length-9 axis: interior columns are bracketed, so an axis
-    # whose points are all bracketed returns None rather than an empty subset.
-    interior = (np.array([4]), np.array([4]))
-    assert _end_plan(torch, "cpu", interior, 0, 1, shape) is None
-    """The GNN gate does not sweep its line ends (see ``_GATE_END_MODE``); pin the
-    measured choice so a future edit to the interp predictor's more conservative
-    default does not silently drag the gate along with it."""
-    assert _GATE_END_MODE == END_QUAD | END_EXTRAP
 
 
 def test_query_only_nearest_search_matches_period_tile_lookup():
@@ -695,20 +716,6 @@ def test_cache_storage_accounting_includes_host_arrays_and_tensors():
     ten = torch.zeros(23, dtype=torch.int16)
 
     assert gp._storage_bytes((arr, ten)) == arr.nbytes + ten.nelement() * 2
-
-
-def test_oversized_chunk_plan_is_used_without_being_cached(monkeypatch):
-    plan = (torch.zeros(8, dtype=torch.int64),)
-    monkeypatch.setattr(gc, "_PLAN_CACHE_MIB", 0)
-    monkeypatch.setattr(gc, "_chunk_device_plan", lambda *args: plan)
-    cache = OrderedDict()
-
-    got = gc._cached_chunk_plan(
-        cache, torch, "cpu", (4, 4), (8, 8), LEVELS, STRIDE, 1, ()
-    )
-
-    assert got is plan
-    assert not cache
 
 
 def test_codec_releases_runtime_caches_after_roundtrip(current_ckpt):
@@ -961,3 +968,72 @@ def test_stage_offsets_are_memoized_per_strides():
     first = cg.stage_offsets(s1)
     assert cg.stage_offsets(np.array([8, 1], np.int64)) is first
     assert cg.stage_offsets(np.array([16, 1], np.int64)) is not first
+
+
+# --- predictor ablation: the same pipeline without the model ---
+
+
+@pytest.mark.parametrize("kind", ["interp-linear", "interp-cubic"])
+@pytest.mark.parametrize("shape", [(8, 8), (8, 8, 8), (8, 8, 8, 8)])
+def test_interp_predictor_ablation_roundtrips(current_ckpt, kind, shape):
+    """``predictor="interp-*"`` swaps the model out of the chunked pipeline --
+    same chunks, waves, quantizer and rANS -- so the bound must still hold and
+    decode must replay the choice from the stream, not from a codec flag."""
+    from latec.gnn_codec import _read_stream
+
+    rng = np.random.RandomState(len(shape))
+    x = np.zeros(shape, np.float32)
+    for k, n in enumerate(shape):
+        wave = np.cos(np.linspace(0, 2 * np.pi, n, dtype=np.float32))
+        x = x + wave.reshape([-1 if i == k else 1 for i in range(len(shape))])
+    x += rng.rand(*shape).astype(np.float32) * 0.05
+    eb = 0.02
+    codec = _codec(current_ckpt, eb=eb, chunk_size=STRIDE, predictor=kind)
+
+    stream = codec.compress(x)
+    assert _read_stream(stream)[0]["predictor"] == kind
+    fresh = GNNCompressorCodec(current_ckpt)  # decode knows nothing but the stream
+    y = fresh.uncompress(stream)
+
+    assert tuple(y.shape) == shape
+    assert _maxerr(y, x) <= eb * float(x.max() - x.min())
+
+
+def test_interp_ablation_never_touches_the_model(current_ckpt):
+    """The point of the ablation is that the model is not run and its geometry
+    is not built -- otherwise it measures nothing."""
+    x = np.cos(np.linspace(0, 6, 16, dtype=np.float32))[:, None] * np.ones((16, 16), np.float32)
+    codec = _codec(current_ckpt, chunk_size=STRIDE, predictor="interp-linear")
+    stream = codec.compress(x)
+
+    predictor = next(iter(codec._chunked_predictors.values()))
+    assert predictor.model_free
+    assert not predictor._geom_cache  # no per-stage model geometry was built
+    predictor.predict_wave_stage = _fail  # decode must not call the model either
+    codec.uncompress(stream)
+
+
+def _fail(*a, **k):
+    raise AssertionError("the model ran in the interpolation ablation")
+
+
+def test_interp_ablation_names_and_gate(current_ckpt):
+    """An unknown predictor is rejected up front, and asking for the gate is
+    silently dropped rather than half-applied: there is no model prediction for
+    a gate to fall back from."""
+    from latec.gnn_codec import _read_stream
+
+    codec = GNNCompressorCodec(current_ckpt)
+    with pytest.raises(ValueError, match="predictor must be"):
+        codec.compress(np.zeros((8, 8), np.float32), predictor="interp-quartic")
+
+    x = np.cos(np.linspace(0, 6, 16, dtype=np.float32))[:, None] * np.ones(
+        (16, 16), np.float32
+    )
+    stream = codec.compress(
+        x, 1e-2, levels=LEVELS, chunk_size=STRIDE, fp16=False, compile=False,
+        gate=True, predictor="interp-linear",
+    )
+    meta = _read_stream(stream)[0]
+    assert "gates" not in meta and "fine_gates" not in meta
+    assert _maxerr(codec.uncompress(stream), x) <= 1e-2 * float(x.max() - x.min())

@@ -95,9 +95,11 @@ Large Jean Zay jobs must be submitted directly by the user.
 
 For each progressive stage, the predictor estimates only newly introduced grid
 points. Residuals are quantized with a linear error-bounded quantizer; values
-that cannot be represented safely are stored as exact outliers. Interpolation
-streams use canonical Huffman coding. GNN streams additionally predict a local
-Laplacian scale and use scale-conditioned rANS coding.
+that cannot be represented safely are stored as exact outliers. Both stream
+kinds are entropy coded with rANS over the same Laplace-mixture dictionary:
+GNN streams predict a local Laplacian scale per point and code against it,
+while interpolation streams, which have no scale head, fit one scale level per
+stage and signal it in the stage frame.
 
 The interpolation predictor operates on the complete field without padding or
 prediction seams. The GNN tensor codec always codes chunk by chunk, for bounded

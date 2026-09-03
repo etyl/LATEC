@@ -1,7 +1,14 @@
 import numpy as np
 import pytest
 
-from latec.levels import stage_masks, stage_plan
+from latec.levels import (
+    LazyStageMasks,
+    mask_tiles,
+    n_stages,
+    stage_counts,
+    stage_masks,
+    stage_plan,
+)
 
 
 # all levels == log2(stride) so the schedule densifies to stride 1 (guard)
@@ -88,3 +95,65 @@ def test_validation():
         stage_masks((64, 64), 3, 8, 9)
     with pytest.raises(ValueError):  # levels < log2(stride): can't reach stride 1
         stage_masks((64, 64), 2, 16)
+
+
+# --- streaming the schedule instead of materializing it ---
+
+
+SCHEDULES = [
+    ((24,), 3, 8, 1),
+    ((64, 64), 3, 8, 1),
+    ((64, 64), 3, 8, 4),
+    ((33, 65), 4, 16, 2),
+    ((19, 23, 17), 3, 8, 1),
+    ((16, 16, 16, 16), 4, 16, 1),
+    ((17, 16, 16, 16, 16), 4, 16, 1),
+    ((64, 64), 5, 16, 1),  # levels > log2(stride): the extra levels are empty
+]
+
+
+@pytest.mark.parametrize("shape,levels,stride,block", SCHEDULES)
+def test_lazy_masks_match_the_list(shape, levels, stride, block):
+    """The streamed masks are the list, in order, with a closed-form length."""
+    lazy = LazyStageMasks(shape, levels, stride, block)
+    eager = stage_masks(shape, levels, stride, block)
+    assert len(lazy) == len(eager) == n_stages(len(shape), levels)
+    for got, want in zip(lazy, eager, strict=True):
+        np.testing.assert_array_equal(got, want)
+
+
+@pytest.mark.parametrize("shape,levels,stride,block", SCHEDULES)
+def test_stage_counts_match_the_masks(shape, levels, stride, block):
+    """Closed-form stage sizes: the interp predictor keys its geometry on the
+    running total, and must not pay a pass over the field's masks to get it."""
+    masks = stage_masks(shape, levels, stride, block)
+    assert stage_counts(shape, levels, stride, block) == [
+        int(m.sum()) for m in masks
+    ]
+
+
+def test_lazy_masks_reject_bad_parameters_eagerly():
+    with pytest.raises(ValueError):
+        LazyStageMasks((64, 64), 3, 7, 1)  # stride not a power of two
+    with pytest.raises(ValueError):
+        stage_counts((64, 64), 2, 16, 1)  # levels too small to reach stride 1
+
+
+@pytest.mark.parametrize("shape", [(64, 64), (9, 7, 5)])
+def test_mask_tiles_reproduce_the_boolean_index(shape):
+    """Tiled flat indices must visit exactly ``recon[:, pos]`` order, so a
+    gather/scatter through them is indistinguishable from boolean indexing."""
+    rng = np.random.RandomState(0)
+    pos = rng.rand(*shape) < 0.3
+    tiles = list(mask_tiles(pos, shape, tile=7))
+    assert max(len(t) for t in tiles) <= 7
+    np.testing.assert_array_equal(np.concatenate(tiles), np.flatnonzero(pos))
+    field = rng.rand(*shape)
+    np.testing.assert_array_equal(
+        field.reshape(-1)[np.concatenate(tiles)], field[pos]
+    )
+
+
+def test_mask_tiles_without_a_mask_covers_the_grid():
+    tiles = list(mask_tiles(None, (4, 5), tile=3))
+    np.testing.assert_array_equal(np.concatenate(tiles), np.arange(20))

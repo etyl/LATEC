@@ -3,14 +3,20 @@ import pytest
 
 from latec.rans import (
     N_SHAPES,
+    OUTLIER_WEIGHTS,
     SHAPES,
     build_laplace_tables,
+    choose_const_level,
     choose_kexp,
+    choose_outlier_weight,
     choose_shape,
+    const_tables,
     full_kexp,
     model_bits,
     rans_decode,
+    rans_decode_const,
     rans_encode,
+    rans_encode_const,
     scale_to_level,
 )
 
@@ -264,3 +270,92 @@ def test_wide_windows_offer_only_the_cheap_entries():
     blob = rans_encode(codes, levels, tables, kexp=kexp, shape=excluded)
     got = rans_decode(blob, levels, tables, kexp=kexp, shape=excluded)
     assert np.array_equal(got, codes)
+
+
+# --- stage-constant scale level (predictors with no scale head) ---
+
+
+def _const_roundtrip(codes, tables=None):
+    """Encode/decode ``codes`` the way ``pack_stage`` does without a scale."""
+    tables = tables or const_tables(1 << 15)
+    kexp = choose_kexp(codes, tables.radius)
+    level, shape, owx, bits = choose_const_level(codes, tables, kexp)
+    blob = rans_encode_const(codes, level, tables, kexp=kexp, shape=shape, owx=owx)
+    assert len(blob) * 8 <= bits * 1.02 + 64  # the model's own count, near exact
+    got = rans_decode_const(
+        blob, len(codes), level, tables, kexp=kexp, shape=shape, owx=owx
+    )
+    np.testing.assert_array_equal(got, codes)
+    return blob
+
+
+@pytest.mark.parametrize("scale", [0.5, 4.0, 60.0])
+def test_const_level_roundtrip(scale):
+    rng = np.random.RandomState(0)
+    radius = 1 << 15
+    q = np.rint(rng.laplace(0.0, scale, 20000)).astype(np.int64)
+    codes = (q + radius).astype(np.uint32)
+    blob = _const_roundtrip(codes)
+    # within a few percent of the empirical entropy of the residuals
+    _, counts = np.unique(codes, return_counts=True)
+    p = counts / counts.sum()
+    entropy_bits = -(p * np.log2(p)).sum() * len(codes)
+    assert len(blob) * 8 <= entropy_bits * 1.15 + 512
+
+
+def test_const_level_roundtrip_over_many_tiles():
+    """The coder is a stack, so a tiled encode must be pushed in reverse; a
+    stage larger than one tile is where that would show up."""
+    from latec.rans import _CONST_TILE
+
+    rng = np.random.RandomState(1)
+    radius = 1 << 15
+    n = int(2.5 * _CONST_TILE)
+    codes = (rng.randint(-3, 4, n) + radius).astype(np.uint32)
+    codes[::1000] = 0
+    _const_roundtrip(codes)
+
+
+def test_const_level_empty_stage():
+    tables = const_tables(1 << 15)
+    codes = np.zeros(0, np.uint32)
+    assert rans_encode_const(codes, 0, tables, kexp=1) == b""
+    assert len(rans_decode_const(b"", 0, 0, tables, kexp=1)) == 0
+
+
+def test_outlier_marker_weight_tracks_the_outlier_rate():
+    """Symbol 0 is priced at ~1e-9 by every Laplace entry. A stage where the
+    quantizer demoted a sixth of the points (integer source, coarse bound) then
+    pays ~24 bits each, which is what the signalled marker weight fixes."""
+    rng = np.random.RandomState(2)
+    radius = 1 << 15
+    codes = (rng.randint(-2, 3, 20000) + radius).astype(np.uint32)
+    codes[rng.rand(len(codes)) < 1 / 6] = 0
+    tables = const_tables(radius)
+    kexp = choose_kexp(codes, radius)
+    level, shape, owx, _bits = choose_const_level(codes, tables, kexp)
+    assert owx > 0
+    fitted = rans_encode_const(codes, level, tables, kexp=kexp, shape=shape, owx=owx)
+    unweighted = rans_encode_const(codes, level, tables, kexp=kexp, shape=shape)
+    assert len(fitted) < 0.6 * len(unweighted)
+    np.testing.assert_array_equal(
+        rans_decode_const(
+            fitted, len(codes), level, tables, kexp=kexp, shape=shape, owx=owx
+        ),
+        codes,
+    )
+
+
+def test_outlier_weight_entry_selection():
+    assert choose_outlier_weight(0, 100) == 0
+    assert choose_outlier_weight(50, 100) == len(OUTLIER_WEIGHTS) - 1  # 0.5
+    for i, w in enumerate(OUTLIER_WEIGHTS[1:], start=1):
+        assert choose_outlier_weight(int(round(w * 100000)), 100000) == i
+
+
+def test_const_level_leaves_the_per_point_path_alone():
+    """Entry 0 of the outlier dictionary must reproduce the shipped tables, so
+    a scale-head stream is coded exactly as before."""
+    tables = build_laplace_tables(0.01, radius=64, precision=14)
+    np.testing.assert_array_equal(tables.cdfs_for(4, 0), tables.cdfs_for(4, 0, 0))
+    assert not np.array_equal(tables.cdfs_for(4, 0), tables.cdfs_for(4, 0, owx=5))

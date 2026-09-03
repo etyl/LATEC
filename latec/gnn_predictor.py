@@ -45,6 +45,7 @@ import itertools
 import os
 import warnings
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -86,6 +87,15 @@ _FRAME_CACHE_MIB = float(os.environ.get("LATEC_FRAME_CACHE_MIB", 0))
 # host geometry is already resident beats sorting/uniquing every reference on
 # the GPU. The 64x33^3 target chunk is above it; a 32^4 single chunk is below.
 _HOST_HALO_MIN_POINTS = 1 << 21
+# The extended-block partition yields up to 2**ndim distinct chunk shapes, each
+# needing its own cold geometry build. Those builds are independent and release
+# the GIL (NumPy + device copies), so `begin` warms them on a small pool instead
+# of paying 2**ndim serial builds inside the wave loop. The cap is a host-memory
+# choice, not a throughput one: each build's temporaries are several times what
+# it retains, so concurrent builds multiply the transient peak. Four keeps that
+# transient under the encode's own high-water mark while still taking most of
+# the speed-up (past ~8 the builds are bandwidth bound and stop scaling anyway).
+_GEOM_BUILD_WORKERS = int(os.environ.get("LATEC_GEOM_BUILD_WORKERS", 4))
 _AXIAL_IMPLICIT_GEOMETRY = True
 
 
@@ -1381,6 +1391,11 @@ class ChunkedGNNPredictor:
     provides_scale = True
     fp16 = False  # fp16 autocast on the message pass (codec sets it)
     compile = False  # torch.compile the embed pass (codec sets it)
+    # Ablation mode (codec sets it): the codec predicts by interpolation instead
+    # of calling the model, so none of the model-side geometry is ever read.
+    # Chunk partition, waves and slices are unaffected -- they are the codec's
+    # schedule, not the model's.
+    model_free = False
 
     def _maybe_compile(self):
         # Wrap the embed pass once (fuses the elementwise message-pass ops that
@@ -1453,9 +1468,73 @@ class ChunkedGNNPredictor:
             self._frame_cache.clear()
             self._cache_signature = signature
         ndim = len(self.shape)
-        self._check_field_budget(ndim, channels, geometry_progress)
+        if not self.model_free:  # nothing reads the model geometry in that mode
+            self._check_field_budget(ndim, channels, geometry_progress)
+            self._prebuild_geometry()
         self.coded = np.zeros(self.n_chunks, bool)
         self._cg = None
+
+    def chunk_shapes(self) -> list[tuple[int, ...]]:
+        """Distinct extended-block chunk shapes this tensor will produce.
+
+        ``chunk_slices`` grows a chunk by one cell on every *internal* high
+        face, so each axis contributes at most two extents -- ``edge + 1`` for
+        the chunks that own a shared plane and the ragged tail extent for the
+        last one. The product of those per-axis sets is every chunk shape the
+        wave loop can ask for (at most ``2 ** ndim``, and never more than
+        ``n_chunks``)."""
+        per_axis = []
+        for e, n, g in zip(self.edges, self.shape, self.grid):
+            extents = {n - (g - 1) * e}  # last chunk along this axis
+            if g > 1:
+                extents.add(e + 1)  # any chunk with an internal high face
+            per_axis.append(sorted(extents))
+        return [tuple(c) for c in itertools.product(*per_axis)]
+
+    def _prebuild_geometry(self):
+        """Warm ``_geom_cache`` for every chunk shape, in parallel.
+
+        Chunk geometry is built once per *shape*, but the extended-block
+        partition yields up to ``2 ** ndim`` of them, so a rank-5 encode paid
+        ~30 serial cold builds -- roughly half its wall time, and a fixed cost
+        that does not shrink as the tensor grows. The builds are independent and
+        spend their time in NumPy and device copies, which release the GIL, so
+        running them on a small thread pool turns that serial tail into
+        ~one build's latency."""
+        shapes = self.chunk_shapes()
+        if len(shapes) < 2:
+            return  # the representative build in _check_field_budget covers it
+        pending = [c for c in shapes if not self._geometry_cached_shape(c)]
+        if not pending:
+            return
+        workers = min(len(pending), _GEOM_BUILD_WORKERS)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for cshape, cg in zip(pending, pool.map(self._build_geom, pending)):
+                self._geom_cache[self._geom_key(cshape)] = cg
+
+    def _geom_key(self, cshape):
+        return (
+            tuple(int(n) for n in cshape),
+            self.levels,
+            self.anchor_stride,
+            self.anchor_block,
+            self.agg_level,
+            str(self.device),
+        )
+
+    def _geometry_cached_shape(self, cshape) -> bool:
+        return self._geom_key(cshape) in self._geom_cache
+
+    def _build_geom(self, cshape):
+        return _ChunkGeoms(
+            cshape,
+            self.levels,
+            self.anchor_stride,
+            self.anchor_block,
+            self._torch,
+            self.device,
+            self.agg_level,
+        )
 
     def _check_field_budget(self, ndim, channels, geometry_progress=None):
         """Warn when the static estimate exceeds available memory.
@@ -1505,15 +1584,7 @@ class ChunkedGNNPredictor:
     def geometry_cached(self, shape, chunk_edges) -> bool:
         """Whether begin()'s representative chunk geometry is already resident."""
         cshape = tuple(min(int(e), int(n)) for e, n in zip(chunk_edges, shape))
-        key = (
-            cshape,
-            self.levels,
-            self.anchor_stride,
-            self.anchor_block,
-            self.agg_level,
-            str(self.device),
-        )
-        return key in self._geom_cache
+        return self._geometry_cached_shape(cshape)
 
     def clear_runtime_cache(self):
         """Release tensor-shaped geometry while retaining the loaded model."""
@@ -1617,11 +1688,10 @@ class ChunkedGNNPredictor:
         else:
             frame = cached[0]
             self._frame_cache.move_to_end(frame_key)
-            # The compact remap is origin-independent, but halo reconstruction
-            # indices are global and shift with the current chunk.
-            _, frame.h_gflat = chunk_halo_info(
-                cg, origins[0], self.shape, self.edges, self.grid, self.coded
-            )
+            # ``h_offsets`` (origin-relative) is what the halo fill reads, and it
+            # is shared by every chunk with this frame key; ``h_gflat`` is only
+            # used by callers that build a frame directly (the trainer), so the
+            # cache-hit path does not re-derive it.
         E = torch.zeros(B, frame.n_compact, ndim, self.d, device=self.device)
         self._wave_fill_halo(E, frame, origins, recon)
         # per-chunk global flat indices per stage, for finalize reads from recon.
