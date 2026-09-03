@@ -25,7 +25,7 @@ from .bitstream import (
     unpack_stage,
     write_stream,
 )
-from .levels import stage_ebs, stage_masks
+from .levels import mask_tiles, stage_ebs, stage_masks
 from .predictor import (
     END_MODE_MAX,
     InterpPredictor,
@@ -75,16 +75,19 @@ def compress(
     # spatial = the whole shape, C = 1. Everything downstream (levels, interp/GNN
     # predictors, quantizer) is rank-generic.
     is_image = img.ndim <= 2 or (img.ndim == 3 and img.shape[-1] in (1, 3))
+    # asarray, not astype: a float32 field (the scientific case, and the largest)
+    # is read-only here, so converting it would only buy a second copy of the
+    # input.
     if is_image:
         if img.ndim == 2:
             img = img[..., None]
         spatial = img.shape[:-1]
         c = img.shape[-1]
-        fimg = img.astype(np.float32)
+        fimg = np.asarray(img, np.float32)
     else:
         spatial = img.shape
         c = 1
-        fimg = img.astype(np.float32)[..., None]  # append a size-1 channel axis
+        fimg = np.asarray(img, np.float32)[..., None]  # append a size-1 channel axis
     src_dtype = DTYPE_IDS[np.dtype(img.dtype)]
 
     vmin = float(fimg.min())
@@ -134,7 +137,7 @@ def compress(
     def encode(ebs):
         st = new_stats()
         payload, recon = _compress_region(
-            field, masks, ebs, predictor, radius, round_output, st
+            field, masks, ebs, predictor, radius, round_output, st, zstd_level
         )
         return payload, recon, len(payload), st
 
@@ -319,14 +322,75 @@ def decompress(stream: bytes, predictor_factory=None) -> np.ndarray:
     return _finalize(canvas, header)
 
 
-def _compress_region(field, masks, ebs, predictor, radius, round_output, stats):
+def _gather_stage(field, pos, n):
+    """The stage's values as a compact (C, n) array, gathered by flat index.
+
+    ``field[:, pos]`` would do the same thing, but NumPy expands an n-D boolean
+    index into one int64 array per axis first (see ``levels.mask_tiles``), which
+    at rank 5 is 40 bytes of temporary per point of the stage."""
+    out = np.empty((field.shape[0], n), field.dtype)
+    flat_field = field.reshape(field.shape[0], -1)
+    at = 0
+    for flat in mask_tiles(pos, field.shape[1:]):
+        out[:, at : at + len(flat)] = flat_field[:, flat]
+        at += len(flat)
+    return out
+
+
+def _scatter_stage(recon, pos, values):
+    """Write a compact (C, n) stage back into the reconstruction. Inverse of
+    ``_gather_stage``; same reason for not using ``recon[:, pos] = values``."""
+    flat_recon = recon.reshape(recon.shape[0], -1)
+    at = 0
+    for flat in mask_tiles(pos, recon.shape[1:]):
+        flat_recon[:, flat] = values[:, at : at + len(flat)]
+        at += len(flat)
+
+
+_STATS_TILE = 1 << 20
+
+
+def _stage_error_stats(stats, stage_idx, values, pred, recon, tile=_STATS_TILE):
+    """Accumulate one stage's prediction/reconstruction error moments.
+
+    Diagnostics only, but the natural form -- three float64 copies of the whole
+    stage plus an abs/square temporary each -- was both the largest host
+    allocation in an encode and its most expensive host operation. The moments
+    are identical to a few ULP when the differences are taken in float32 a tile
+    at a time and accumulated in float64, and the working set then stays in
+    cache instead of streaming several times the field through memory.
+    """
+    p_sae = p_sse = r_sae = r_sse = 0.0
+    r_max = 0.0
+    for a in range(0, values.shape[1], tile):
+        v = values[:, a : a + tile]
+        pred_err = v - pred[:, a : a + tile]
+        recon_err = v - recon[:, a : a + tile]
+        p_sae += float(np.abs(pred_err).sum(dtype=np.float64))
+        p_sse += float(np.square(pred_err, dtype=np.float64).sum())
+        np.abs(recon_err, out=recon_err)
+        r_sae += float(recon_err.sum(dtype=np.float64))
+        r_sse += float(np.square(recon_err, dtype=np.float64).sum())
+        r_max = max(r_max, float(recon_err.max(initial=0.0)))
+    stats["stage_pred_sae"][stage_idx] += p_sae
+    stats["stage_pred_sse"][stage_idx] += p_sse
+    stats["stage_recon_sae"][stage_idx] += r_sae
+    stats["stage_recon_sse"][stage_idx] += r_sse
+    stats["stage_recon_max"][stage_idx] = max(
+        stats["stage_recon_max"][stage_idx], r_max
+    )
+
+
+def _compress_region(
+    field, masks, ebs, predictor, radius, round_output, stats, zstd_level=9
+):
     c = field.shape[0]
     recon = np.zeros_like(field)
     known = np.zeros(field.shape[1:], bool)
     parts = []
     use_rans = getattr(predictor, "provides_scale", False)
     for stage_idx, pos in enumerate(masks):
-        n = int(pos.sum())
+        n = int(np.count_nonzero(pos))
         if n == 0:
             if use_rans:
                 tables = build_laplace_tables(ebs[stage_idx], radius)
@@ -340,7 +404,12 @@ def _compress_region(field, masks, ebs, predictor, radius, round_output, stats):
                 )
             else:
                 parts.append(
-                    pack_stage(np.zeros(0, np.uint32), np.zeros(0, np.float32))
+                    pack_stage(
+                        np.zeros(0, np.uint32),
+                        np.zeros(0, np.float32),
+                        radius=radius,
+                        zstd_level=zstd_level,
+                    )
                 )
             continue
         eb = ebs[stage_idx]
@@ -357,19 +426,11 @@ def _compress_region(field, masks, ebs, predictor, radius, round_output, stats):
                 pred = predictor.predict(recon, known, pos)
             stats["predict_s"] += time.time() - t0
         t0 = time.time()
-        values = field[:, pos]
+        values = _gather_stage(field, pos, n)
         codes, outliers = quantize(values, pred, eb, radius, round_output=round_output)
-        recon[:, pos] = dequantize(pred, codes, outliers, eb, radius).reshape(c, n)
-        x_stage = values.astype(np.float64)
-        pred_err = x_stage - pred.astype(np.float64)
-        recon_err = x_stage - recon[:, pos].astype(np.float64)
-        stats["stage_pred_sae"][stage_idx] += float(np.abs(pred_err).sum())
-        stats["stage_pred_sse"][stage_idx] += float(np.square(pred_err).sum())
-        stats["stage_recon_sae"][stage_idx] += float(np.abs(recon_err).sum())
-        stats["stage_recon_sse"][stage_idx] += float(np.square(recon_err).sum())
-        stats["stage_recon_max"][stage_idx] = max(
-            stats["stage_recon_max"][stage_idx], float(np.abs(recon_err).max())
-        )
+        stage_recon = dequantize(pred, codes, outliers, eb, radius).reshape(c, n)
+        _scatter_stage(recon, pos, stage_recon)
+        _stage_error_stats(stats, stage_idx, values, pred, stage_recon)
         stats["quantize_s"] += time.time() - t0
         known |= pos
         stats["outliers"] += len(outliers)
@@ -389,7 +450,9 @@ def _compress_region(field, masks, ebs, predictor, radius, round_output, stats):
             )
             part = pack_stage(codes, outliers, rans_levels=levels64, rans_tables=tables)
         else:
-            part = pack_stage(codes, outliers)
+            part = pack_stage(
+                codes, outliers, radius=radius, zstd_level=zstd_level
+            )
         stats["stage_payload_bytes"][stage_idx] += len(part)
         parts.append(part)
         stats["entropy_s"] += time.time() - t0
@@ -398,13 +461,13 @@ def _compress_region(field, masks, ebs, predictor, radius, round_output, stats):
 
 def _decompress_region(payload, masks, ebs, header, predictor):
     c = header.channels
-    region = masks[0].shape
+    region = tuple(header.spatial)
     recon = np.zeros((c, *region), np.float32)
     known = np.zeros(region, bool)
     off = 0
     use_rans = bool(header.flags & FLAG_RANS)
     for stage_idx, pos in enumerate(masks):
-        n = int(pos.sum())
+        n = int(np.count_nonzero(pos))
         if n == 0:
             if use_rans:
                 tables = build_laplace_tables(ebs[stage_idx], header.radius)
@@ -412,7 +475,9 @@ def _decompress_region(payload, masks, ebs, header, predictor):
                     payload, off, rans_levels=np.zeros(0, np.uint8), rans_tables=tables
                 )
             else:
-                codes, outliers, off = unpack_stage(payload, off)
+                codes, outliers, off = unpack_stage(
+                    payload, off, radius=header.radius
+                )
             continue
         if stage_idx == 0:
             pred = np.zeros((c, n), np.float32)
@@ -433,10 +498,14 @@ def _decompress_region(payload, masks, ebs, header, predictor):
                 payload, off, rans_levels=levels64, rans_tables=tables
             )
         else:
-            codes, outliers, off = unpack_stage(payload, off)
-        recon[:, pos] = dequantize(
-            pred, codes, outliers, ebs[stage_idx], header.radius
-        ).reshape(c, n)
+            codes, outliers, off = unpack_stage(payload, off, radius=header.radius)
+        _scatter_stage(
+            recon,
+            pos,
+            dequantize(pred, codes, outliers, ebs[stage_idx], header.radius).reshape(
+                c, n
+            ),
+        )
         known |= pos
     return recon
 
@@ -447,7 +516,9 @@ def _finalize(canvas: np.ndarray, header: Header) -> np.ndarray:
     if np.issubdtype(dtype, np.integer):
         info = np.iinfo(dtype)
         out = np.clip(np.rint(out), info.min, info.max)
-    out = out.astype(dtype)
+    # copy=False: for the float32 scientific case this is the reconstruction
+    # itself rather than a second full-size array.
+    out = out.astype(dtype, copy=False)
     if header.channels == 1:
         out = out[..., 0]
     return out

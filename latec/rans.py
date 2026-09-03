@@ -30,10 +30,10 @@ class RansTables:
     def alphabet(self) -> int:
         return 2 * self.radius
 
-    def cdfs_for(self, kexp: int, shape: int = 0) -> np.ndarray:
+    def cdfs_for(self, kexp: int, shape: int = 0, owx: int = 0) -> np.ndarray:
         """CDFs over the reduced alphabet of window ``kexp``, shaped by ``shape``."""
         return _build_cdfs_cached(
-            int(kexp), int(shape), self.cdfs.shape[0], self.precision
+            int(kexp), int(shape), self.cdfs.shape[0], self.precision, int(owx)
         )
 
 
@@ -133,6 +133,51 @@ assert N_SHAPES <= 1 << SHAPE_BITS
 # third of the cost.
 _SELECT_SAMPLE = 0.05
 _SELECT_MIN = 1024
+
+# ---- outlier-marker weight ----
+#
+# Symbol 0 marks an unpredictable value (the float itself rides in the stage's
+# outlier array). The Laplace dictionary has no room for it -- every entry
+# prices it at ~1e-9 -- which is right when outliers are freak events and very
+# wrong when they are systematic: an integer source at a coarse bound demotes
+# whole stages (a sixth of the points on the 160x120 uint8 image at eb=2), and
+# at 24-bit precision each one then costs ~24 bits, tripling the stage. The
+# marker's weight is therefore its own signalled axis, snapped to this
+# dictionary; entry 0 keeps the original tables exactly, so the per-point path
+# is unchanged.
+OUTLIER_WEIGHTS: tuple[float, ...] = (
+    0.0,
+    2.0**-13,
+    2.0**-10,
+    2.0**-8,
+    2.0**-6,
+    2.0**-4,
+    2.0**-2,
+    0.5,
+)
+OUTLIER_BITS = 3
+assert len(OUTLIER_WEIGHTS) <= 1 << OUTLIER_BITS
+
+
+def choose_outlier_weight(n_outliers: int, n_codes: int) -> int:
+    """Dictionary entry closest (in log odds) to the observed marker rate."""
+    if n_codes <= 0 or n_outliers <= 0:
+        return 0
+    rate = n_outliers / n_codes
+    return int(
+        np.argmin([abs(np.log(max(w, 1e-12)) - np.log(rate)) for w in OUTLIER_WEIGHTS])
+    )
+
+
+def _with_outlier_weight(weights: np.ndarray, owx: int) -> np.ndarray:
+    """Re-weight the marker symbol of a per-level weight table."""
+    ow = OUTLIER_WEIGHTS[int(owx)]
+    if not ow:
+        return weights
+    out = weights.copy()
+    out[:, 1:] *= (1.0 - ow) / out[:, 1:].sum(1, keepdims=True)
+    out[:, 0] = ow
+    return out
 
 # A model set costs n_levels * 2**(kexp+1) * 4 bytes, so at the widest windows
 # each dictionary entry is 16 MB and takes ~1 s to build. Offering all 21 there
@@ -256,12 +301,13 @@ def build_laplace_tables(
     )
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=16)
 def _build_cdfs_cached(
     kexp: int,
     shape: int,
     n_levels: int,
     precision: int,
+    owx: int = 0,
 ) -> np.ndarray:
     """CDFs in normalized units; invariant to the absolute error bound.
 
@@ -275,11 +321,7 @@ def _build_cdfs_cached(
     if alphabet > total:
         raise ValueError("precision is too small for the quantizer alphabet")
 
-    weights = _level_weights(kexp, n_levels)
-    d, w = SHAPES[shape]
-    if w:
-        broad = weights[np.minimum(np.arange(n_levels) + d, n_levels - 1)]
-        weights = (1.0 - w) * weights + w * broad
+    weights = _with_outlier_weight(_shaped_weights(kexp, shape, n_levels), owx)
 
     cdfs = np.empty((n_levels, alphabet + 1), np.uint32)
     cdfs[:, 0] = 0
@@ -313,6 +355,192 @@ def model_bits(
             cdf = cdfs[level]
             probs[idx] = cdf[syms + 1].astype(np.int64) - cdf[syms].astype(np.int64)
     return float((-np.log2(probs / tables.total)).sum())
+
+
+# ---- stage-constant scale level ----
+#
+# A predictor with no scale head (interpolation) still wants the compiled rANS
+# back end rather than a Huffman fallback. It has no per-point scale, so the
+# encoder fits ONE level of the shared grid to the stage's own code histogram
+# and signals it in the stage frame, exactly as ``kexp`` and the shape id are
+# signalled. The model machinery, tables and dictionary are the per-point path's,
+# with the per-level partition collapsed to a single bulk call.
+
+
+# Symbols per pass of the stage-constant coder. ``_narrow`` widens to int64, so
+# an untiled pass over the finest stage of a large field allocates several times
+# the stage; the coder is a stack, so tiles just have to be pushed in reverse.
+_CONST_TILE = 1 << 22
+
+
+@lru_cache(maxsize=32)
+def _shaped_weights(kexp: int, shape: int, n_levels: int) -> np.ndarray:
+    """Per-level weights of one dictionary entry (entry 0 is pure Laplace)."""
+    weights = _level_weights(kexp, n_levels)
+    d, w = SHAPES[shape]
+    if not w:
+        return weights
+    broad = weights[np.minimum(np.arange(n_levels) + d, n_levels - 1)]
+    return (1.0 - w) * weights + w * broad
+
+
+@lru_cache(maxsize=16)
+def _neg_log2_weights(kexp: int, shape: int, n_levels: int, precision: int, owx: int):
+    """``-log2`` of the per-level model weights, for histogram scoring."""
+    weights = _with_outlier_weight(_shaped_weights(kexp, shape, n_levels), owx)
+    floor = 1.0 / (1 << precision)  # _quantize_pmf never leaves a symbol below this
+    return -np.log2(np.maximum(weights, floor)).astype(np.float32)
+
+
+def choose_const_level(
+    codes: np.ndarray, tables: RansTables, kexp: int
+) -> tuple[int, int, int, float]:
+    """(level, shape, outlier-weight entry, coded bits) for the shortest coding
+    of ``codes`` under one scale level.
+
+    Scored on the stage's exact symbol histogram: the candidate cost is then a
+    matrix-vector product over the reduced alphabet, so all 64 levels of every
+    dictionary entry are evaluated for the price of one pass over the codes.
+    The marker weight follows the observed outlier rate, which is optimal
+    independently of the level and shape (it only moves mass between symbol 0
+    and the rest). The returned bit count is the model's own, which the coder
+    tracks to well under a percent -- accurate enough for ``pack_stage`` to
+    compare back ends without encoding.
+    """
+    codes = np.asarray(codes, np.uint32).ravel()
+    n_levels = tables.cdfs.shape[0]
+    if len(codes) == 0:
+        return 0, 0, 0, 0.0
+    alphabet = 2 * ((1 << int(kexp)) - 1) + 2
+    hist = np.zeros(alphabet, np.float32)
+    for a in range(0, len(codes), _CONST_TILE):
+        hist += np.bincount(
+            _narrow(codes[a : a + _CONST_TILE], tables.radius, int(kexp)),
+            minlength=alphabet,
+        )
+    owx = choose_outlier_weight(int(hist[0]), len(codes))
+    best = (np.inf, 0, 0)
+    for shape_id in _shape_ids(int(kexp)):
+        cost = _neg_log2_weights(
+            int(kexp), int(shape_id), n_levels, tables.precision, owx
+        ) @ hist
+        level = int(cost.argmin())
+        if cost[level] < best[0]:
+            best = (float(cost[level]), level, int(shape_id))
+    return best[1], best[2], owx, best[0]
+
+
+def literal_dtype(kexp: int) -> np.dtype:
+    """Symbol width for the literal back end: the narrowed alphabet is
+    ``2**(kexp + 1)``, so windows up to 7 fit a byte."""
+    return np.dtype(np.uint8 if int(kexp) <= 7 else np.uint16)
+
+
+def narrow_literal(codes: np.ndarray, radius: int, kexp: int) -> np.ndarray:
+    """The stage's narrowed symbols as a compact literal array.
+
+    The rANS model is memoryless, which is the right call when a stage's codes
+    are close to independent and costs a third of the stream when they are not:
+    a smooth 5-D field's finest stages measure H(sym | previous) ~ 0.82 bit
+    against H(sym) ~ 1.19, and no scale level can price that. Handing zstd the
+    raw symbols instead lets its LZ pass take the correlation. ``pack_stage``
+    picks per stage.
+    """
+    out = np.empty(len(codes), literal_dtype(kexp))
+    for a in range(0, len(codes), _CONST_TILE):  # _narrow widens to int64
+        out[a : a + _CONST_TILE] = _narrow(
+            codes[a : a + _CONST_TILE], radius, int(kexp)
+        )
+    return out
+
+
+def widen_literal(buf, n_codes: int, radius: int, kexp: int) -> np.ndarray:
+    """Inverse of :func:`narrow_literal`."""
+    syms = np.frombuffer(buf, literal_dtype(kexp), count=int(n_codes))
+    out = np.empty(int(n_codes), np.uint32)
+    for a in range(0, int(n_codes), _CONST_TILE):
+        out[a : a + _CONST_TILE] = _widen(syms[a : a + _CONST_TILE], radius, int(kexp))
+    return out
+
+
+def rans_encode_const(
+    codes: np.ndarray,
+    level: int,
+    tables: RansTables,
+    *,
+    kexp: int | None = None,
+    shape: int = 0,
+    owx: int = 0,
+) -> bytes:
+    """Encode a whole stage against a single scale level (see above)."""
+    import constriction
+
+    codes = np.asarray(codes, np.uint32).ravel()
+    if len(codes) == 0:
+        return b""
+    if int(codes.max(initial=0)) >= tables.alphabet:
+        raise ValueError("code exceeds table alphabet")
+    n_levels = tables.cdfs.shape[0]
+    if not 0 <= int(level) < n_levels:
+        raise ValueError("scale level exceeds table count")
+    if kexp is None:
+        kexp = full_kexp(tables.radius)
+    models = _ans_models(int(kexp), int(shape), n_levels, tables.precision, int(owx))
+    model = models[int(level)]
+    enc = constriction.stream.stack.AnsCoder()
+    for a in reversed(range(0, len(codes), _CONST_TILE)):  # stack: last in, first out
+        enc.encode_reverse(
+            _narrow(codes[a : a + _CONST_TILE], tables.radius, int(kexp)).astype(
+                np.int32
+            ),
+            model,
+        )
+    return enc.get_compressed().astype("<u4", copy=False).tobytes()
+
+
+def rans_decode_const(
+    blob: bytes,
+    n_codes: int,
+    level: int,
+    tables: RansTables,
+    *,
+    kexp: int | None = None,
+    shape: int = 0,
+    owx: int = 0,
+) -> np.ndarray:
+    """Inverse of :func:`rans_encode_const`."""
+    import constriction
+
+    n_codes = int(n_codes)
+    if n_codes == 0:
+        if blob:
+            raise ValueError("non-empty rANS blob for an empty stage")
+        return np.empty(0, np.uint32)
+    if len(blob) % 4:
+        raise ValueError("rANS payload is not aligned to 32-bit words")
+    n_levels = tables.cdfs.shape[0]
+    if not 0 <= int(level) < n_levels:
+        raise ValueError("scale level exceeds table count")
+    if kexp is None:
+        kexp = full_kexp(tables.radius)
+    models = _ans_models(int(kexp), int(shape), n_levels, tables.precision, int(owx))
+    dec = constriction.stream.stack.AnsCoder(np.frombuffer(blob, dtype="<u4"))
+    model = models[int(level)]
+    out = np.empty(n_codes, np.uint32)
+    for a in range(0, n_codes, _CONST_TILE):
+        b = min(a + _CONST_TILE, n_codes)
+        out[a:b] = _widen(dec.decode(model, b - a), tables.radius, int(kexp))
+    if not dec.is_empty():
+        raise ValueError("trailing data in rANS payload")
+    return out
+
+
+@lru_cache(maxsize=4)
+def const_tables(radius: int) -> RansTables:
+    """Tables for the stage-constant path. The CDFs are eb-invariant and the
+    scale grid is unused there (the level is signalled, not derived), so one
+    table set per radius serves every stage."""
+    return build_laplace_tables(1.0, int(radius))
 
 
 def rans_encode(
@@ -394,11 +622,11 @@ def rans_decode(
 # recently used, which keeps the small windows resident for free and only ever
 # rebuilds the wide ones.
 _MODEL_BUDGET_BYTES = 192 << 20
-_model_cache: "OrderedDict[tuple[int, int, int, int], tuple]" = OrderedDict()
+_model_cache: "OrderedDict[tuple[int, int, int, int, int], tuple]" = OrderedDict()
 _model_bytes = 0
 
 
-def _ans_models(kexp: int, shape: int, n_levels: int, precision: int):
+def _ans_models(kexp: int, shape: int, n_levels: int, precision: int, owx: int = 0):
     """Build reusable compiled models, cached under a byte budget.
 
     The discretized PMFs are invariant to ``eb`` because both bin boundaries and
@@ -407,7 +635,7 @@ def _ans_models(kexp: int, shape: int, n_levels: int, precision: int):
     global _model_bytes
     import constriction
 
-    key = (int(kexp), int(shape), int(n_levels), int(precision))
+    key = (int(kexp), int(shape), int(n_levels), int(precision), int(owx))
     hit = _model_cache.get(key)
     if hit is not None:
         _model_cache.move_to_end(key)

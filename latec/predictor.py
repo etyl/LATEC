@@ -15,7 +15,7 @@ from __future__ import annotations
 import numpy as np
 
 from .bitstream import FLAG_CUBIC, FLAG_INTERP
-from .levels import stage_plan
+from .levels import LazyStageMasks, mask_tiles, stage_counts, stage_strides
 
 
 def default_interp_center(ndim: int) -> int:
@@ -66,10 +66,40 @@ def default_interp_end_mode(ndim: int) -> int:
     return END_QUAD
 
 
-def _interp_axis_at(W, coords, axis, s, order, shape, end_mode):
-    """SZ3's 1D interpolation of the query points ``coords`` (a tuple of per-axis
-    index arrays into the spatial grid) along ``axis``: cubic weights
-    [-1, 9, 9, -1]/16 over the four nearest same-line samples.
+# Query points are predicted in tiles: every intermediate below is (C, tile)
+# rather than (C, |stage|), so a stage's working set stays in cache and the peak
+# host memory of a prediction no longer scales with the field.
+_TILE = 1 << 20
+
+
+def _flat_gatherer(flatW, flat, coords, shape, strides, axis):
+    """``gather(off) -> (values (C, M) float64, valid (M,))`` for the neighbours
+    ``off`` cells away along ``axis``, edge-clamped.
+
+    Indexes the flattened reconstruction by arithmetic on the query points' own
+    flat indices (one multiply-add per neighbour) instead of building an n-D
+    index tuple, and upcasts only the gathered M values -- promoting the whole
+    field to float64 first cost a full-size temporary per stage.
+    """
+    ca = coords[axis]
+    n = shape[axis]
+    stride = int(strides[axis])
+
+    def gather(off):
+        t = ca + off
+        valid = (t >= 0) & (t < n)
+        np.clip(t, 0, n - 1, out=t)
+        return flatW[:, flat + (t - ca) * stride].astype(np.float64), valid
+
+    return gather
+
+
+def _interp_axis_at(gather, s, order, end_mode):
+    """SZ3's 1D interpolation of one query tile along one axis: cubic weights
+    [-1, 9, 9, -1]/16 over the four nearest same-line samples. ``gather(off)``
+    supplies the neighbours ``off`` cells away and their validity (see
+    ``_flat_gatherer``), so this is independent of how the reconstruction is
+    laid out.
 
     Line ends follow SZ3's ``Interpolators.hpp`` rather than degrading to linear
     and then to an edge copy, which is what this used to do and what cost the
@@ -87,18 +117,7 @@ def _interp_axis_at(W, coords, axis, s, order, shape, end_mode):
       every finer level interpolated from them.
 
     ``end_mode`` 0 restores the original linear/edge-copy behaviour. See
-    ``default_interp_end_mode`` for why the choice is rank-gated and swept.
-
-    Operates only on the M query points (``W`` is (C, *S) float64), so it never
-    materializes a whole-grid temporary."""
-
-    def gather(off):  # neighbour value at coord[axis]+off (edge-clamped) + validity
-        ca = coords[axis] + off
-        valid = (ca >= 0) & (ca < shape[axis])
-        idx = list(coords)
-        idx[axis] = np.clip(ca, 0, shape[axis] - 1)
-        return W[(slice(None), *idx)], valid  # (C, M), (M,)
-
+    ``default_interp_end_mode`` for why the choice is rank-gated and swept."""
     Lm1, vm1 = gather(-s)
     Lp1, vp1 = gather(+s)
     lin = 0.5 * (Lm1 + Lp1)
@@ -140,7 +159,7 @@ def _interp_axis_at(W, coords, axis, s, order, shape, end_mode):
 class InterpPredictor:
     """SZ3-style interpolation baseline dropped into LATEC's closed loop, so
     GNN vs. classical interpolation is isolated to the predictor (identical
-    quantizer + Huffman/zstd stage, matching SZ3's own pipeline). Torch- and
+    quantizer + rANS/zstd stage, matching SZ3's own pipeline). Torch- and
     checkpoint-free, so streams decode without a model.
 
     Each dyadic level is split into codec sub-stages ordered by how many axes a
@@ -195,50 +214,52 @@ class InterpPredictor:
         self.end_mode = end_mode
         self.stream_flag = FLAG_INTERP | (FLAG_CUBIC if order == "cubic" else 0)
         self.checkpoint_hash = b"\0" * 16
-        self._cache: dict[tuple[int, ...], tuple[list, dict]] = {}
+        self._cache: dict[tuple[int, ...], dict] = {}
 
-    def _build(self, shape: tuple[int, ...]) -> tuple[list, dict]:
-        """Return (masks, schedule) for a region of the given spatial shape,
-        from the shared ``levels.stage_plan`` (so the GNN codec/trainer use the
-        identical schedule). ``masks`` is the per-axis split stage list [anchor,
-        l1-axis0, l1-axis1, ..., l2-axis0, ...]; ``schedule`` maps |known so far|
-        -> (stride, axis) so ``predict`` knows which axis to interpolate along.
-        Cached per shape."""
+    def _schedule(self, shape: tuple[int, ...]) -> dict:
+        """``|known so far| -> (stride, axes)`` for a region of this shape, so
+        ``predict`` knows which axes to interpolate along at each call.
+
+        The stage order, strides and sizes are the shared schedule's
+        (``levels.stage_strides`` / ``levels.stage_counts``, so the GNN
+        codec/trainer stay on the identical plan), all closed form: keying the
+        geometry off the stage sizes must not cost a pass over the field's
+        stage masks. Cached per shape."""
         key = tuple(int(n) for n in shape)
-        if key in self._cache:
-            return self._cache[key]
-        masks: list = []
+        hit = self._cache.get(key)
+        if hit is not None:
+            return hit
+        ndim = len(key)
+        counts = stage_counts(key, self.levels, self.anchor_stride, self.anchor_block)
+        strides = stage_strides(ndim, self.levels, self.anchor_stride)
+        # stage axes, in plan order: one weight-1 sub-stage per axis, then the
+        # fused weight >= 2 sub-stages, whose points' own odd axes vary.
+        fused = tuple(range(ndim))
+        axes_by_stage = [()] + [
+            (axis,) if axis < ndim else fused
+            for _ in range(self.levels)
+            for axis in range(2 * ndim - 1)
+        ]
         schedule: dict[int, tuple[int, tuple[int, ...]]] = {}
         covered = 0
-        for mask, s, axes in stage_plan(
-            key, self.levels, self.anchor_stride, self.anchor_block
-        ):
-            n = int(mask.sum())
+        for n, s, axes in zip(counts, strides, axes_by_stage):
             if axes and n:  # non-anchor sub-stage; predict() is keyed by prior |known|
                 schedule[covered] = (s, axes)
-            masks.append(mask)
             covered += n
-        self._cache[key] = (masks, schedule)
-        return self._cache[key]
+        self._cache[key] = schedule
+        return schedule
 
-    def stage_masks(self, shape, levels, anchor_stride, anchor_block) -> list:
-        return self._build(shape)[0]
+    def stage_masks(self, shape, levels, anchor_stride, anchor_block):
+        return LazyStageMasks(shape, levels, anchor_stride, anchor_block)
 
     def predict(
         self, recon: np.ndarray, known: np.ndarray, pos: np.ndarray | None = None
     ) -> np.ndarray:
-        entry = self._build(recon.shape[1:])[1].get(int(known.sum()))
+        entry = self._schedule(recon.shape[1:]).get(int(np.count_nonzero(known)))
         if entry is None:
             raise ValueError("known mask does not match the interp schedule")
         s, axes = entry
         shape = recon.shape[1:]
-        W = recon.astype(np.float64)
-        # Query points of this sub-stage, in the codec's recon[:, pos] order.
-        coords = (
-            np.nonzero(pos)
-            if pos is not None
-            else np.indices(shape).reshape(len(shape), -1)
-        )
         # Interpolate each odd axis from its ±stride neighbours (already
         # reconstructed in an earlier, lower-weight sub-stage of the same level):
         # an edge-midpoint (one odd axis) reads 2 priors, a 2-D centre (two odd
@@ -254,26 +275,43 @@ class InterpPredictor:
             if self.end_mode is not None
             else default_interp_end_mode(len(shape))
         )
+        flatW = recon.reshape(recon.shape[0], -1)
+        strides = np.cumprod((1,) + shape[:0:-1])[::-1].astype(np.int64)
+        n = int(np.count_nonzero(pos)) if pos is not None else int(np.prod(shape))
+        out = np.empty((recon.shape[0], n), np.float32)
+        at = 0
+        for flat in mask_tiles(pos, shape, _TILE):
+            coords = np.unravel_index(flat, shape)
 
-        def is_odd(a):  # this point's own midpoint axes, not the stage-wide
-            # candidate set: a fused sub-stage (weight >= 2) mixes points whose
-            # odd axes differ, e.g. all 3-D face centres share one sub-stage.
-            return coords[a] // s % 2 == 1
+            def is_odd(a):  # this point's own midpoint axes, not the stage-wide
+                # candidate set: a fused sub-stage (weight >= 2) mixes points whose
+                # odd axes differ, e.g. all 3-D face centres share one sub-stage.
+                # ``s`` is a power of two, so the odd-multiple test is one bit.
+                return (coords[a] & s) != 0
 
-        if center == 0 or len(axes) == 1:
-            total = count = None
-            for a in axes:
-                v = _interp_axis_at(W, coords, a, s, self.order, shape, end_mode)
-                m = is_odd(a)[None].astype(np.float64)
-                total = v * m if total is None else total + v * m
-                count = m if count is None else count + m
-            out = total / count
-        else:
-            out = None
-            order = reversed(axes) if center == 1 else axes  # first-/last-wins
-            for a in order:
-                v = _interp_axis_at(W, coords, a, s, self.order, shape, end_mode)
-                take = is_odd(a)[None]
-                out = v if out is None else np.where(take, v, out)
-        out = out.astype(np.float32)  # (C, M)
+            def axis_pred(a):
+                return _interp_axis_at(
+                    _flat_gatherer(flatW, flat, coords, shape, strides, a),
+                    s,
+                    self.order,
+                    end_mode,
+                )
+
+            if center == 0 or len(axes) == 1:
+                total = count = None
+                for a in axes:
+                    v = axis_pred(a)
+                    m = is_odd(a)[None].astype(np.float64)
+                    total = v * m if total is None else total + v * m
+                    count = m if count is None else count + m
+                tile = total / count
+            else:
+                tile = None
+                order = reversed(axes) if center == 1 else axes  # first-/last-wins
+                for a in order:
+                    v = axis_pred(a)
+                    take = is_odd(a)[None]
+                    tile = v if tile is None else np.where(take, v, tile)
+            out[:, at : at + len(flat)] = tile  # (C, tile)
+            at += len(flat)
         return out if pos is not None else out.reshape(recon.shape)

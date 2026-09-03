@@ -3,14 +3,20 @@
 File = a fixed little-endian header, the spatial shape, and one zstd frame.
 
 The stage payload (produced by the codec, opaque here) contains, per stage:
-  [n_codes u32][shape u5 | kexp u4 | blob len u55][entropy blob]
+  [n_codes u32][lit u1 | owx u3 | level u6 | shape u5 | kexp u4 | len u45][blob]
   [n_outliers u32][outliers f32...]
 
-The entropy blob is canonical Huffman unless the header sets ``FLAG_RANS``, in
-which case it uses scale-conditioned context coding over the same code array.
-``kexp`` is the rANS coder window for that stage and ``shape`` its entry in the
-mixture dictionary (both 0 on the Huffman path). They share the length word so
-that per-stage alphabet sizing and shape selection cost no bytes.
+The entropy blob is always rANS over the same Laplace-mixture dictionary; the
+header's ``FLAG_RANS`` selects how the scale level is obtained. With the flag
+the predictor supplies a per-point scale and the decoder re-derives the levels
+itself (``level`` is 0 and unused); without it the encoder fits one level to the
+stage's own histogram and sends it here, together with ``owx``, the weight its
+outlier marker is coded at -- unless ``lit`` is set, which replaces the whole
+stage with its narrowed symbols deflated by zstd, for stages whose codes are
+correlated enough that a memoryless coder loses to an LZ pass. ``kexp`` is the
+coder window for that stage and ``shape`` its entry in the mixture dictionary.
+They all share the length word, so per-stage alphabet sizing, shape selection,
+the fitted model and the back-end choice cost no bytes of their own.
 """
 
 from __future__ import annotations
@@ -21,8 +27,11 @@ from dataclasses import dataclass
 import numpy as np
 import zstandard
 
+from .quantizer import DEFAULT_RADIUS
+from .rans import OUTLIER_BITS
+
 MAGIC = b"LATEC001"
-VERSION = 3
+VERSION = 4  # stage frame: rANS everywhere, fitted level + outlier weight
 
 
 FLAG_MOCK = 1 << 0
@@ -157,6 +166,14 @@ def read_stream(data: bytes) -> tuple[Header, bytes]:
 
 # ---- stage-record helpers used by codec ----
 
+# Stages smaller than this keep the rANS coder unconditionally: a deflated
+# literal cannot pay its own frame back at a few hundred symbols, and the scout
+# pass would cost more than the stage.
+_LITERAL_MIN = 1 << 12
+# The scout deflate runs at level 1; measured stages land ~15% under it at level
+# 9, so this is how much cheaper the scout has to be before the real pass runs.
+_LITERAL_SCOUT_SLACK = 0.85
+
 
 def pack_stage(
     codes: np.ndarray,
@@ -164,14 +181,42 @@ def pack_stage(
     *,
     rans_levels: np.ndarray | None = None,
     rans_tables=None,
+    radius: int = DEFAULT_RADIUS,
+    zstd_level: int = 9,
 ) -> bytes:
     blob_codes = np.asarray(codes, np.uint32)
     out = np.asarray(outliers, np.float32)
-    kexp = shape = 0  # unused on the Huffman path
+    level = owx = 0
+    literal = False
     if rans_levels is None:
-        from .huffman import huffman_encode
+        # No per-point scale: fit one scale level to this stage's histogram and
+        # signal it. Same coder, same dictionary, one bulk call.
+        from .rans import (
+            choose_const_level,
+            choose_kexp,
+            const_tables,
+            narrow_literal,
+            rans_encode_const,
+        )
 
-        hblob = huffman_encode(blob_codes)
+        tables = rans_tables if rans_tables is not None else const_tables(radius)
+        kexp = choose_kexp(blob_codes, tables.radius)
+        level, shape, owx, model_bits = choose_const_level(blob_codes, tables, kexp)
+        hblob = None
+        if len(blob_codes) >= _LITERAL_MIN:
+            syms = narrow_literal(blob_codes, tables.radius, kexp)
+            # A cheap pass first: only when a fast deflate already beats the
+            # model does the (much slower) full-strength one get to run.
+            scout = zstandard.ZstdCompressor(level=1).compress(syms)
+            if len(scout) * _LITERAL_SCOUT_SLACK < model_bits / 8.0:
+                blob = zstandard.ZstdCompressor(level=zstd_level).compress(syms)
+                if len(blob) * 8.0 < model_bits:
+                    hblob, literal = blob, True
+            del syms
+        if hblob is None:
+            hblob = rans_encode_const(
+                blob_codes, level, tables, kexp=kexp, shape=shape, owx=owx
+            )
     else:
         from .rans import choose_kexp, choose_shape, rans_encode
 
@@ -191,29 +236,53 @@ def pack_stage(
             blob_codes, rans_levels, rans_tables, kexp=kexp, shape=shape
         )
     return (
-        struct.pack("<IQ", len(blob_codes), _pack_hlen(len(hblob), kexp, shape))
+        struct.pack("<IQ", len(blob_codes), _pack_hlen(len(hblob), kexp, shape, level, owx, literal))
         + hblob
         + struct.pack("<I", len(out))
         + out.tobytes()
     )
 
 
-# The blob length occupies the low bits; the coder window and the shape id share
-# the top 9, which the length word had going spare (55 bits still frames 32 PB).
-_HLEN_BITS = 55
+# The blob length occupies the low bits; the coder window, the shape id and the
+# fitted (level, outlier weight) share the top 18, which the length word had
+# going spare (46 bits still frames 64 TB per stage).
+_HLEN_BITS = 45
 _KEXP_BITS = 4
+_SHAPE_BITS = 5
+_LEVEL_BITS = 6
 _KEXP_SHIFT = _HLEN_BITS
-_SHAPE_SHIFT = _HLEN_BITS + _KEXP_BITS
+_SHAPE_SHIFT = _KEXP_SHIFT + _KEXP_BITS
+_LEVEL_SHIFT = _SHAPE_SHIFT + _SHAPE_BITS
+_OWX_SHIFT = _LEVEL_SHIFT + _LEVEL_BITS
+_LIT_SHIFT = _OWX_SHIFT + OUTLIER_BITS
 
 
-def _pack_hlen(hlen: int, kexp: int, shape: int) -> int:
+def _pack_hlen(
+    hlen: int,
+    kexp: int,
+    shape: int,
+    level: int = 0,
+    owx: int = 0,
+    literal: bool = False,
+) -> int:
     if hlen >= 1 << _HLEN_BITS:
         raise ValueError("stage entropy blob is too large to frame")
     if not 0 <= int(kexp) < 1 << _KEXP_BITS:
         raise ValueError("rANS coder window does not fit the stage frame")
-    if not 0 <= int(shape) < 1 << 5:
+    if not 0 <= int(shape) < 1 << _SHAPE_BITS:
         raise ValueError("rANS shape id does not fit the stage frame")
-    return hlen | (int(kexp) << _KEXP_SHIFT) | (int(shape) << _SHAPE_SHIFT)
+    if not 0 <= int(level) < 1 << _LEVEL_BITS:
+        raise ValueError("rANS scale level does not fit the stage frame")
+    if not 0 <= int(owx) < 1 << OUTLIER_BITS:
+        raise ValueError("rANS outlier weight does not fit the stage frame")
+    return (
+        hlen
+        | (int(kexp) << _KEXP_SHIFT)
+        | (int(shape) << _SHAPE_SHIFT)
+        | (int(level) << _LEVEL_SHIFT)
+        | (int(owx) << _OWX_SHIFT)
+        | (int(bool(literal)) << _LIT_SHIFT)
+    )
 
 
 def unpack_stage(
@@ -222,16 +291,39 @@ def unpack_stage(
     *,
     rans_levels: np.ndarray | None = None,
     rans_tables=None,
+    radius: int = DEFAULT_RADIUS,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     n_codes, framed = struct.unpack_from("<IQ", buf, off)
     hlen = framed & ((1 << _HLEN_BITS) - 1)
     kexp = (framed >> _KEXP_SHIFT) & ((1 << _KEXP_BITS) - 1)
-    shape = framed >> _SHAPE_SHIFT
+    shape = (framed >> _SHAPE_SHIFT) & ((1 << _SHAPE_BITS) - 1)
+    level = (framed >> _LEVEL_SHIFT) & ((1 << _LEVEL_BITS) - 1)
+    owx = (framed >> _OWX_SHIFT) & ((1 << OUTLIER_BITS) - 1)
+    literal = bool((framed >> _LIT_SHIFT) & 1)
     off += 12
     if rans_levels is None:
-        from .huffman import huffman_decode
+        from .rans import const_tables, rans_decode_const, widen_literal
 
-        codes = huffman_decode(buf[off : off + hlen])
+        tables = rans_tables if rans_tables is not None else const_tables(radius)
+        if not kexp:
+            raise ValueError("rANS stage record has no coder window")
+        if literal:
+            codes = widen_literal(
+                zstandard.ZstdDecompressor().decompress(buf[off : off + hlen]),
+                n_codes,
+                tables.radius,
+                kexp,
+            )
+        else:
+            codes = rans_decode_const(
+                buf[off : off + hlen],
+                n_codes,
+                level,
+                tables,
+                kexp=kexp,
+                shape=shape,
+                owx=owx,
+            )
     else:
         from .rans import rans_decode
 

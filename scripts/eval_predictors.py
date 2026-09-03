@@ -1,7 +1,7 @@
 """Evaluate LATEC predictors (GNN vs. interpolation) against SZ3 on Kodak.
 
 Runs each method through the same closed-loop codec (identical quantizer +
-Huffman/zstd stage) so the comparison isolates the predictor, and reports
+rANS/zstd stage) so the comparison isolates the predictor, and reports
 bit-rate (bpp), PSNR, and error-bound compliance per image / error bound.
 
 Usage:

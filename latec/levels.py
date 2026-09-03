@@ -51,26 +51,12 @@ def _combo_slices(axes: tuple[int, ...], s: int, ndim: int) -> tuple[slice, ...]
     )
 
 
-def stage_plan(
-    shape: tuple[int, ...],
-    levels: int,
-    anchor_stride: int,
-    anchor_block: int = 1,
-) -> list[tuple[np.ndarray, int, tuple[int, ...]]]:
-    """Ordered sub-stages as (mask, stride, axes) for a grid of arbitrary rank.
-
-    ``axes`` is the *candidate* set of axes on which this sub-stage's points
-    may be midpoints: a single axis for the weight-1 sub-stages (kept
-    separate, so ``axes`` names it exactly), or ``range(ndim)`` for a fused
-    weight >= 2 sub-stage, since its points' actual odd-axis sets vary (all
-    same-weight combinations are revealed together). Callers that need a
-    point's real odd axes re-derive them from its own coordinates —
-    ``(coord // stride) % 2 == 1`` — which is exact for every point in this
-    schedule. The anchor stage has ``axes == ()``. ``stage_masks`` drops the
-    metadata."""
+def _check_plan(
+    shape: tuple[int, ...], levels: int, anchor_stride: int, anchor_block: int
+) -> tuple[int, ...]:
+    """Validate schedule parameters and return the normalized shape."""
     shape = tuple(int(n) for n in shape)
-    ndim = len(shape)
-    if ndim < 1:
+    if len(shape) < 1:
         raise ValueError("shape must have at least one axis")
     if levels < 1:
         raise ValueError("levels must be >= 1")
@@ -87,14 +73,53 @@ def stage_plan(
             f"{anchor_stride}: need levels >= log2(anchor_stride) = "
             f"{anchor_stride.bit_length() - 1} to densify to stride 1"
         )
+    return shape
 
+
+def stage_plan(
+    shape: tuple[int, ...],
+    levels: int,
+    anchor_stride: int,
+    anchor_block: int = 1,
+) -> list[tuple[np.ndarray, int, tuple[int, ...]]]:
+    """Ordered sub-stages as (mask, stride, axes) for a grid of arbitrary rank.
+
+    ``axes`` is the *candidate* set of axes on which this sub-stage's points
+    may be midpoints: a single axis for the weight-1 sub-stages (kept
+    separate, so ``axes`` names it exactly), or ``range(ndim)`` for a fused
+    weight >= 2 sub-stage, since its points' actual odd-axis sets vary (all
+    same-weight combinations are revealed together). Callers that need a
+    point's real odd axes re-derive them from its own coordinates —
+    ``(coord // stride) % 2 == 1`` — which is exact for every point in this
+    schedule. The anchor stage has ``axes == ()``. ``stage_masks`` drops the
+    metadata. ``iter_stage_plan`` is the same schedule without holding every
+    mask alive at once."""
+    return list(iter_stage_plan(shape, levels, anchor_stride, anchor_block))
+
+
+def iter_stage_plan(
+    shape: tuple[int, ...],
+    levels: int,
+    anchor_stride: int,
+    anchor_block: int = 1,
+):
+    """``stage_plan`` as a generator: one mask is built per step.
+
+    A codec pass reads each stage once, in order, so the list form's real cost
+    is that all ``1 + levels * (2*ndim - 1)`` full-size boolean grids stay alive
+    together -- 36 of them for a 1 GiB float32 field is 9 GiB of masks, by far
+    the largest allocation in a whole-field encode. Streaming them keeps two
+    (the current mask and the running ``covered`` grid)."""
+    shape = _check_plan(shape, levels, anchor_stride, anchor_block)
+    ndim = len(shape)
     covered = np.zeros(shape, bool)
 
     anchor = np.zeros(shape, bool)
     for offs in itertools.product(range(anchor_block), repeat=ndim):
         anchor[tuple(slice(o, None, anchor_stride) for o in offs)] = True
-    plan: list[tuple[np.ndarray, int, tuple[int, ...]]] = [(anchor, anchor_stride, ())]
     covered |= anchor
+    yield (anchor, anchor_stride, ())
+    del anchor
 
     for k in range(1, levels + 1):
         s = max(anchor_stride >> k, 1)
@@ -106,8 +131,9 @@ def stage_plan(
             mask &= ~covered
             if k == levels and ndim == 1:  # only sub-stage this level: absorbs remainder
                 mask |= ~covered
-            plan.append((mask, s, (axis,)))
             covered |= mask
+            yield (mask, s, (axis,))
+            del mask
 
         for w in range(2, ndim + 1):  # weight >= 2: fuse same-weight axis sets
             mask = np.zeros(shape, bool)
@@ -116,10 +142,144 @@ def stage_plan(
             mask &= ~covered
             if k == levels and w == ndim:  # final sub-stage absorbs remainder
                 mask |= ~covered
-            plan.append((mask, s, tuple(range(ndim))))
             covered |= mask
+            yield (mask, s, tuple(range(ndim)))
+            del mask
 
-    return plan
+
+class LazyStageMasks:
+    """The ``stage_plan`` masks as a sized, re-iterable stream.
+
+    Behaves like the ``stage_masks`` list for a codec pass -- ``len()`` and
+    iteration in schedule order -- but builds each mask on demand instead of
+    holding the whole schedule's grids alive (see ``iter_stage_plan``). ``len``
+    is closed form, so it costs nothing to ask."""
+
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        levels: int,
+        anchor_stride: int,
+        anchor_block: int = 1,
+    ):
+        self.shape = _check_plan(shape, levels, anchor_stride, anchor_block)
+        self.levels = int(levels)
+        self.anchor_stride = int(anchor_stride)
+        self.anchor_block = int(anchor_block)
+
+    def __len__(self) -> int:
+        return n_stages(len(self.shape), self.levels)
+
+    def __iter__(self):
+        for mask, _, _ in iter_stage_plan(
+            self.shape, self.levels, self.anchor_stride, self.anchor_block
+        ):
+            yield mask
+
+
+# Points per tile when a stage is walked by flat index (see ``mask_tiles``).
+_MASK_TILE = 1 << 20
+
+
+def mask_tiles(pos, shape, tile: int = _MASK_TILE):
+    """Yield a stage mask's points as flat-index tiles, in ``recon[:, pos]``
+    order (C-order over the mask); ``pos=None`` means every point.
+
+    Both the codec and the interpolation predictor walk a stage this way instead
+    of indexing with the boolean mask directly. NumPy expands an n-D boolean
+    index into one int64 array per axis, so ``field[:, pos]`` on a 5-D field
+    transiently allocates 40 bytes per selected point -- several hundred MiB at
+    the finest stage of a large field, and the codec's actual host peak. The
+    mask is scanned a slab at a time, so neither the tile nor the scan holds an
+    index array proportional to the stage size."""
+    if pos is None:
+        n = int(np.prod(shape))
+        for a in range(0, n, tile):
+            yield np.arange(a, min(a + tile, n), dtype=np.int64)
+        return
+    flat = pos.reshape(-1)
+    slab = 4 * tile
+    for a in range(0, flat.size, slab):
+        idx = np.flatnonzero(flat[a : a + slab])
+        if not len(idx):
+            continue
+        idx += a
+        for b in range(0, len(idx), tile):
+            yield idx[b : b + tile]
+
+
+def n_stages(ndim: int, levels: int) -> int:
+    """Number of sub-stages in the schedule (see ``stage_strides``)."""
+    return 1 + levels * (2 * ndim - 1)
+
+
+def _slice_count(n: int, start: int, step: int) -> int:
+    """Number of indices ``start::step`` selects from an axis of extent ``n``."""
+    return 0 if n <= start else (n - start + step - 1) // step
+
+
+def stage_counts(
+    shape: tuple[int, ...],
+    levels: int,
+    anchor_stride: int,
+    anchor_block: int = 1,
+) -> list[int]:
+    """Point count per stage, aligned with ``stage_plan`` order.
+
+    Closed form for ``anchor_block == 1``: every stage's set is a union of
+    cross products of arithmetic progressions, and the schedule's sets are
+    disjoint by construction (a point revealed at stride ``s`` is an odd
+    multiple of ``s`` on at least one axis, so no coarser lattice contains it),
+    which makes the ``&= ~covered`` step a no-op for counting. The final
+    sub-stage additionally absorbs every point off all dyadic lattices, i.e.
+    whatever the other stages leave over. Blocked anchors overlap the dyadic
+    lattices, so those fall back to counting the masks.
+
+    Lets a caller size the schedule -- the interpolation predictor keys its
+    per-stage geometry on the number of points revealed so far -- without
+    materializing a single stage mask."""
+    shape = _check_plan(shape, levels, anchor_stride, anchor_block)
+    ndim = len(shape)
+    if anchor_block != 1:
+        return [
+            int(np.count_nonzero(mask))
+            for mask, _, _ in iter_stage_plan(shape, levels, anchor_stride, anchor_block)
+        ]
+    counts = [int(np.prod([_slice_count(n, 0, anchor_stride) for n in shape]))]
+    prev_s = None
+    for k in range(1, levels + 1):
+        s = max(anchor_stride >> k, 1)
+        if s == prev_s:  # repeated finest level: every point is already covered
+            counts += [0] * (2 * ndim - 1)
+            continue
+        prev_s = s
+        for axis in range(ndim):
+            counts.append(
+                int(
+                    np.prod(
+                        [
+                            _slice_count(n, s if j == axis else 0, 2 * s)
+                            for j, n in enumerate(shape)
+                        ]
+                    )
+                )
+            )
+        for w in range(2, ndim + 1):
+            counts.append(
+                sum(
+                    int(
+                        np.prod(
+                            [
+                                _slice_count(n, s if j in axes else 0, 2 * s)
+                                for j, n in enumerate(shape)
+                            ]
+                        )
+                    )
+                    for axes in itertools.combinations(range(ndim), w)
+                )
+            )
+    counts[-1] += int(np.prod(shape)) - sum(counts)  # remainder clause
+    return counts
 
 
 def stage_masks(
@@ -129,7 +289,8 @@ def stage_masks(
     anchor_block: int = 1,
 ) -> list[np.ndarray]:
     return [
-        mask for mask, _, _ in stage_plan(shape, levels, anchor_stride, anchor_block)
+        mask
+        for mask, _, _ in iter_stage_plan(shape, levels, anchor_stride, anchor_block)
     ]
 
 
@@ -223,3 +384,191 @@ def stage_ebs(
         raise ValueError("anchor_block must be in [1, anchor_stride]")
     finest = min(strides)
     return [eb * eb_ratio ** np.log2(stride / finest) for stride in strides]
+
+
+# --- closed-form stage geometry (no masks, no per-point plan) ---------------
+# Every sub-stage's point set is a union of *parity classes*: a class fixes, per
+# axis, whether the coordinate is an odd multiple of the sub-stage stride (a
+# midpoint on that axis) or an even one, so the class is a cross product of
+# arithmetic progressions -- a strided view of the grid, addressable with pure
+# integer arithmetic the way SZ3/HPEZ address theirs.
+#
+# The one thing a view cannot give directly is the class's position inside the
+# *stage* array, which is ordered by flat grid index and therefore interleaves
+# the classes. That order is lexicographic in (m_0, p_0, m_1, p_1, ...) -- the
+# per-axis lattice index split into its high part and its parity bit -- and
+# counting the stage points that precede a given position collapses to
+#
+#     rank(m, p) = offset(p) + sum_j m_j * G_j(r_j)
+#
+# with r_j the odd-axis budget still unplaced at axis j. It is *affine in m*, so
+# each class is also a strided view of the stage array. Both halves of the
+# schedule are then plain strides, and the codec never materializes a per-point
+# index, a stage mask, or a cached plan.
+
+
+class ClassLayout:
+    """One parity class of a sub-stage: where its points live, in both spaces.
+
+    ``starts``/``step``/``sizes`` address the grid (``start::step`` per axis, a
+    view); ``offset``/``strides`` address the stage's compact point array (an
+    ``as_strided`` view of it). ``parity[j]`` is 1 on the axes the class's points
+    are midpoints of, which is exactly the set of axes it is interpolated along.
+    """
+
+    __slots__ = ("parity", "axes", "starts", "step", "sizes", "strides", "offset")
+
+    def __init__(self, parity, starts, step, sizes, strides, offset):
+        self.parity = parity
+        self.axes = tuple(j for j, p in enumerate(parity) if p)
+        self.starts, self.step, self.sizes = starts, step, sizes
+        self.strides, self.offset = strides, offset
+
+    @property
+    def size(self) -> int:
+        return int(np.prod(self.sizes)) if self.sizes else 1
+
+    def slices(self, origins=None) -> tuple[slice, ...]:
+        """Grid slice tuple for this class, optionally shifted by ``origins``."""
+        if origins is None:
+            return tuple(
+                slice(b, b + self.step * n, self.step)
+                for b, n in zip(self.starts, self.sizes)
+            )
+        return tuple(
+            slice(o + b, o + b + self.step * n, self.step)
+            for o, b, n in zip(origins, self.starts, self.sizes)
+        )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"ClassLayout(parity={self.parity}, starts={self.starts}, "
+            f"step={self.step}, sizes={self.sizes}, strides={self.strides}, "
+            f"offset={self.offset})"
+        )
+
+
+class StageLayout:
+    """A sub-stage as its parity classes plus the schedule metadata."""
+
+    __slots__ = ("stride", "weight", "axes", "classes", "size")
+
+    def __init__(self, stride, weight, axes, classes, size):
+        self.stride, self.weight, self.axes = stride, weight, axes
+        self.classes, self.size = classes, size
+
+
+def _single_class(parity, starts, step, sizes):
+    """Layout of a sub-stage that has exactly one class: plain row-major."""
+    strides = [1] * len(sizes)
+    for j in range(len(sizes) - 2, -1, -1):
+        strides[j] = strides[j + 1] * sizes[j + 1]
+    return ClassLayout(parity, tuple(starts), step, tuple(sizes), tuple(strides), 0)
+
+
+def _fused_classes(shape, s, weight, low_axes):
+    """Layouts of every weight-``weight`` parity class of one fused sub-stage.
+
+    ``low_axes`` (grow mode) drops each named axis's coordinate-0 hyperplane,
+    which shifts that axis's even-parity progression from ``0::2s`` to ``2s::2s``
+    and takes one position out of the interleave -- a constant shift of the rank,
+    so the layout stays affine.
+    """
+    ndim = len(shape)
+    lo, cnt = [], []
+    for j, n in enumerate(shape):
+        base = 2 * s if j in low_axes else 0
+        lo.append((1 if j in low_axes else 0, 0))
+        cnt.append((_slice_count(n, base, 2 * s), _slice_count(n, s, 2 * s)))
+    # F[j][r]: stage points in axes j.. with r odd axes left to place.
+    # G[j][r]: the same for one fixed lattice index on axis j (either parity).
+    F = [[0] * (weight + 1) for _ in range(ndim + 1)]
+    F[ndim][0] = 1
+    G = [[0] * (weight + 1) for _ in range(ndim + 1)]
+    for j in range(ndim - 1, -1, -1):
+        for r in range(weight + 1):
+            odd = F[j + 1][r - 1] if r else 0
+            F[j][r] = cnt[j][0] * F[j + 1][r] + cnt[j][1] * odd
+            G[j][r] = F[j + 1][r] + odd
+    out = []
+    for combo in itertools.combinations(range(ndim), weight):
+        parity = tuple(1 if j in combo else 0 for j in range(ndim))
+        starts, sizes, strides = [], [], []
+        offset, r = 0, weight
+        for j, p in enumerate(parity):
+            strides.append(G[j][r])
+            starts.append(s if p else (2 * s if j in low_axes else 0))
+            sizes.append(cnt[j][p])
+            offset += lo[j][p] * G[j][r]
+            if j in low_axes:
+                if not p:
+                    offset -= F[j + 1][r]
+            elif p:
+                offset += F[j + 1][r]
+            r -= p
+        out.append(
+            ClassLayout(parity, tuple(starts), 2 * s, tuple(sizes), tuple(strides), offset)
+        )
+    return out, F[0][weight]
+
+
+def stage_layouts(
+    shape: tuple[int, ...],
+    levels: int,
+    anchor_stride: int,
+    low_axes: tuple[int, ...] = (),
+) -> list[StageLayout]:
+    """``stage_plan``'s schedule as strided class layouts, built by arithmetic.
+
+    Aligned one-for-one with ``stage_plan`` / ``stage_counts``: stage ``i``'s
+    classes partition exactly the points of stage ``i``'s mask, and concatenating
+    each class's points in ``as_strided`` order reproduces the mask's
+    ``flatnonzero`` order. ``anchor_block`` is fixed at 1 (the codec's only
+    setting); the schedule's remainder clause is empty whenever the dyadic
+    levels reach stride 1, which ``_check_plan`` already requires.
+
+    ``low_axes`` removes the coordinate-0 hyperplane of each listed axis from
+    every stage -- the grow-mode column split, whose points the up/left
+    neighbour already coded.
+    """
+    shape = _check_plan(shape, levels, anchor_stride, 1)
+    ndim = len(shape)
+    low_axes = tuple(sorted(set(low_axes)))
+    zero = tuple(0 for _ in range(ndim))
+    anchor_starts = [anchor_stride if j in low_axes else 0 for j in range(ndim)]
+    out = [
+        StageLayout(
+            anchor_stride,
+            0,
+            (),
+            [
+                _single_class(
+                    zero,
+                    anchor_starts,
+                    anchor_stride,
+                    [_slice_count(n, b, anchor_stride) for n, b in zip(shape, anchor_starts)],
+                )
+            ],
+            0,
+        )
+    ]
+    out[0].size = out[0].classes[0].size
+    prev_s = None
+    for k in range(1, levels + 1):
+        s = max(anchor_stride >> k, 1)
+        if s == prev_s:  # repeated finest level: every point is already covered
+            out += [StageLayout(s, w, (), [], 0) for w in [1] * ndim + list(range(2, ndim + 1))]
+            continue
+        prev_s = s
+        for axis in range(ndim):
+            parity = tuple(1 if j == axis else 0 for j in range(ndim))
+            starts = [
+                s if j == axis else (2 * s if j in low_axes else 0) for j in range(ndim)
+            ]
+            sizes = [_slice_count(n, b, 2 * s) for n, b in zip(shape, starts)]
+            cl = _single_class(parity, starts, 2 * s, sizes)
+            out.append(StageLayout(s, 1, (axis,), [cl], cl.size))
+        for w in range(2, ndim + 1):
+            classes, size = _fused_classes(shape, s, w, low_axes)
+            out.append(StageLayout(s, w, tuple(range(ndim)), classes, size))
+    return out
